@@ -14,7 +14,7 @@ import torch
 
 
 if __name__ == "__main__":
-    files = glob.glob('/usr/local/sra/testing_data/medium/*.npz')
+    files = glob.glob('/home/project/testing_data/large/*.npz')
     files = sorted(files, key=lambda x : int(x.split('/')[-1].split('_')[0]))
     results = {
         "hr": [],
@@ -32,7 +32,7 @@ if __name__ == "__main__":
         
         
     # Hybrid Reinforce
-    model = PPO.load_from_checkpoint('/usr/local/sra/cpkts/cl1/epoch=008.ckpt')
+    model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/last.ckpt')
     policy, env = model.policy.cuda(), model.env
     for f in tqdm(files):
         dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f)
@@ -44,7 +44,7 @@ if __name__ == "__main__":
         td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
         td = td.cuda()
 
-        # td = batchify(td, 100)
+        # td = batchify(td, 10)
         # with torch.no_grad():
         #     out = policy(td, env=env, decode_type='sampling', return_actions=True)
         #     obj = env.get_objective(td, out['actions'])

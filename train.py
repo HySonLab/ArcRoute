@@ -25,9 +25,9 @@ if __name__ == "__main__":
                 val_data_size=10000
                 ) 
 
-    _model = PPO.load_from_checkpoint('/usr/local/sra/cpkts/cl1/last0.ckpt')
-    model.policy.load_state_dict(_model.policy.state_dict())
-    model.critic.load_state_dict(_model.critic.state_dict())
+    # _model = PPO.load_from_checkpoint('/home/project/cpkts/epoch=008.ckpt')
+    # model.policy.load_state_dict(_model.policy.state_dict())
+    # model.critic.load_state_dict(_model.critic.state_dict())
 
     checkpoint_callback = ModelCheckpoint(dirpath="../cpkts/cl1", # save to checkpoints/
                                         filename="{epoch:03d}",  # save as epoch_XXX.ckpt

@@ -7,6 +7,7 @@ from torch import Tensor
 from typing import Tuple, Union
 from einops import rearrange
 from torch.nn.functional import scaled_dot_product_attention
+import math
 from .init import ARPInitEmbedding
     
 class SkipConnection(nn.Module):
@@ -143,8 +144,9 @@ class MultiHeadAttention(nn.Module):
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, adj, attn_mask=None):
         """x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
+        adj: (batch, seqlen, seqlen) adjacency matrix
         attn_mask: bool tensor of shape (batch, seqlen)
         """
         # Project query, key, value
@@ -159,15 +161,21 @@ class MultiHeadAttention(nn.Module):
                 else attn_mask.unsqueeze(1).unsqueeze(2)
             )
 
-        # Scaled dot product attention
-        out = self.sdpa_fn(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.attention_dropout,
-        )
-        return self.out_proj(rearrange(out, "b h s d -> b s (h d)"))
+        # Modify attention using adjacency matrix
+        # Here we multiply the attention scores by the adjacency matrix to mask out non-neighbors
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if adj is not None:
+            attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
+            attn_weights = attn_weights * adj.unsqueeze(1)  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
+
+        attn_weights = nn.Softmax(dim=-1)(attn_weights)
+
+        if self.attention_dropout > 0:
+            attn_weights = nn.Dropout(self.attention_dropout)(attn_weights)
+
+        out = torch.matmul(attn_weights, v)
+        out = rearrange(out, "b h s d -> b s (h d)")
+        return self.out_proj(out)
     
 class MultiHeadAttentionLayer(nn.Sequential):
     def __init__(
@@ -180,20 +188,46 @@ class MultiHeadAttentionLayer(nn.Sequential):
         sdpa_fn: Optional[Callable] = None,
         moe_kwargs: Optional[dict] = None,
     ):
+
+
+        super(MultiHeadAttentionLayer, self).__init__()
+        
         num_neurons = [feedforward_hidden] if feedforward_hidden > 0 else []
-        ffn = MLP(input_dim=embed_dim, output_dim=embed_dim, num_neurons=num_neurons, hidden_act="ReLU")
+        self.f1 = MultiHeadAttention(embed_dim, num_heads, bias=bias, sdpa_fn=sdpa_fn)
+        self.f2 = Normalization(embed_dim, normalization)
+        self.f3 = SkipConnection(MLP(input_dim=embed_dim, output_dim=embed_dim, num_neurons=num_neurons, hidden_act="ReLU"))
+        self.f4 = Normalization(embed_dim, normalization)
+    
 
-        super(MultiHeadAttentionLayer, self).__init__(
-            SkipConnection(
-                MultiHeadAttention(embed_dim, num_heads, bias=bias, sdpa_fn=sdpa_fn)
-            ),
-            Normalization(embed_dim, normalization),
-            SkipConnection(ffn),
-            Normalization(embed_dim, normalization),
-        )
+    def forward(self, x: Tensor, adj: Optional[Tensor] = None) -> Tensor:
+        """Forward pass of the MHA layer
 
-
+        Args:
+            x: [batch_size, graph_size, embed_dim] input embeddings to process
+            adj: [batch_size, graph_size, graph_size] adjacency matrix representing graph structure
+        """
+        # Pass adjacency matrix to attention layer (adjust attention mechanism accordingly)
+        x = x + self.f1(x, adj)
+        x = self.f2(x)  # Normalization
+        x = self.f3(x)  # SkipConnection with Feedforward (MLP)
+        x = self.f4(x)  # Normalization
+        
+        return x
+    
 class GraphAttentionNetwork(nn.Module):
+    """Graph Attention Network to encode embeddings with a series of MHA layers consisting of a MHA layer,
+    normalization, feed-forward layer, and normalization. Similar to Transformer encoder, as used in Kool et al. (2019).
+
+    Args:
+        num_heads: number of heads in the MHA
+        embed_dim: dimension of the embeddings
+        num_layers: number of MHA layers
+        normalization: type of normalization to use (batch, layer, none)
+        feedforward_hidden: dimension of the hidden layer in the feed-forward layer
+        sdpa_fn: scaled dot product attention function (SDPA)
+        moe_kwargs: Keyword arguments for MoE
+    """
+
     def __init__(
         self,
         num_heads: int,
@@ -206,8 +240,8 @@ class GraphAttentionNetwork(nn.Module):
     ):
         super(GraphAttentionNetwork, self).__init__()
 
-        self.layers = nn.Sequential(
-            *(
+        self.layers = nn.ModuleList(
+            [
                 MultiHeadAttentionLayer(
                     embed_dim,
                     num_heads,
@@ -217,18 +251,14 @@ class GraphAttentionNetwork(nn.Module):
                     moe_kwargs=moe_kwargs,
                 )
                 for _ in range(num_layers)
-            )
+            ]
         )
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        """Forward pass of the encoder
-
-        Args:
-            x: [batch_size, graph_size, embed_dim] initial embeddings to process
-            mask: [batch_size, graph_size, graph_size] mask for the input embeddings. Unused for now.
-        """
+    def forward(self, x: Tensor, adj: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         assert mask is None, "Mask not yet supported!"
-        h = self.layers(x)
+        h = x
+        for layer in self.layers:
+            h = layer(h, adj)
         return h
 
 
@@ -273,7 +303,7 @@ class Encoder(nn.Module):
         init_h = self.init_embedding(td)
 
         # Process embedding
-        h = self.net(init_h, mask)
+        h = self.net(init_h, td['adj'])
 
         # Return latent representation and initial embedding
         return h, init_h

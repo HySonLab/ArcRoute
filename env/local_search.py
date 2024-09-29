@@ -12,9 +12,10 @@ def local_search(vars=None, td=None, actions=None, tours_batch=None, epochs=100)
 
     bs = len(tours_batch)
     for k in [1,2,3]:
-        for _ in range(3):
-            tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
-            tours_batch = run_parallel(inner, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
+        tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
+        # for _ in range(3):
+        #     tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
+        #     tours_batch = run_parallel(inner, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
     return tours_batch
 
 @nb.njit(nb.float32(nb.float32[:], nb.float32[:,:], nb.int32[:]), nogil=True)
