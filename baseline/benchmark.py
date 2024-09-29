@@ -2,12 +2,11 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from baseline.hr import InsertCheapestHCARP
-from envs.local_search import local_search
-from envs.cal_reward import get_Ts
-from models.ppo import PPO
-from common.common import import_instance
+from env.local_search import local_search
+from env.cal_reward import get_Ts
+from rl.ppo import PPO
+from common.ops import import_instance, batchify
 
-from rl4co.utils.ops import batchify
 import glob
 from tqdm import tqdm
 import numpy as np
@@ -15,7 +14,7 @@ import torch
 
 
 if __name__ == "__main__":
-    files = glob.glob('/home/project/ArcRoute/data/instances/15/*.npz')
+    files = glob.glob('/usr/local/sra/testing_data/medium/*.npz')
     files = sorted(files, key=lambda x : int(x.split('/')[-1].split('_')[0]))
     results = {
         "hr": [],
@@ -33,7 +32,7 @@ if __name__ == "__main__":
         
         
     # Hybrid Reinforce
-    model = PPO.load_from_checkpoint('/home/project/checkpoints/cl1_old/best.ckpt')
+    model = PPO.load_from_checkpoint('/usr/local/sra/cpkts/cl1/epoch=008.ckpt')
     policy, env = model.policy.cuda(), model.env
     for f in tqdm(files):
         dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f)
@@ -45,12 +44,17 @@ if __name__ == "__main__":
         td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
         td = td.cuda()
 
-        td = batchify(td, 100)
+        # td = batchify(td, 100)
+        # with torch.no_grad():
+        #     out = policy(td, env=env, decode_type='sampling', return_actions=True)
+        #     obj = env.get_objective(td, out['actions'])
+        #     idx = obj[:, 0].argmin()
+        #     results['rl'].append(obj[idx].numpy())
+
         with torch.no_grad():
-            out = policy(td, env=env, decode_type='sampling', return_actions=True)
+            out = policy(td, env=env, decode_type='greedy', return_actions=True)
             obj = env.get_objective(td, out['actions'])
-            idx = obj[:, 0].argmin()
-            results['rl'].append(obj[idx].numpy())
+            results['rl'].append(obj[0])
             
     results['rl'] = np.array(results['rl'])
     results['hr'] = np.array(results['hr'])
@@ -58,4 +62,4 @@ if __name__ == "__main__":
     r1_rl = results['rl'][:, 0]
     r1_hr = results['hr'][:, 0]
     
-    print("Gap%: hr - rl", ((r1_hr - r1_rl)/r1_rl * 100).mean())
+    print("Gap%: hr - rl:", ((r1_hr - r1_rl)/(r1_rl+1e-8) * 100).mean())

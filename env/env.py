@@ -108,7 +108,7 @@ class CARPEnv:
         tours_batch = gen_tours_batch(actions)
         if is_local_search:
             tours_batch = local_search(td=td, tours_batch=tours_batch)  
-        return torch.stack(get_Ts(td, tours_batch=tours_batch)).T
+        return torch.tensor(get_Ts(td, tours_batch=tours_batch))
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         tours_batch = gen_tours_batch(actions)

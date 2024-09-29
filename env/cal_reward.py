@@ -19,12 +19,16 @@ def get_reward(td, actions=None, tours_batch=None):
 def get_Ts(td, actions=None, tours_batch=None):
     if tours_batch is None:
         tours_batch = gen_tours_batch(actions)
+        
+    if isinstance(td, list):
+        adjs, service_times, clsss = td
+    else:
+        adjs, service_times, clsss = setup_vars(td)
     bs = len(tours_batch)
-    adjs, service_times, clsss = setup_vars(td)
     reward1 = run_parallel(reward_ins, [1]*bs, service_times, adjs, clsss, tours_batch)
     reward2 = run_parallel(reward_ins, [2]*bs, service_times, adjs, clsss, tours_batch)
     reward3 = run_parallel(reward_ins, [3]*bs, service_times, adjs, clsss, tours_batch)
-    return [torch.tensor(reward1), torch.tensor(reward2), torch.tensor(reward3)]
+    return np.float32([reward1, reward2, reward3]).T
 
 @nb.njit(nb.float32(nb.int32, nb.float32[:], nb.float32[:, :], nb.int32[:], nb.int32[:, :]), nogil=True)
 def reward_ins(k, service_time, adj, clss, tours):

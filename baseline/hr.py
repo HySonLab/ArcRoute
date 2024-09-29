@@ -3,9 +3,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
 import numpy as np
-from common.common import import_instance, softmax
-from envs.local_search import local_search
-from envs.cal_reward import get_Ts
+from common.ops import import_instance, softmax
+from env.local_search import local_search
+from env.cal_reward import get_Ts
 
 class InsertCheapestHCARP:
     def __init__(self):

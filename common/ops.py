@@ -149,9 +149,12 @@ def gen_tours(action):
         padded[idx][1:len(tour)+1] = tour
     return padded
 
-
 def gen_tours_batch(actions):
-    actions = actions.cpu().numpy().astype(np.int32)
+    if isinstance(actions, list):
+        actions = np.int32(actions)
+    if not isinstance(actions, np.ndarray):
+        actions = actions.cpu().numpy().astype(np.int32)
+       
     tours_batch = run_parallel(gen_tours, actions)
     return tours_batch
 
@@ -219,3 +222,8 @@ def import_instance(es):
     s = np.float32(es_req[:, 4])
     d = np.float32(es_req[:, 5])
     return dms, P, M, demands, clss, s, d, edge_indxs
+
+def softmax(x):
+    x = np.array(x)
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum(axis=0) # only difference
