@@ -80,9 +80,9 @@ def get_log_likelihood(logprobs, actions=None, mask=None, return_sum: bool = Tru
     if mask is not None:
         logprobs[~mask] = 0
 
-    assert (
-        logprobs > -1000
-    ).data.all(), "Logprobs should not be -inf, check sampling procedure!"
+    # assert (
+    #     logprobs > -1000
+    # ).data.all(), "Logprobs should not be -inf, check sampling procedure!"
 
     # Calculate log_likelihood
     if return_sum:

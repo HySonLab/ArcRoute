@@ -38,7 +38,7 @@ class PPO(LightningModule):
             "milestones": [80, 95],
             "gamma": 0.1,
         },
-        lr_scheduler_interval: str = "epoch",
+        lr_scheduler_interval: str = "step",
         lr_scheduler_monitor: str = "val/reward",
         shuffle_train_dataloader: bool = False,
         dataloader_num_workers: int = 0,
@@ -143,22 +143,26 @@ class PPO(LightningModule):
     def configure_optimizers(self):
         parameters = list(self.policy.parameters()) + list(self.critic.parameters())
 
-        optimizer = torch.optim.SGD(
-            parameters,
-            lr=1e-4,
-            momentum=0.9,
-            weight_decay=5e-4,
-        )
-        steps_per_epoch = self.train_data_size // self.mini_batch_size
+        # optimizer = torch.optim.AdamW(
+        #     parameters,
+        #     lr=3e-4
+        # )
+        # steps_per_epoch = self.train_data_size // self.mini_batch_size
+        # scheduler_dict = {
+        #     "scheduler": OneCycleLR(
+        #         optimizer,
+        #         0.1,
+        #         epochs=self.trainer.max_epochs,
+        #         steps_per_epoch=steps_per_epoch,
+        #     ),
+        #     "interval": "step",
+        #     "monitor": self.lr_scheduler_monitor,
+        # }
+        optimizer = torch.optim.AdamW(parameters, lr=3e-4)  
         scheduler_dict = {
-            "scheduler": OneCycleLR(
-                optimizer,
-                0.1,
-                epochs=self.trainer.max_epochs,
-                steps_per_epoch=steps_per_epoch,
-            ),
+            "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500),
             "interval": "step",
-            "monitor": self.lr_scheduler_monitor,
+            # "monitor": self.lr_scheduler_monitor,
         }
         return [optimizer], scheduler_dict
     
