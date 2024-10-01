@@ -111,7 +111,7 @@ class CARPEnv:
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         tours_batch = gen_tours_batch(actions)
-        # tours_batch = local_search(td=td, tours_batch=tours_batch)  
+        tours_batch = local_search(td=td, tours_batch=tours_batch)  
         r = get_reward(td, tours_batch=tours_batch)
         r = -torch.tensor(r, device=td.device)
         return r

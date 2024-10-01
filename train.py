@@ -25,7 +25,7 @@ if __name__ == "__main__":
                 val_data_size=10000
                 ) 
 
-    # _model = PPO.load_from_checkpoint('/home/project/cpkts/epoch=008.ckpt')
+    # _model = PPO.load_from_checkpoint('/home/project/cpkts/last1.ckpt')
     # model.policy.load_state_dict(_model.policy.state_dict())
     # model.critic.load_state_dict(_model.critic.state_dict())
 

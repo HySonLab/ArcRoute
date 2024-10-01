@@ -94,13 +94,15 @@ class CARPGenerator:
         service_time = a + (b - a) * torch.rand(batch_size, self.num_arc)
         service_time = torch.cat((torch.zeros(batch_size, 1), service_time), dim=-1)
 
-        dms = torch.rand(batch_size, self.num_loc, self.num_loc)
+        a, b = 0, 4
+        dms = a + (b - a) * torch.rand(batch_size, self.num_loc, self.num_loc)
         bs, n_nodes, _ = dms.size()
         dms[dms == 0] = float('inf')
         torch.diagonal(dms, dim1=1, dim2=2).fill_(0)
+        dms[torch.arange(bs).view(bs, 1), arc_indices[..., 0], arc_indices[..., 1]] = torch.rand_like(service_time)
         for k in range(n_nodes):
             dms = torch.minimum(dms, dms[:, :, k].view(bs, -1, 1) + dms[:, k, :].view(bs, 1, -1))
-
+        
         traveling_time = dms[torch.arange(bs).view(bs, 1), arc_indices[..., 0], arc_indices[..., 1]]
         
         start_nodes = arc_indices[..., 0]  # Shape: (bs, num_arc+1)

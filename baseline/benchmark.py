@@ -14,7 +14,7 @@ import torch
 
 
 if __name__ == "__main__":
-    files = glob.glob('/home/project/testing_data/large/*.npz')
+    files = glob.glob('/home/project/testing_data/small/*.npz')
     files = sorted(files, key=lambda x : int(x.split('/')[-1].split('_')[0]))
     results = {
         "hr": [],
@@ -29,7 +29,11 @@ if __name__ == "__main__":
         tours = local_search([al.dms[None],al.s[None],al.clss[None]], actions=[routes])
         r = get_Ts([al.dms[None], al.s[None], al.clss[None]], tours_batch=tours)
         results['hr'].append(r[0])
-        
+    results['hr'] = np.array(results['hr'])
+
+    # print(results['hr'])
+    # exit()
+
         
     # Hybrid Reinforce
     model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/last.ckpt')
@@ -44,7 +48,7 @@ if __name__ == "__main__":
         td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
         td = td.cuda()
 
-        # td = batchify(td, 10)
+        # td = batchify(td, 100)
         # with torch.no_grad():
         #     out = policy(td, env=env, decode_type='sampling', return_actions=True)
         #     obj = env.get_objective(td, out['actions'])
@@ -55,9 +59,11 @@ if __name__ == "__main__":
             out = policy(td, env=env, decode_type='greedy', return_actions=True)
             obj = env.get_objective(td, out['actions'])
             results['rl'].append(obj[0])
-            
+    
     results['rl'] = np.array(results['rl'])
-    results['hr'] = np.array(results['hr'])
+
+    # print(results['rl'])
+    # exit()
     
     r1_rl = results['rl'][:, 0]
     r1_hr = results['hr'][:, 0]

@@ -143,28 +143,11 @@ class PPO(LightningModule):
     def configure_optimizers(self):
         parameters = list(self.policy.parameters()) + list(self.critic.parameters())
 
-        # optimizer = torch.optim.AdamW(
-        #     parameters,
-        #     lr=3e-4
-        # )
-        # steps_per_epoch = self.train_data_size // self.mini_batch_size
-        # scheduler_dict = {
-        #     "scheduler": OneCycleLR(
-        #         optimizer,
-        #         0.1,
-        #         epochs=self.trainer.max_epochs,
-        #         steps_per_epoch=steps_per_epoch,
-        #     ),
-        #     "interval": "step",
-        #     "monitor": self.lr_scheduler_monitor,
-        # }
-        optimizer = torch.optim.AdamW(parameters, lr=3e-4)  
-        scheduler_dict = {
-            "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500),
-            "interval": "step",
-            # "monitor": self.lr_scheduler_monitor,
-        }
-        return [optimizer], scheduler_dict
+        optimizer = torch.optim.AdamW(
+            parameters,
+            lr=1e-4
+        )
+        return optimizer
     
     def on_train_epoch_end(self):
         sch = self.lr_schedulers()

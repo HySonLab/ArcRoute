@@ -270,7 +270,7 @@ class Encoder(nn.Module):
         env_name: str = "tsp",
         num_heads: int = 8,
         num_layers: int = 3,
-        normalization: str = "batch",
+        normalization: str = "instance",
         feedforward_hidden: int = 512,
         net: nn.Module = None,
         sdpa_fn = None,

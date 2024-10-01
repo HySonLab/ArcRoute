@@ -11,8 +11,9 @@ def local_search(vars=None, td=None, actions=None, tours_batch=None, epochs=100)
         adjs, ss, clss = vars
 
     bs = len(tours_batch)
-    for k in [1,2,3]:
-        tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
+    tours_batch = run_parallel(intra, [1]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
+    # for k in [1,2,3]:
+        # tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
         # for _ in range(3):
         #     tours_batch = run_parallel(intra, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
         #     tours_batch = run_parallel(inner, [k]*bs, ss, adjs, clss, tours_batch, epochs=epochs)
