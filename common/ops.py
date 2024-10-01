@@ -1,0 +1,229 @@
+import torch
+import numpy as np
+import concurrent.futures
+import numba as nb
+
+def gather_by_index(src, idx, dim=1, squeeze=True):
+    """Gather elements from src by index idx along specified dim
+
+    Example:
+    >>> src: shape [64, 20, 2]
+    >>> idx: shape [64, 3)] # 3 is the number of idxs on dim 1
+    >>> Returns: [64, 3, 2]  # get the 3 elements from src at idx
+    """
+    expanded_shape = list(src.shape)
+    expanded_shape[dim] = -1
+    idx = idx.view(idx.shape + (1,) * (src.dim() - idx.dim())).expand(expanded_shape)
+    squeeze = idx.size(dim) == 1 and squeeze
+    return src.gather(dim, idx).squeeze(dim) if squeeze else src.gather(dim, idx)
+
+
+def _batchify_single(x, repeats):
+    """Same as repeat on dim=0 for Tensordicts as well"""
+    s = x.shape
+    return x.expand(repeats, *s).contiguous().view(s[0] * repeats, *s[1:])
+
+def batchify(x, shape):
+    """Same as `einops.repeat(x, 'b ... -> (b r) ...', r=repeats)` but ~1.5x faster and supports TensorDicts.
+    Repeats batchify operation `n` times as specified by each shape element.
+    If shape is a tuple, iterates over each element and repeats that many times to match the tuple shape.
+
+    Example:
+    >>> x.shape: [a, b, c, ...]
+    >>> shape: [a, b, c]
+    >>> out.shape: [a*b*c, ...]
+    """
+    shape = [shape] if isinstance(shape, int) else shape
+    for s in reversed(shape):
+        x = _batchify_single(x, s) if s > 0 else x
+    return x
+
+def get_distance(x, y):
+    """Euclidean distance between two tensors of shape `[..., n, dim]`"""
+    return (x - y).norm(p=2, dim=-1)
+
+def get_tour_length(ordered_locs):
+    """Compute the total tour distance for a batch of ordered tours.
+    Computes the L2 norm between each pair of consecutive nodes in the tour and sums them up.
+
+    Args:
+        ordered_locs: Tensor of shape [batch_size, num_nodes, 2] containing the ordered locations of the tour
+    """
+    ordered_locs_next = torch.roll(ordered_locs, -1, dims=-2)
+    return get_distance(ordered_locs_next, ordered_locs).sum(-1)
+
+def calculate_entropy(logprobs):
+    """Calculate the entropy of the log probabilities distribution
+    logprobs: Tensor of shape [batch, decoder_steps, num_actions]
+    """
+    logprobs = torch.nan_to_num(logprobs, nan=0.0)
+    entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
+    entropy = entropy.sum(dim=1)  # [batch] -- sum over decoding steps
+    assert entropy.isfinite().all(), "Entropy is not finite"
+    return entropy
+
+def get_log_likelihood(logprobs, actions=None, mask=None, return_sum: bool = True):
+    """Get log likelihood of selected actions.
+    Note that mask is a boolean tensor where True means the value should be kept.
+
+    Args:
+        logprobs: Log probabilities of actions from the model (batch_size, seq_len, action_dim).
+        actions: Selected actions (batch_size, seq_len).
+        mask: Action mask. 1 if feasible, 0 otherwise (so we keep if 1 as done in PyTorch).
+        return_sum: Whether to return the sum of log probabilities or not. Defaults to True.
+    """
+    # Optional: select logp when logp.shape = (bs, dec_steps, N)
+    if actions is not None and logprobs.dim() == 3:
+        logprobs = logprobs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+
+    # Optional: mask out actions irrelevant to objective so they do not get reinforced
+    if mask is not None:
+        logprobs[~mask] = 0
+
+    # assert (
+    #     logprobs > -1000
+    # ).data.all(), "Logprobs should not be -inf, check sampling procedure!"
+
+    # Calculate log_likelihood
+    if return_sum:
+        return logprobs.sum(1)  # [batch]
+    else:
+        return logprobs  # [batch, decode_len]
+
+def _unbatchify_single(x, repeats: int):
+    """Undoes batchify operation for Tensordicts as well"""
+    s = x.shape
+    return x.view(repeats, s[0] // repeats, *s[1:]).permute(1, 0, *range(2, len(s) + 1))
+
+
+def unbatchify(x, shape):
+    """Same as `einops.rearrange(x, '(r b) ... -> b r ...', r=repeats)` but ~2x faster and supports TensorDicts
+    Repeats unbatchify operation `n` times as specified by each shape element
+    If shape is a tuple, iterates over each element and unbatchifies that many times to match the tuple shape.
+
+    Example:
+    >>> x.shape: [a*b*c, ...]
+    >>> shape: [a, b, c]
+    >>> out.shape: [a, b, c, ...]
+    """
+    shape = [shape] if isinstance(shape, int) else shape
+    for s in reversed(
+        shape
+    ):  # we need to reverse the shape to unbatchify in the right order
+        x = _unbatchify_single(x, s) if s > 0 else x
+    return x
+
+def unbatchify_and_gather(x, idx, n):
+    """first unbatchify a tensor by n and then gather (usually along the unbatchified dimension)
+    by the specified index
+    """
+    x = unbatchify(x, n)
+    return gather_by_index(x, idx, dim=idx.dim())
+
+
+def run_parallel(operation, *args, **kwargs):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
+        return [f.result() for f in futures]
+    
+def setup_vars(td):
+    distances_np = td['adj'].detach().cpu().numpy()
+    distances_np = distances_np + 1e9 * np.eye(distances_np.shape[1], dtype=np.float32)[None, :, :]
+    service_time_np = td['service_time'].detach().cpu().numpy()
+    clss_np = td['clss'].detach().cpu().numpy().astype(np.int32)
+    return distances_np, service_time_np, clss_np
+
+@nb.njit(nb.int32[:,:](nb.int32[:]), nogil=True)
+def gen_tours(action):
+    idxs = [0] + [i+1 for i in range(len(action)) if action[i] == 0] + [len(action)]
+    tours = []
+    maxlen = 0
+    for i,j in zip(idxs[:-1], idxs[1:]):
+        a = action[i:j]
+        if a.sum() == 0:
+            continue
+        tours.append(a)
+        maxlen = max(maxlen, len(a))
+    padded = np.zeros((len(tours), maxlen+2), dtype=np.int32)
+    for idx, tour in enumerate(tours):
+        padded[idx][1:len(tour)+1] = tour
+    return padded
+
+def gen_tours_batch(actions):
+    if isinstance(actions, list):
+        actions = np.int32(actions)
+    if not isinstance(actions, np.ndarray):
+        actions = actions.cpu().numpy().astype(np.int32)
+       
+    tours_batch = run_parallel(gen_tours, actions)
+    return tours_batch
+
+@nb.njit(nb.int32[:](nb.int32[:,:], nb.int32), nogil=True)
+def deserialize_tours(tours, n):
+    new_action = []
+    for tour in tours:
+        j = len(tour) - 1
+        while tour[j] == 0 and j >= 0: j -= 1
+        new_action.extend(tour[1:j+2])
+    while(len(new_action) < n): new_action.append(0)
+    while(len(new_action) > n): new_action.pop(-1)
+    return np.int32(new_action)
+
+def deserialize_tours_batch(tours_batch, actions):
+    new_actions = run_parallel(deserialize_tours, tours_batch, [actions.shape[1]]*len(actions))
+    return np.array(new_actions)
+
+
+def convert_adjacency_matrix(n1, n2, d):
+    n1, n2 = n1.astype(int), n2.astype(int)
+    n = len(np.unique([n1, n2]))
+    adj = np.full((n, n), np.inf)
+    np.fill_diagonal(adj, 0)
+    adj[n1, n2] = d
+    return adj
+
+def floyd_warshall(adj):
+    dms = adj.copy()
+    for k in range(adj.shape[0]):
+        dms = np.minimum(dms, dms[:, k, None] + dms[None, k, :])
+    return dms
+
+def dist_edges(dms, n1, n2):
+    dms = dms.copy()
+    n1 = n1.astype(int)
+    n2 = n2.astype(int)
+    go_from = np.hstack([[0], n2])[..., None]
+    go_to = np.hstack([[0], n1])[None, ...]
+    dms = dms[go_from, go_to]
+    return dms.astype(np.float32)
+
+def dist_edges_from_file(es):
+    if isinstance(es, str):
+        es = np.load(es)
+    es_cat = np.concatenate([es['req'], es['nonreq']], axis=0)
+    adj = convert_adjacency_matrix(es_cat[:, 0], es_cat[:, 1], es_cat[:, -1])
+    dms = floyd_warshall(adj)
+    dms = dist_edges(dms, es['req'][:, 0], es['req'][:, 1])
+    return dms
+
+def import_instance(es):
+    if isinstance(es, str):
+        es = np.load(es)
+    C = es['C']
+    P = [i for i in range(1, es['P']+1)]
+    M = [i for i in range(es['M'])]
+    dms = dist_edges_from_file(es)
+    
+    es_req = es['req']
+    es_req = np.vstack([[0]*6, es_req])
+    edge_indxs = np.int32(es_req[:, :2])
+    demands = np.float32(es_req[:, 2]) / C
+    clss = np.int32(es_req[:, 3])
+    s = np.float32(es_req[:, 4])
+    d = np.float32(es_req[:, 5])
+    return dms, P, M, demands, clss, s, d, edge_indxs
+
+def softmax(x):
+    x = np.array(x)
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum(axis=0) # only difference
