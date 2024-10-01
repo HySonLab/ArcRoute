@@ -5,33 +5,42 @@ from rl.ppo import PPO
 import torch
 import numpy as np
 from common.ops import import_instance, batchify
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run PPO model")
+
+    # Add arguments
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to the model checkpoint')
+    parser.add_argument('--data_path', type=str, required=True, help='Path to the data file (.npz)')
+
+    return parser.parse_args()
 
 if __name__ == "__main__":
     torch.manual_seed(6868)
     np.random.seed(6868)
-    model = PPO.load_from_checkpoint("/home/project/cpkts/cl1/epoch=016.ckpt")
-    policy = model.policy.cuda()
-    env = model.env
+    args = parse_args()
+    
+    # Load model from checkpoint
+    model = PPO.load_from_checkpoint(args.checkpoint_path)
+    policy, env = model.policy.cuda(), model.env
 
     # Import data from .npz file
-    dms, P, M, demands, clss, s, d, edge_indxs = import_instance("/home/project/testing_data/small/1_32.npz")
+    dms, P, M, demands, clss, s, d, edge_indxs = import_instance(args.data_path)
 
-    # # Prepare the environment
+    # Prepare the environment
     td = env.reset(batch_size=1)
-    # print(td)
-    print(td['adj'].min(), td['adj'].max())
     td['clss'] = torch.tensor(clss[None, :], dtype=torch.int64)
     td['demand'] = torch.tensor(demands[1:][None, :], dtype=torch.float32)
     td['service_time'] = torch.tensor(s[None, :], dtype=torch.float32)
     td['traveling_time'] = torch.tensor(d[None, :], dtype=torch.float32)
     td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
-    print('-------')
-    print(td['adj'].min(), td['adj'].max())
     td = td.cuda()
 
-    # td = batchify(td, 10)
+    # Run the model with no gradients for inference
     with torch.no_grad():
-        out = policy(td, env=env, decode_type='greedy', return_actions=True)
-
-    print(env.get_objective(td, actions=out['actions']))
-
+        out = policy(td.clone(), env=env, decode_type='greedy', return_actions=True)
+    
+    # Output results
+    print(out['actions'])
+    print(env.get_objective(td, out['actions']))

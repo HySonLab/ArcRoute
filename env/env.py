@@ -14,7 +14,7 @@ class CARPEnv:
     def __init__(
         self,
         generator_params: dict = {},
-        variant= 'U',
+        variant= 'P',
         **kwargs,
     ):
         super().__init__(**kwargs)

@@ -49,7 +49,6 @@ hdcarp/
 │   ├── decoder.py            # Decoding components
 │   ├── init.py               # Model initialization functions
 │   ├── policy.py             # Policy network for RL
-│   ├── ppo.py                # Proximal Policy Optimization (PPO) algorithm
 ├── rl/
 │   ├── critic.py
 │   ├── ppo.py                # Proximal Policy Optimization (PPO) algorithm

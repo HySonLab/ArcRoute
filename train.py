@@ -1,45 +1,71 @@
 import torch
 import numpy as np
+import argparse
 from env.env import CARPEnv
 from policy.policy import AttentionModelPolicy
 from rl.ppo import PPO
 from rl.trainer import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-if __name__ == "__main__":
-    torch.manual_seed(6868)
-    np.random.seed(6868)
-
-    env = CARPEnv(generator_params={"num_loc": 20, "num_arc": 20})
+def parse_args():
+    parser = argparse.ArgumentParser(description="Training script for PPO on CARPEnv")
     
-    policy = AttentionModelPolicy(
-                embed_dim=128,
-                num_encoder_layers=12,
-                num_heads=8)
+    # Add arguments
+    parser.add_argument('--seed', type=int, default=6868, help='Random seed')
+    parser.add_argument('--max_epoch', type=int, default=1000, help='Maximum number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=512*4, help='Batch size')
+    parser.add_argument('--mini_batch_size', type=int, default=256, help='Mini-batch size')
+    parser.add_argument('--train_data_size', type=int, default=1000000, help='Training data size')
+    parser.add_argument('--val_data_size', type=int, default=10000, help='Validation data size')
+    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
+    parser.add_argument('--num_encoder_layers', type=int, default=12, help='Number of encoder layers')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
+    parser.add_argument('--num_loc', type=int, default=20, help='Number of locations')
+    parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
+    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--checkpoint_dir', type=str, default='/home/project/checkpoints/cl123', help='Checkpoint directory')
+    parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
+    parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
+    
+    return parser.parse_args()
 
+if __name__ == "__main__":
+    args = parse_args()
+
+    # Set random seeds
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    # Initialize environment
+    env = CARPEnv(generator_params={'num_loc': args.num_loc, 'num_arc': args.num_arc}, variant=args.variant)
+    
+    # Initialize policy
+    policy = AttentionModelPolicy(
+                    embed_dim=args.embed_dim,
+                    num_encoder_layers=args.num_encoder_layers,
+                    num_heads=args.num_heads)
+
+    # Initialize PPO model
     model = PPO(env, 
                 policy,
-                batch_size=512*4,
-                mini_batch_size=256,
-                train_data_size=1000000,
-                val_data_size=10000
-                ) 
-
-    # _model = PPO.load_from_checkpoint('/home/project/cpkts/last1.ckpt')
-    # model.policy.load_state_dict(_model.policy.state_dict())
-    # model.critic.load_state_dict(_model.critic.state_dict())
-
-    checkpoint_callback = ModelCheckpoint(dirpath="../cpkts/cl1", # save to checkpoints/
-                                        filename="{epoch:03d}",  # save as epoch_XXX.ckpt
-                                        save_top_k=1, # save only the best model
-                                        save_last=True, # save the last model
-                                        monitor="val/reward", # monitor validation reward
-                                        mode="max") # maximize validation reward
+                batch_size=args.batch_size,
+                mini_batch_size=args.mini_batch_size,
+                train_data_size=args.train_data_size,
+                val_data_size=args.val_data_size,
+                critic_kwargs={'embed_dim': args.embed_dim})
+    
+    # Setup checkpoint callback
+    checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_dir,
+                                          filename="{epoch:03d}",
+                                          save_top_k=1,
+                                          save_last=True,
+                                          monitor="val/reward",
+                                          mode="max")
     
     trainer = Trainer(
-        max_epochs=1000,
-        accelerator="gpu",
-        devices=1,
+        max_epochs=args.max_epoch,
+        accelerator=args.accelerator,
+        devices=args.devices,
         callbacks=[checkpoint_callback]
     )
 
