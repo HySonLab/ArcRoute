@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument('--num_loc', type=int, default=20, help='Number of locations')
     parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
-    parser.add_argument('--checkpoint_dir', type=str, default='/home/project/checkpoints/cl123', help='Checkpoint directory')
+    parser.add_argument('--checkpoint_dir', type=str, default='/home/project/cpkts/cl11', help='Checkpoint directory')
     parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
     parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
     
@@ -51,13 +51,16 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 mini_batch_size=args.mini_batch_size,
                 train_data_size=args.train_data_size,
-                val_data_size=args.val_data_size,
-                critic_kwargs={'embed_dim': args.embed_dim})
+                val_data_size=args.val_data_size)
     
+    _model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/epoch=025.ckpt')
+    model.policy.load_state_dict(_model.policy.state_dict())
+    model.critic.load_state_dict(_model.critic.state_dict())
+
     # Setup checkpoint callback
     checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_dir,
                                           filename="{epoch:03d}",
-                                          save_top_k=1,
+                                          save_top_k=2,
                                           save_last=True,
                                           monitor="val/reward",
                                           mode="max")
