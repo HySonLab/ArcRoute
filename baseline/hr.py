@@ -4,8 +4,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import numpy as np
 from common.ops import import_instance, softmax
-from env.local_search import local_search
-from env.cal_reward import get_Ts
+from common.local_search import local_search
+from common.cal_reward import get_Ts
 
 class InsertCheapestHCARP:
     def __init__(self):
@@ -49,11 +49,19 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
+    np.random.seed(42)
 
     args = parse_args()
     al = InsertCheapestHCARP()
     al.import_instance(args.data_path)
     routes = al(merge_tour=True)
-    tours = local_search([al.dms[None], al.s[None], al.clss[None]], actions=[routes])
-    r = get_Ts([al.dms[None], al.s[None], al.clss[None]], tours_batch=tours)
+    vars = {
+        'adj': al.dms[None],
+        'service_time': al.s[None],
+        'clss': al.clss[None],
+        'demand': al.demands[None]
+    }
+    # print(vars['demand'].sum(-1))
+    tours = local_search(vars, actions=routes[None])
+    r = get_Ts(vars, tours_batch=tours)
     print(r)

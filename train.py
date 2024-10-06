@@ -20,10 +20,10 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
     parser.add_argument('--num_encoder_layers', type=int, default=12, help='Number of encoder layers')
     parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--num_loc', type=int, default=20, help='Number of locations')
+    parser.add_argument('--num_loc', type=int, default=40, help='Number of nodes')
     parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
-    parser.add_argument('--checkpoint_dir', type=str, default='/home/project/cpkts/cl11', help='Checkpoint directory')
+    parser.add_argument('--checkpoint_dir', type=str, default='/home/project/cpkts/cl111', help='Checkpoint directory')
     parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
     parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
     
@@ -53,7 +53,8 @@ if __name__ == "__main__":
                 train_data_size=args.train_data_size,
                 val_data_size=args.val_data_size)
     
-    _model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/epoch=025.ckpt')
+
+    _model = PPO.load_from_checkpoint('/home/project/cpkts/cl11/epoch=049.ckpt')
     model.policy.load_state_dict(_model.policy.state_dict())
     model.critic.load_state_dict(_model.critic.state_dict())
 

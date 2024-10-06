@@ -35,7 +35,7 @@ hdcarp/
 ├── baseline/
 │   ├── hr.py                 # Heuristic algorithms
 │   ├── lp.py                 # Linear Programming based exact method
-│   ├── rl.py                 # Reinforcement Learning-based method
+│   ├── rl_infer.py           # Reinforcement Learning-based method
 ├── common/
 │   └── ops.py                # Common utilities shared across methods
 ├── env/
@@ -87,7 +87,7 @@ pip install -r requirements.txt
 ```
 ### Run RL Method
 ```python
-    python3 baseline/rl.py \
+    python3 baseline/rl_infer.py \
     --checkpoint_path "/home/project/checkpoints/cl1_old/best.ckpt" \
     --data_path "/home/project/data/data/15/28_20.npz"
 ```

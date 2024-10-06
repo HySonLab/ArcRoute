@@ -4,10 +4,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from tensordict.tensordict import TensorDict
 from common.ops import gather_by_index
 import torch
-from .generator import CARPGenerator, TensorDictDataset
-from .cal_reward import get_reward, get_Ts
-from .local_search import local_search
-from common.ops import  gen_tours_batch
+from env.generator import CARPGenerator, TensorDictDataset
+from common.cal_reward import get_reward, get_Ts
+from common.local_search import local_search
+from common.nb_utils import gen_tours_batch
 
 class CARPEnv:
     name = "tsp"
@@ -106,12 +106,12 @@ class CARPEnv:
     def get_objective(self, td, actions, is_local_search=True):
         tours_batch = gen_tours_batch(actions)
         if is_local_search:
-            tours_batch = local_search(td=td, tours_batch=tours_batch)  
+            tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant)  
         return torch.tensor(get_Ts(td, tours_batch=tours_batch))
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         tours_batch = gen_tours_batch(actions)
-        tours_batch = local_search(td=td, tours_batch=tours_batch)  
+        # tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant))  
         r = get_reward(td, tours_batch=tours_batch)
         r = -torch.tensor(r, device=td.device)
         return r

@@ -2,8 +2,8 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from baseline.hr import InsertCheapestHCARP
-from env.local_search import local_search
-from env.cal_reward import get_Ts
+from common.local_search import local_search
+from common.cal_reward import get_Ts
 from rl.ppo import PPO
 from common.ops import import_instance, batchify
 
@@ -14,8 +14,10 @@ import torch
 
 
 if __name__ == "__main__":
-    files = glob.glob('/home/project/testing_data/small/*.npz')
-    files = sorted(files, key=lambda x : int(x.split('/')[-1].split('_')[0]))
+    torch.manual_seed(6868)
+    np.random.seed(6868)
+    files = glob.glob('/home/project/testing_data/medium/*.npz')
+    files = sorted(files, key=lambda x : int(x.split('/')[-1].split('_')[0]))[:10]
     results = {
         "hr": [],
         "rl": []
@@ -26,8 +28,14 @@ if __name__ == "__main__":
     for f in tqdm(files):
         al.import_instance(f)
         routes = al(merge_tour=True)
-        tours = local_search([al.dms[None],al.s[None],al.clss[None]], actions=[routes])
-        r = get_Ts([al.dms[None], al.s[None], al.clss[None]], tours_batch=tours)
+        vars = {
+            'adj': al.dms[None],
+            'service_time': al.s[None],
+            'clss': al.clss[None],
+            'demand': al.demands[None]
+        }
+        tours = local_search(vars, actions=routes[None], variant='U')
+        r = get_Ts(vars, tours_batch=tours)
         results['hr'].append(r[0])
     results['hr'] = np.array(results['hr'])
 
@@ -36,7 +44,7 @@ if __name__ == "__main__":
 
         
     # Hybrid Reinforce
-    model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/last.ckpt')
+    model = PPO.load_from_checkpoint('/home/project/cpkts/cl1/epoch=025.ckpt')
     policy, env = model.policy.cuda(), model.env
     for f in tqdm(files):
         dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f)
@@ -48,12 +56,12 @@ if __name__ == "__main__":
         td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
         td = td.cuda()
 
-        # td = batchify(td, 100)
+        # td = batchify(td, 10)
         # with torch.no_grad():
         #     out = policy(td, env=env, decode_type='sampling', return_actions=True)
         #     obj = env.get_objective(td, out['actions'])
         #     idx = obj[:, 0].argmin()
-        #     results['rl'].append(obj[idx].numpy())
+            # results['rl'].append(obj[idx].numpy())
 
         with torch.no_grad():
             out = policy(td, env=env, decode_type='greedy', return_actions=True)
@@ -62,8 +70,8 @@ if __name__ == "__main__":
     
     results['rl'] = np.array(results['rl'])
 
-    # print(results['rl'])
-    # exit()
+    # # print(results['rl'])
+    # # exit()
     
     r1_rl = results['rl'][:, 0]
     r1_hr = results['hr'][:, 0]

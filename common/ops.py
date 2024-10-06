@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import concurrent.futures
-import numba as nb
 
 def gather_by_index(src, idx, dim=1, squeeze=True):
     """Gather elements from src by index idx along specified dim
@@ -126,52 +125,14 @@ def run_parallel(operation, *args, **kwargs):
         futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
         return [f.result() for f in futures]
     
-def setup_vars(td):
-    distances_np = td['adj'].detach().cpu().numpy()
-    distances_np = distances_np + 1e9 * np.eye(distances_np.shape[1], dtype=np.float32)[None, :, :]
-    service_time_np = td['service_time'].detach().cpu().numpy()
-    clss_np = td['clss'].detach().cpu().numpy().astype(np.int32)
-    return distances_np, service_time_np, clss_np
-
-@nb.njit(nb.int32[:,:](nb.int32[:]), nogil=True)
-def gen_tours(action):
-    idxs = [0] + [i+1 for i in range(len(action)) if action[i] == 0] + [len(action)]
-    tours = []
-    maxlen = 0
-    for i,j in zip(idxs[:-1], idxs[1:]):
-        a = action[i:j]
-        if a.sum() == 0:
-            continue
-        tours.append(a)
-        maxlen = max(maxlen, len(a))
-    padded = np.zeros((len(tours), maxlen+2), dtype=np.int32)
-    for idx, tour in enumerate(tours):
-        padded[idx][1:len(tour)+1] = tour
-    return padded
-
-def gen_tours_batch(actions):
-    if isinstance(actions, list):
-        actions = np.int32(actions)
-    if not isinstance(actions, np.ndarray):
-        actions = actions.cpu().numpy().astype(np.int32)
-       
-    tours_batch = run_parallel(gen_tours, actions)
-    return tours_batch
-
-@nb.njit(nb.int32[:](nb.int32[:,:], nb.int32), nogil=True)
-def deserialize_tours(tours, n):
-    new_action = []
-    for tour in tours:
-        j = len(tour) - 1
-        while tour[j] == 0 and j >= 0: j -= 1
-        new_action.extend(tour[1:j+2])
-    while(len(new_action) < n): new_action.append(0)
-    while(len(new_action) > n): new_action.pop(-1)
-    return np.int32(new_action)
-
-def deserialize_tours_batch(tours_batch, actions):
-    new_actions = run_parallel(deserialize_tours, tours_batch, [actions.shape[1]]*len(actions))
-    return np.array(new_actions)
+def convert_vars_np(td):
+    torch.diagonal(td['adj'], dim1=1, dim2=2).fill_(float('inf'))
+    return {
+        'adj': td['adj'].detach().cpu().numpy(),
+        'service_time': td['service_time'].detach().cpu().numpy(),
+        'clss': td['clss'].detach().cpu().numpy().astype(np.int32),
+        'demand': td['demand'].detach().cpu().numpy()
+    }
 
 
 def convert_adjacency_matrix(n1, n2, d):
