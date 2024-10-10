@@ -3,7 +3,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numba as nb
 import numpy as np
-from numba import prange
 from common.cal_reward import reward_in
 from common.nb_utils import calc_length
 from common.consts import *
@@ -29,9 +28,9 @@ def once_intraP(adj, service, sub):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), parallel=True, nogil=True)
+@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), nogil=True)
 def intraP(k, adj, service, p, tours):
-    for tour_idx in prange(len(tours)):
+    for tour_idx in range(len(tours)):
         tour = tours[tour_idx]
         pos = np.where(p[tour] == k)[0]
         if len(pos) <= 1:
@@ -68,7 +67,7 @@ def once_intraU(k, adj, service, clss, sub):
                 c = length[t] - best[t]
                 if c > 0:
                     break
-                change += c*(10**t)
+                change += c*(10**(k-t))
             if change < min_delta:
                 start, end, min_delta, best = i, j, change, length
 
@@ -78,9 +77,9 @@ def once_intraU(k, adj, service, clss, sub):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), parallel=True, nogil=True)
+@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), nogil=True)
 def intraU(k, adj, service, clss, tours):
-    for tour_idx in prange(len(tours)):
+    for tour_idx in range(len(tours)):
         tour = tours[tour_idx]
         pos = np.where(clss[tour] == k)[0]
         if len(pos) <= 1:

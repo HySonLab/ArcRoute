@@ -91,7 +91,8 @@ class CARPEnv:
                 'service_time': td["service_time"],
                 'traveling_time': td["traveling_time"],
                 'adj': td["adj"],
-                "done": torch.zeros(batch_size, td["service_time"].shape[1], dtype=torch.bool)
+                "done": torch.zeros(batch_size, td["service_time"].shape[1], dtype=torch.bool),
+                'num_vehicle': torch.full((batch_size, 1), fill_value=2, dtype=torch.long)
             },
             batch_size=batch_size,
         ).to(td.device)
@@ -106,12 +107,12 @@ class CARPEnv:
     def get_objective(self, td, actions, is_local_search=True):
         tours_batch = gen_tours_batch(actions)
         if is_local_search:
-            tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant)  
+            tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant, is_train=False)  
         return torch.tensor(get_Ts(td, tours_batch=tours_batch))
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
         tours_batch = gen_tours_batch(actions)
-        # tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant))  
+        tours_batch = local_search(td, tours_batch=tours_batch, variant=self.variant, is_train=True)
         r = get_reward(td, tours_batch=tours_batch)
         r = -torch.tensor(r, device=td.device)
         return r

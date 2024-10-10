@@ -126,9 +126,10 @@ def run_parallel(operation, *args, **kwargs):
         return [f.result() for f in futures]
     
 def convert_vars_np(td):
-    torch.diagonal(td['adj'], dim1=1, dim2=2).fill_(float('inf'))
+    adj = td['adj'].detach().clone()
+    torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))
     return {
-        'adj': td['adj'].detach().cpu().numpy(),
+        'adj': adj.cpu().numpy(),
         'service_time': td['service_time'].detach().cpu().numpy(),
         'clss': td['clss'].detach().cpu().numpy().astype(np.int32),
         'demand': td['demand'].detach().cpu().numpy()

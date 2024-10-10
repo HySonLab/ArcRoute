@@ -3,7 +3,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numba as nb
 import numpy as np
-from numba import prange
 from common.nb_utils import calc_length, calc_demand
 from common.cal_reward import reward_in
 from common.consts import *
@@ -72,7 +71,7 @@ def once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2):
                 c = length[t] - best[t]
                 if c > 0:
                     break
-                change += c*(10**t)
+                change += c*(10**(k-t))
 
             if change < min_delta:
                 start, end, min_delta, best, demand_best = i, j, change, length, candidate_demand
@@ -83,13 +82,14 @@ def once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), parallel=True, nogil=True)
+@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), nogil=True)
 def interP(k, adj, service, clss, demand, tours):
-    change = False
+    change = True
     it = 0
     remain_demand = np.ones(2, np.float32)
-    while not change and it < EPS:
-        for i in prange(len(tours) - 1):
+    while change and it < EPS:
+        change = False
+        for i in range(len(tours) - 1):
             for j in range(i + 1, len(tours)):
                 pos1 = np.where(clss[tours[i]] == k)[0]
                 pos2 = np.where(clss[tours[j]] == k)[0]
@@ -106,17 +106,19 @@ def interP(k, adj, service, clss, demand, tours):
                     remain_demand[1] = 1 - demand[tours[j]].sum()
                     sub_change = once_interP(adj, service, demand, remain_demand, sub1, sub2)
                     sub_it += 1
-                    change = change or (sub_it < 2)
+                    if sub_it >= 2:
+                        change = True
         it += 1
     return tours
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), parallel=True, nogil=True)
+@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), nogil=True)
 def interU(k, adj, service, clss, demand, tours):
-    change = False
+    change = True
     it = 0
     remain_demand = np.ones(2, np.float32)
-    while not change and it < EPS:
-        for i in prange(len(tours) - 1):
+    while change and it < EPS:
+        change = False
+        for i in range(len(tours) - 1):
             for j in range(i + 1, len(tours)):
                 pos1 = np.where(clss[tours[i]] == k)[0]
                 pos2 = np.where(clss[tours[j]] == k)[0]
@@ -133,6 +135,7 @@ def interU(k, adj, service, clss, demand, tours):
                     remain_demand[1] = 1 - demand[tours[j]].sum()
                     sub_change = once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2)
                     sub_it += 1
-                    change = change or (sub_it < 2)
+                    if sub_it >= 2:
+                        change = True
         it += 1
     return tours
