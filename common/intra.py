@@ -28,11 +28,11 @@ def once_intraP(adj, service, sub):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), nogil=True)
-def intraP(k, adj, service, p, tours):
+@nb.njit(nb.int32[:,:](nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32), nogil=True)
+def intraP(tours, adj, service, clss, k):
     for tour_idx in range(len(tours)):
         tour = tours[tour_idx]
-        pos = np.where(p[tour] == k)[0]
+        pos = np.where(clss[tour] == k)[0]
         if len(pos) <= 1:
             continue
 
@@ -45,14 +45,14 @@ def intraP(k, adj, service, p, tours):
     return tours
 
 
-@nb.njit(nb.float32(nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:]), nogil=True)
-def once_intraU(k, adj, service, clss, sub):
+@nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)
+def once_intraU(adj, service, clss, sub, k):
     n = len(sub)
     best = calc_length(adj, service, sub[1:]) + adj[sub[0], sub[1]]
 
     best = np.zeros(k)
     for t in range(1, k+1):
-        best[t-1] = reward_in(t, adj, service, clss, sub)
+        best[t-1] = reward_in(adj, service, clss, sub, k = t)
         
     start, end, min_delta = 0, 0, 0
     for i in range(1, n - 1):
@@ -61,7 +61,7 @@ def once_intraU(k, adj, service, clss, sub):
             candidate[i:j+1] = np.flip(candidate[i:j+1])
             length = np.zeros(k)
             for t in range(1, k+1):
-                length[t-1] = reward_in(t, adj, service, clss, candidate)
+                length[t-1] = reward_in(adj, service, clss, candidate, k = t)
             change = 0
             for t in range(k):
                 c = length[t] - best[t]
@@ -77,8 +77,8 @@ def once_intraU(k, adj, service, clss, sub):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:, :]), nogil=True)
-def intraU(k, adj, service, clss, tours):
+@nb.njit(nb.int32[:,:](nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32), nogil=True)
+def intraU(tours, adj, service, clss, k):
     for tour_idx in range(len(tours)):
         tour = tours[tour_idx]
         pos = np.where(clss[tour] == k)[0]
@@ -89,6 +89,6 @@ def intraU(k, adj, service, clss, tours):
         change = -1.0
         sub = tour[: pos[-1] + 1]
         while change < -1e-6 and it < EPS:
-            change = once_intraU(k, adj, service, clss, sub)
+            change = once_intraU(adj, service, clss, sub, k)
             it += 1
     return tours

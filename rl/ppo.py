@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from lightning import LightningModule
 from functools import partial
-from torch.optim.lr_scheduler import OneCycleLR
 from .critic import create_critic_from_actor
 
 class PPO(LightningModule):

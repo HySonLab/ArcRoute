@@ -119,12 +119,12 @@ def unbatchify_and_gather(x, idx, n):
     x = unbatchify(x, n)
     return gather_by_index(x, idx, dim=idx.dim())
 
-
+    
 def run_parallel(operation, *args, **kwargs):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
         return [f.result() for f in futures]
-    
+
 def convert_vars_np(td):
     adj = td['adj'].detach().clone()
     torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))
@@ -189,3 +189,8 @@ def softmax(x):
     x = np.array(x)
     e_x = np.exp(x - np.max(x))
     return e_x / e_x.sum(axis=0) # only difference
+
+def convert_prob(a):
+    a = np.array(a)
+    a = a - np.min(a) + 1e-10
+    return a / np.sum(a, axis=0)

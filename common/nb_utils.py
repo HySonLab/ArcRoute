@@ -55,5 +55,5 @@ def deserialize_tours(tours, n):
     return np.int32(new_action)
 
 def deserialize_tours_batch(tours_batch, n):
-    new_actions = run_parallel(deserialize_tours, tours_batch, [n]*len(tours_batch))
+    new_actions = run_parallel(deserialize_tours, tours_batch, n=n)
     return np.array(new_actions)

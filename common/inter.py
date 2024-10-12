@@ -41,14 +41,14 @@ def once_interP(adj, service, demand, remain_demand, sub1, sub2):
         return 0.0
 
 
-@nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.float32[:], nb.int32, nb.int32[:], nb.int32[:]), nogil=True)
-def once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2):
+@nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)
+def once_interU(adj, service, clss, demand, remain_demand, sub1, sub2, k):
     start, end, min_delta = 0, 0, 0
 
     best = np.zeros(k)
     for t in range(1, k+1):
-        best[t-1] = max(reward_in(t, adj, service, clss, sub1), 
-                        reward_in(t, adj, service, clss, sub2))
+        best[t-1] = max(reward_in(adj, service, clss, sub1, k=t), 
+                        reward_in(adj, service, clss, sub2, k=t))
     length = np.zeros(k)
     demand_best = calc_demand(demand, sub1[1:]), calc_demand(demand, sub2[1:])
     for i in range(1, len(sub1)):
@@ -64,8 +64,8 @@ def once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2):
                 continue
             
             for t in range(1, k+1):
-                length[t-1] = max(reward_in(t, adj, service, clss, candidate1), 
-                                reward_in(t, adj, service, clss, candidate2))
+                length[t-1] = max(reward_in(adj, service, clss, candidate1, k = t), 
+                                  reward_in(adj, service, clss, candidate2, k = t))
             change = 0
             for t in range(k):
                 c = length[t] - best[t]
@@ -82,8 +82,8 @@ def once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2):
     else:
         return 0.0
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), nogil=True)
-def interP(k, adj, service, clss, demand, tours):
+@nb.njit(nb.int32[:,:](nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32), nogil=True)
+def interP(tours, adj, service, clss, demand, k):
     change = True
     it = 0
     remain_demand = np.ones(2, np.float32)
@@ -111,8 +111,8 @@ def interP(k, adj, service, clss, demand, tours):
         it += 1
     return tours
 
-@nb.njit(nb.int32[:,:](nb.int32, nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32[:, :]), nogil=True)
-def interU(k, adj, service, clss, demand, tours):
+@nb.njit(nb.int32[:,:](nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.float32[:], nb.int32), nogil=True)
+def interU(tours, adj, service, clss, demand, k):
     change = True
     it = 0
     remain_demand = np.ones(2, np.float32)
@@ -133,7 +133,7 @@ def interU(k, adj, service, clss, demand, tours):
                 while sub_change < -1e-6 and sub_it < EPS:
                     remain_demand[0] = 1 - demand[tours[i]].sum()
                     remain_demand[1] = 1 - demand[tours[j]].sum()
-                    sub_change = once_interU(adj, service, clss, demand, remain_demand, k, sub1, sub2)
+                    sub_change = once_interU(adj, service, clss, demand, remain_demand, sub1, sub2, k)
                     sub_it += 1
                     if sub_it >= 2:
                         change = True

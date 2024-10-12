@@ -5,36 +5,64 @@ from common.nb_utils import gen_tours_batch
 from common.intra import intraP, intraU
 from common.inter import interP, interU
 from common.ops import run_parallel, convert_vars_np
+from numpy.random import random
 
+def ls(vars, variant, actions=None, tours_batch=None):
+    if tours_batch is None:
+        tours_batch = gen_tours_batch(actions)
 
-def local_search(vars, variant, actions=None, tours_batch=None, is_train=True):
+    for _ in range(3):
+        for k in [1,2,3]:
+            if random() > 0.5:
+                tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                        tours_batch,
+                                        adj=vars['adj'], 
+                                        service=vars['service_time'], 
+                                        clss=vars['clss'], 
+                                        k = k)
+            if random() > 0.5:
+                tours_batch = run_parallel(interU if variant=='U' else interP, 
+                                        tours_batch,
+                                        adj=vars['adj'], 
+                                        service=vars['service_time'], 
+                                        clss=vars['clss'],
+                                        demand=vars['demand'],
+                                        k = k)
+
+    return tours_batch
+
+def lsRL(vars, variant, actions=None, tours_batch=None, is_train=True):
     if tours_batch is None:
         tours_batch = gen_tours_batch(actions)
         
     if not isinstance(vars, dict):
         vars = convert_vars_np(vars)
 
-    bs = len(tours_batch)
     if is_train:
-        tours_batch = run_parallel(intraU if variant=='U' else intraP, [1]*bs, 
+        tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                tours_batch,
                                 vars['adj'], 
                                 vars['service_time'], 
                                 vars['clss'], 
-                                tours_batch)
+                                k = 1)
     else:
-        for _ in range(1):
+        for _ in range(3):
             for k in [1,2,3]:
-                # tours_batch = run_parallel(intraU if variant=='U' else intraP, [k]*bs, 
-                #                         vars['adj'], 
-                #                         vars['service_time'], 
-                #                         vars['clss'], 
-                #                         tours_batch)
-                tours_batch = run_parallel(interU if variant=='U' else interP, [k]*bs, 
-                                        vars['adj'], 
-                                        vars['service_time'], 
-                                        vars['clss'],
-                                        vars['demand'],
-                                        tours_batch)
+                if random() > 0.5:
+                    tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                            tours_batch,
+                                            vars['adj'], 
+                                            vars['service_time'], 
+                                            vars['clss'], 
+                                            k = k)
+                if random() > 0.5:
+                    tours_batch = run_parallel(interU if variant=='U' else interP, 
+                                            tours_batch,
+                                            vars['adj'], 
+                                            vars['service_time'], 
+                                            vars['clss'],
+                                            vars['demand'],
+                                            k = k)
 
     return tours_batch
 
