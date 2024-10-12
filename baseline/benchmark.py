@@ -78,5 +78,5 @@ if __name__ == "__main__":
     
     r1_rl = results['rl'][:, 0]
     r1_hr = results['hr'][:, 0]
-    s
+    
     print("Gap%: hr - rl:", ((r1_hr - r1_rl)/(r1_rl+1e-8) * 100).mean())

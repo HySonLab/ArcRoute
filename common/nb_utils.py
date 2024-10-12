@@ -43,17 +43,17 @@ def gen_tours_batch(actions):
     tours_batch = run_parallel(gen_tours, actions)
     return tours_batch
 
-@nb.njit(nb.int32[:](nb.int32[:,:]), nogil=True)
-def deserialize_tours(tours):
+@nb.njit(nb.int32[:](nb.int32[:,:], nb.int32), nogil=True)
+def deserialize_tours(tours, n):
     new_action = []
     for tour in tours:
         j = len(tour) - 1
         while tour[j] == 0 and j >= 0: j -= 1
         new_action.extend(tour[1:j+2])
-    # while(len(new_action) < n): new_action.append(0)
-    # while(len(new_action) > n): new_action.pop(-1)
+    while(len(new_action) < n): new_action.append(0)
+    while(len(new_action) > n): new_action.pop(-1)
     return np.int32(new_action)
 
-def deserialize_tours_batch(tours_batch):
-    new_actions = run_parallel(deserialize_tours, tours_batch)
+def deserialize_tours_batch(tours_batch, n):
+    new_actions = run_parallel(deserialize_tours, tours_batch, [n]*len(tours_batch))
     return np.array(new_actions)

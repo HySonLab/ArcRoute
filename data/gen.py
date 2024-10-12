@@ -4,6 +4,7 @@ import os
 import random
 import torch
 import numpy as np
+import shutil
 from torch.distributions import Uniform
 
 CAPACITIES = {
@@ -40,24 +41,11 @@ def get_random_connected_subgraph(G, num_nodes):
         subgraph = get_subgraph(G.copy(), num_nodes)
     return subgraph
 
-if __name__ == "__main__":
-
-    G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
-    G_proj = ox.project_graph(G_dump)
-
-    num_nodes = 45
-    pdir = f'instances/{num_nodes}'
-    if not os.path.isdir(pdir):
-        os.mkdir(pdir)
-    
-    idx = 0    
-    while idx < 1000:
-        subgraph = get_random_connected_subgraph(G_proj.copy(), num_nodes)
-        num_loc = len(subgraph.nodes())
-        num_arc = 20
-
+def gen_graph(num_loc, num_arc):
+    while True:
+        subgraph = get_random_connected_subgraph(G_proj.copy(), num_loc)
         g = nx.DiGraph()
-        map_node = {vi:i for i, vi in enumerate(random.sample(list(subgraph.nodes()), k=num_loc))}
+        map_node = {vi:i for i, vi in enumerate(subgraph.nodes())}
         for u,v,attr in subgraph.edges(data=True):
             u,v = map_node[u],map_node[v]
             g.add_edge(u,v)
@@ -109,7 +97,49 @@ if __name__ == "__main__":
 
         req = np.concatenate([e_req,demands,clss,s,d_req], axis=-1)
         nonreq = np.concatenate([e_nonreq, np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),d_nonreq], axis=-1)
-        es = np.concatenate([req,nonreq], axis=0).shape
+        break
 
-        np.savez(f'instances/{num_nodes}/{idx}_{len(req)+len(nonreq)}', req=req, nonreq=nonreq, P=3, M=2, C=capacity)
-        idx += 1
+    np.savez(f'{dir}/{len(req)+len(nonreq)}_{num_loc}_{np.random.randint(0,100):02d}', req=req, nonreq=nonreq, P=3, M=2, C=capacity)
+
+
+if __name__ == "__main__":
+
+    G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
+    G_proj = ox.project_graph(G_dump)
+
+    num = {
+        "10": ((6, 8), (4, 6)),
+        "20": ((10, 14), (6, 8)),
+        "30": ((16, 20), (8, 10)),
+        "40": ((20, 24), (10, 12)),
+        "50": ((24, 28), (12, 14)),
+        "60": ((28, 32), (14, 16)),
+        "70": ((32, 36), (16, 18)),
+        "80": ((36, 40), (16, 18)),
+        "90": ((40, 44), (16, 18)),
+        "100": ((44, 50), (18, 20)),
+    }
+
+    dir = "temp"
+    os.mkdir(dir)
+    for num_loc, num_arc in num.values():
+        print(num_loc, num_arc)
+        for i in range(50):
+            gen_graph(num_loc=np.random.randint(*num_loc), num_arc=np.random.randint(*num_arc))
+
+    
+    save = 'instances'
+    os.mkdir(save)
+    ll = np.array(sorted([(int(p.split('_')[0]), p) for p in os.listdir(dir)]))
+    nums = ll[:, 0].astype(int)
+    ps = ll[:, 1]
+    for i in range(10):
+        n = 10*i
+        low, high = np.array([8, 12])+n
+        pdir = f'{save}/{n+10}/'
+        if not os.path.isdir(pdir):
+            os.mkdir(pdir)
+        for name in ps[(nums <= high) & (nums >= low)][:10]:
+            shutil.copy(f"{dir}/{name}", pdir)
+    
+    shutil.rmtree(dir)
