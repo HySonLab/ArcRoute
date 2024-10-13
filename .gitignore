@@ -31,3 +31,4 @@ lightning_logs
 data/cache
 data/instances
 logs
+nohup.out
