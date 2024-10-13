@@ -48,21 +48,21 @@ def lsRL(vars, variant, actions=None, tours_batch=None, is_train=True):
     else:
         for _ in range(3):
             for k in [1,2,3]:
-                if random() > 0.5:
-                    tours_batch = run_parallel(intraU if variant=='U' else intraP, 
-                                            tours_batch,
-                                            vars['adj'], 
-                                            vars['service_time'], 
-                                            vars['clss'], 
-                                            k = k)
-                if random() > 0.5:
-                    tours_batch = run_parallel(interU if variant=='U' else interP, 
-                                            tours_batch,
-                                            vars['adj'], 
-                                            vars['service_time'], 
-                                            vars['clss'],
-                                            vars['demand'],
-                                            k = k)
+                # if random() > 0.5:
+                tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                        tours_batch,
+                                        vars['adj'], 
+                                        vars['service_time'], 
+                                        vars['clss'], 
+                                        k = k)
+                # if random() > 0.5:
+                tours_batch = run_parallel(interU if variant=='U' else interP, 
+                                        tours_batch,
+                                        vars['adj'], 
+                                        vars['service_time'], 
+                                        vars['clss'],
+                                        vars['demand'],
+                                        k = k)
 
     return tours_batch
 

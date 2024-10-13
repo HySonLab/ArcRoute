@@ -24,6 +24,7 @@ class RLHCARP:
         td['service_time'] = torch.tensor(s[None, :], dtype=torch.float32)
         td['traveling_time'] = torch.tensor(d[None, :], dtype=torch.float32)
         td['adj'] = torch.tensor(dms[None, :], dtype=torch.float32)
+        td = self.env.reset(td)
         self.td = td.to(self.device)
 
     def __call__(self):
