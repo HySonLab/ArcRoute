@@ -33,9 +33,9 @@ def get_Ts_RL(vars, actions=None, tours_batch=None):
     if not isinstance(vars, dict):
         vars = convert_vars_np(vars)
                                         
-    reward1 = run_parallel(reward_ins, vars['adj'], vars['service_time'], vars['clss'], tours_batch, k = 1)
-    reward2 = run_parallel(reward_ins, vars['adj'], vars['service_time'], vars['clss'], tours_batch, k = 2)
-    reward3 = run_parallel(reward_ins, vars['adj'], vars['service_time'], vars['clss'], tours_batch, k = 3)
+    reward1 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 1)
+    reward2 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 2)
+    reward3 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 3)
     return np.float32([reward1, reward2, reward3]).T
 
 @nb.njit(nb.float32(nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32), nogil=True)
@@ -48,7 +48,8 @@ def reward_ins(tours, adj, service, clss, k):
         candidate = tour[:pos[-1] + 1]
         length = calc_length(adj, service, candidate)
         r = max(r, length)
-    return r + 1000*max(0, len(tours) - 2)
+    # return r + 1000*max(0, len(tours) - 2)
+    return r 
 
 @nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)
 def reward_in(adj, service, clss, tour, k):

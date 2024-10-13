@@ -28,3 +28,6 @@ Temporary Items
 __pycache__
 ckpts
 lightning_logs
+data/cache
+data/instances
+logs

@@ -2,8 +2,9 @@ import networkx as nx
 from gurobipy import quicksum, Model, GRB
 import numpy as np
 from time import time
+from glob import glob
 
-def hdcarp_p(es):
+def LPHCARP(es):
     if isinstance(es, str):
         es = np.load(es)
     v0 = 0
@@ -38,21 +39,17 @@ def hdcarp_p(es):
 
     A = [[(u,v) for u,v,attr in edges if attr['p']==k] for k in P0]
     AA = [a for k in P0 for a in A[k]] + [(v00, node) for node in nodes] + [(node, v00) for node in nodes]
-    # AA = [a for k in P0 for a in A[k]]
     Ar = [a for k in P for a in A[k]]
-    # print(Ar)
     GG = nx.DiGraph()
     GG.add_edges_from(AA)
-    # print(nx.is_strongly_connected(GG))
 
-    # exit()
     model = Model('HDCARP')
     x = model.addVars([(m, a) for m in M for a in Ar], vtype=GRB.BINARY, name='x')
     y = model.addVars([(m, a, k) for m in M for a in AA for k in P], vtype=GRB.INTEGER, name='y')
     t = model.addVars([(m, k) for m in M for k in P0], vtype=GRB.CONTINUOUS, lb=0, name='t')
     r = model.addVars([(m, k) for m in M for k in P], vtype=GRB.BINARY, name='r')
     T = model.addVars([k for k in P], vtype=GRB.CONTINUOUS, lb=0, name='T')
-    print("Num vars:", len(x) + len(y) + len(t) + len(r) + len(T))
+    # print("Num vars:", len(x) + len(y) + len(t) + len(r) + len(T))
 
 
     # Constrain (2)
@@ -117,9 +114,11 @@ def hdcarp_p(es):
                 f2 = quicksum(y[m, a, k] for a in arcs_out)
                 f4 = quicksum(y[m, a, k] for a in arcs_in)
                 model.addConstr(f1+f2==f3+f4)
+
+    # Constraint (12)
     def subtour_elimination(model, where):
         if where == GRB.Callback.MIPSOL:  
-       
+        
             # Get the current solution
             xval = model.cbGetSolution(x)
             yval = model.cbGetSolution(y)
@@ -140,43 +139,25 @@ def hdcarp_p(es):
                         f1 = quicksum(x[me, (u,v)] for me, (u,v) in xmk 
                             if u in S and v not in S)
                         f2 = quicksum(y[me, (u,v), ke] for me, (u,v), ke in ymk
-                            if u in S and v not in S and v != v0)
+                            if u in S and v not in S)
 
                         for me, (u,v) in xmk:
                             if u in S and v in S:
                                 model.cbLazy(f1 + f2 >= x[me, (u,v)]) 	       
             
-    t1 = time()
     model.setParam(GRB.Param.OutputFlag, 0)
-    model.setParam('TimeLimit', 60)
     model.Params.lazyConstraints = 1
+    model.setParam('TimeLimit', 180)
     model.setObjective(T[1]*1000 + T[2]*10 + T[3]*0.1, GRB.MINIMIZE)
     model.optimize(subtour_elimination)
-    t2 = time()
+    runtime = model.Runtime
+    T = None if runtime >= 180 else np.array([T[1].x, T[2].x, T[3].x])
+    model.dispose()
+    return T
 
-    # routes = {m:{k:[] for k in P} for m in M}
-    # for m, (u,v) in x:
-    #     if x[m,(u,v)].x > 0:
-    #         for k in P:
-    #             if (u,v) in A[k]:
-    #                 routes[m][k].append((u,v,0))
-    # for m, e, k in y:
-    #     for i in range(int(y[m, e, k].x)):
-    #         routes[m][k].append(e+(i+1,))
 
-    # for m in M:
-    #     print('--------')
-    #     for k in P:
-    #         g = nx.MultiDiGraph()
-    #         g.add_edges_from(routes[m][k])
-    #         print(f'-------> m={m} k={k}', nx.has_eulerian_path(g, -1))
-    if t2 - t1 >= 1:
-        return [0,0,0]
-    try:
-        return [T[k].x for k in P]
-    except:
-        return [0, 0, 0]
-
-# if __name__ == "__main__":
-#     es = np.load('/home/project/ArcRoute/data/instances/30/61_20.npz')
-#     print(hdcarp_p(es))
+if __name__ == "__main__":
+    files = glob('/usr/local/sra/ArcRoute/data/instances/*/*.npz')
+    for f in files:
+        t1 = time()
+        print(f,':::', LPHCARP(f),':::', time() - t1)

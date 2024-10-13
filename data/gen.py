@@ -104,36 +104,26 @@ def gen_graph(num_loc, num_arc):
 
 if __name__ == "__main__":
 
-    G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
-    G_proj = ox.project_graph(G_dump)
+    # G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
+    # G_proj = ox.project_graph(G_dump)
 
-    num = {
-        "10": ((6, 8), (4, 6)),
-        "20": ((10, 14), (6, 8)),
-        "30": ((16, 20), (8, 10)),
-        "40": ((20, 24), (10, 12)),
-        "50": ((24, 28), (12, 14)),
-        "60": ((28, 32), (14, 16)),
-        "70": ((32, 36), (16, 18)),
-        "80": ((36, 40), (16, 18)),
-        "90": ((40, 44), (16, 18)),
-        "100": ((44, 50), (18, 20)),
-    }
+
+    # nums = list(range(10, 80, 4))
+    # nums = list(zip(nums[:-1], nums[1:]))
 
     dir = "temp"
-    os.mkdir(dir)
-    for num_loc, num_arc in num.values():
-        print(num_loc, num_arc)
-        for i in range(50):
-            gen_graph(num_loc=np.random.randint(*num_loc), num_arc=np.random.randint(*num_arc))
+    # if not os.path.isdir(dir): os.mkdir(dir)
+    # for low, high in nums:
+    #     for i in range(50):
+    #         gen_graph(num_loc=np.random.randint(low, high), num_arc=20)
 
     
     save = 'instances'
-    os.mkdir(save)
+    if not os.path.isdir(save): os.mkdir(save)
     ll = np.array(sorted([(int(p.split('_')[0]), p) for p in os.listdir(dir)]))
     nums = ll[:, 0].astype(int)
     ps = ll[:, 1]
-    for i in range(10):
+    for i in range(2, 15):
         n = 10*i
         low, high = np.array([8, 12])+n
         pdir = f'{save}/{n+10}/'
