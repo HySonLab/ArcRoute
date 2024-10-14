@@ -24,6 +24,17 @@ CAPACITIES = {
         1000: 150.0,
     }
 
+def check():
+    from glob import glob
+    from collections import defaultdict
+
+    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
+    l = defaultdict(list)
+    for file in files:
+        l[int(file.split('/')[-2])].append(file)
+    for k in l.keys():
+        print(k, len(l[k]))
+
 def get_subgraph(G, num_nodes):
     if num_nodes > G.number_of_nodes():
         raise ValueError("num_nodes is greater than the number of nodes in the graph.")
@@ -98,38 +109,39 @@ def gen_graph(num_loc, num_arc):
         req = np.concatenate([e_req,demands,clss,s,d_req], axis=-1)
         nonreq = np.concatenate([e_nonreq, np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),d_nonreq], axis=-1)
         break
-
-    np.savez(f'{dir}/{len(req)+len(nonreq)}_{num_loc}_{np.random.randint(0,100):02d}', req=req, nonreq=nonreq, P=3, M=2, C=capacity)
+    
+    fpath = f'{dir}/{len(req)+len(nonreq)}_{num_loc}_{np.random.randint(0,1000):03d}'
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=2, C=capacity)
+    return fpath + '.npz', len(req)+len(nonreq)
 
 
 if __name__ == "__main__":
 
-    # G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
-    # G_proj = ox.project_graph(G_dump)
+    G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
+    G_proj = ox.project_graph(G_dump)
 
 
-    # nums = list(range(10, 80, 4))
-    # nums = list(zip(nums[:-1], nums[1:]))
+    nums = list(range(10, 90, 4))
+    nums = list(zip(nums[:-1], nums[1:]))
 
     dir = "temp"
-    # if not os.path.isdir(dir): os.mkdir(dir)
-    # for low, high in nums:
-    #     for i in range(50):
-    #         gen_graph(num_loc=np.random.randint(low, high), num_arc=20)
+    if not os.path.isdir(dir): os.mkdir(dir)
 
-    
     save = 'instances'
     if not os.path.isdir(save): os.mkdir(save)
-    ll = np.array(sorted([(int(p.split('_')[0]), p) for p in os.listdir(dir)]))
-    nums = ll[:, 0].astype(int)
-    ps = ll[:, 1]
-    for i in range(2, 15):
+    for i in range(2, 20):
         n = 10*i
-        low, high = np.array([8, 12])+n
         pdir = f'{save}/{n+10}/'
-        if not os.path.isdir(pdir):
-            os.mkdir(pdir)
-        for name in ps[(nums <= high) & (nums >= low)][:10]:
-            shutil.copy(f"{dir}/{name}", pdir)
-    
+        if not os.path.isdir(pdir): os.mkdir(pdir)
+
+        low, high = np.array([8, 12])+n
+
+        count = 0
+        while count < 20:
+            fpath, n_arc = gen_graph(num_loc=np.random.randint(*nums[min(i-2, len(nums)-1)]), num_arc=20)
+            if not ((n_arc <= high) & (n_arc >= low)) or os.path.isfile(pdir + fpath.split('/')[-1]):
+                continue
+            shutil.move(fpath, pdir)
+            count += 1
+
     shutil.rmtree(dir)

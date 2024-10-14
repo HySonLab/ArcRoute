@@ -8,7 +8,7 @@ import numpy as np
 
 if __name__ == "__main__":
     np.random.seed(6868)
-    files = glob('/usr/local/rsa/instances/*/*.npz')
+    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
 
     al = EAHCARP(n_population=100) # EA
     for f in files:

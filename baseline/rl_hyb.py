@@ -27,16 +27,15 @@ class RLHCARP:
         td = self.env.reset(td)
         self.td = td.to(self.device)
 
-    def __call__(self):
+    def __call__(self, num_sample=100):
         # with torch.inference_mode():
         #     out = self.policy(self.td, env=self.env, decode_type='greedy', return_actions=True)
         #     obj = self.env.get_objective(self.td, out['actions'])
 
-        td = batchify(self.td, 10)
+        td = batchify(self.td, num_sample)
         with torch.inference_mode():
             out = self.policy(td, env=self.env, decode_type='sampling', return_actions=True)
             obj = self.env.get_objective(td, out['actions'])
-            print(out['actions'].cpu().numpy().tolist())
             idx = obj[:, 0].argmin()
             obj = obj[idx]
         return obj
@@ -45,9 +44,9 @@ if __name__ == "__main__":
     torch.manual_seed(6868)
     np.random.seed(6868)
 
-    files = glob('/usr/local/sra/ArcRoute/data/instances/*/*.npz')
-    al = RLHCARP('/usr/local/sra/cpkts/bestP_20_2.ckpt')
+    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
+    al = RLHCARP('/usr/local/rsa/cpkts/bestP_20_2.ckpt')
     for f in files:
         al.import_instance(f)
         t1 = time()
-        print(f,':::', al(),':::', time() - t1)
+        print(f,':::', al(num_sample=100),':::', time() - t1)
