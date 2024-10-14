@@ -57,3 +57,9 @@ def deserialize_tours(tours, n):
 def deserialize_tours_batch(tours_batch, n):
     new_actions = run_parallel(deserialize_tours, tours_batch, n=n)
     return np.array(new_actions)
+
+
+def convert_prob(a):
+    a = a - np.min(a) + np.float32(1e-4)
+    a = a / np.sum(a, axis=0)
+    return a

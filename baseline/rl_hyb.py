@@ -32,10 +32,11 @@ class RLHCARP:
         #     out = self.policy(self.td, env=self.env, decode_type='greedy', return_actions=True)
         #     obj = self.env.get_objective(self.td, out['actions'])
 
-        td = batchify(self.td, 100)
+        td = batchify(self.td, 10)
         with torch.inference_mode():
             out = self.policy(td, env=self.env, decode_type='sampling', return_actions=True)
             obj = self.env.get_objective(td, out['actions'])
+            print(out['actions'].cpu().numpy().tolist())
             idx = obj[:, 0].argmin()
             obj = obj[idx]
         return obj

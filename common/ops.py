@@ -189,8 +189,3 @@ def softmax(x):
     x = np.array(x)
     e_x = np.exp(x - np.max(x))
     return e_x / e_x.sum(axis=0) # only difference
-
-def convert_prob(a):
-    a = np.array(a)
-    a = a - np.min(a) + 1e-10
-    return a / np.sum(a, axis=0)

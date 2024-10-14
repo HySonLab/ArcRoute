@@ -8,10 +8,10 @@ import numpy as np
 
 if __name__ == "__main__":
     np.random.seed(6868)
-    files = glob('/usr/local/sra/ArcRoute/data/instances/*/*.npz')
+    files = glob('/usr/local/rsa/instances/*/*.npz')
 
     al = InsertCheapestHCARP() # ILS
     for f in files:
         al.import_instance(f)
         t1 = time()
-        print(f,':::', al(variant='P'),':::', time() - t1)
+        print(f,':::', al(variant='P', num_sample=20),':::', time() - t1)

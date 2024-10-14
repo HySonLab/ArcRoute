@@ -8,7 +8,7 @@ import numpy as np
 
 if __name__ == "__main__":
     np.random.seed(6868)
-    files = glob('/usr/local/sra/ArcRoute/data/instances/*/*.npz')
+    files = glob('/usr/local/rsa/instances/*/*.npz')
 
     al = ACOHCARP(n_ant=100) # ACO
     for f in files:
