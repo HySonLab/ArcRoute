@@ -18,6 +18,7 @@ class BaseHCARP:
         self.demands, self.clss, self.s, self.d = demands, clss, s, d
         self.edge_indxs = edge_indxs
         self.has_instance = True
+        self.max_seq = len(self.s) + (len(M) - 2)
 
         self.vars = {
             'adj': self.dms,
@@ -71,7 +72,7 @@ class InsertCheapestHCARP(BaseHCARP):
         assert self.has_instance, "please import instance first"
         actions = [self.get_once() for _ in range(num_sample)]
         tours_batch = ls(self.vars, variant=variant, actions=actions)
-        actions = deserialize_tours_batch(tours_batch, len(self.s))
+        actions = deserialize_tours_batch(tours_batch, self.max_seq)
         _, best = self.get_best(actions)
         return get_Ts(self.vars, actions=best[None])
 
@@ -84,7 +85,7 @@ class EAHCARP(BaseHCARP):
         self.crossover_rate = crossover_rate
 
     def init_population(self):
-        routes = np.int32(list(range(1, len(self.s))) + [0]*(len(self.M)-1))
+        routes = np.int32(list(range(1, self.max_seq)) + [0]*(len(self.M)-1))
         population = []
         for _ in range(self.n_population):
             routes = permutation(routes)
@@ -167,7 +168,7 @@ class ACOHCARP(BaseHCARP):
 
     def init_population(self):
         pheromones = np.zeros_like(self.dms)
-        ants = permutation(range(1, len(self.s)))
+        ants = permutation(range(1, self.max_seq))
         ants = np.concatenate([ants[:self.n_ant], np.random.choice(ants, size=self.n_ant - len(ants))])
         np.add.at(pheromones, (np.zeros_like(ants), ants), self.del_tau)
         return ants[:, None], pheromones
@@ -176,7 +177,7 @@ class ACOHCARP(BaseHCARP):
     def find_tour(self, ant, pheromones):
         tour = ant.tolist()
         sub = tour.copy()
-        while len(tour) < len(self.s):
+        while len(tour) < self.max_seq:
             mask = pheromones[tour[-1]].copy()
             mask[tour] -= 1e8
             next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
@@ -208,7 +209,7 @@ class ACOHCARP(BaseHCARP):
             # refine tours by local search
             if is_local_search:
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)
-                elitist_ants = deserialize_tours_batch(tours, len(self.s))
+                elitist_ants = deserialize_tours_batch(tours, self.max_seq)
 
             # Update pheromones 
             ant_obj, best_ants = self.get_best(elitist_ants)
