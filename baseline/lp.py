@@ -157,7 +157,7 @@ def LPHCARP(es):
 
 
 if __name__ == "__main__":
-    files = glob('/usr/local/sra/ArcRoute/data/instances/*/*.npz')
+    files = glob('/usr/local/rsa/instances/*/*.npz')
     for f in files:
         t1 = time()
         print(f,':::', LPHCARP(f),':::', time() - t1)

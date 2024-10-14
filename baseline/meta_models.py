@@ -1,11 +1,11 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from common.ops import import_instance, convert_prob
-from common.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch
-from common.cal_reward import get_Ts
 import numpy as np
 from numpy.random import random, randint, permutation
+
+from common.ops import import_instance
+from common.nb_utils import deserialize_tours, deserialize_tours_batch, convert_prob
+from common.cal_reward import get_Ts
 from common.local_search import ls
 
 class BaseHCARP:
@@ -25,37 +25,55 @@ class BaseHCARP:
             'clss': self.clss,
             'demand': self.demands
         }
-
-
-class InsertCheapestHCARP(BaseHCARP):
     
-    def calc_obj(self, path):
-        return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
+    def get_idx(self, prob, size=1, strategy='sampling'):
+        if strategy == 'greedy':
+            return np.argmax(prob)
+        
+        return np.random.choice(len(prob), size=size, p=prob)[0]
+        
 
     def is_valid(self, path):
         if self.demands[path].sum() > 1:
             return False
         return True
+    
+    def calc_obj(self, actions):
+        w = np.array([1e3, 1e1, 1e-1])
+        rewards = get_Ts(self.vars, actions=actions)
+        obj = rewards @ w
+        return -obj
+    
+    def get_best(self, samples):
+        obj = self.calc_obj(samples)
+        idx = obj.argmax()
+        return obj[idx], samples[idx]
 
-    def __call__(self, variant='P', is_local_search=True):
-        assert self.has_instance, "please import instance first"
+class InsertCheapestHCARP(BaseHCARP):
+    
+    def calc_len(self, path):
+        return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
 
+    def get_once(self):
         routes = [[0] for _ in self.M]
         for p in self.P:
             edges = np.where(self.clss==p)[0]
             for e in edges:
                 paths = [routes[m] + [e] for m in self.M]
                 idxs = [i for i, path in enumerate(paths) if self.is_valid(path)]
-                costs = [self.calc_obj(paths[i]) for i in idxs]
-                idx = np.random.choice(idxs, size=1, p=convert_prob(costs))[0]
+                costs = [self.calc_len(paths[i]) for i in idxs]
+                idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
         
-        routes = np.int32([a for tour in routes for a in tour])[None]
+        return np.int32([a for tour in routes for a in tour])
 
-        if is_local_search:
-            tours_batch = ls(self.vars, variant=variant, actions=routes)
-            return get_Ts(self.vars, tours_batch=tours_batch)
-        return get_Ts(self.vars, actions=routes)
+    def __call__(self, variant='P', num_sample=20):
+        assert self.has_instance, "please import instance first"
+        actions = [self.get_once() for _ in range(num_sample)]
+        tours_batch = ls(self.vars, variant=variant, actions=actions)
+        actions = deserialize_tours_batch(tours_batch, len(self.s))
+        _, best = self.get_best(actions)
+        return get_Ts(self.vars, actions=best[None])
 
 class EAHCARP(BaseHCARP):
     def __init__(self, n_population=500, pathnament_size=4, mutation_rate=0.5, crossover_rate=0.9):
@@ -64,19 +82,7 @@ class EAHCARP(BaseHCARP):
         self.pathnament_size = pathnament_size
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
-        self.idxs_org = np.arange(n_population)
 
-    def is_valid(self, routes):
-        if (self.demands[gen_tours(routes)].sum(-1) > 1).sum() > 0:
-            return False
-        return True
-
-    def calc_obj(self, population):
-        w = np.array([1e3, 1e1, 1e-1])
-        rewards = get_Ts(self.vars, actions=population)
-        obj = rewards @ w
-        return -obj
-    
     def init_population(self):
         routes = np.int32(list(range(1, len(self.s))) + [0]*(len(self.M)-1))
         population = []
@@ -104,9 +110,12 @@ class EAHCARP(BaseHCARP):
         tours = ls(self.vars, variant=variant, actions=tours[None])
         return deserialize_tours(tours[0], n)
     
-    def __call__(self, n_epoch=500, variant='P'):
+    def get_parent(self, population, prob):
+        return population[self.get_idx(prob, strategy='sampling', size=self.pathnament_size)]
+
+    def __call__(self, n_epoch=500, variant='P', verbose=False):
         assert self.has_instance, "please import instance first"
-        self.l_early = []
+        
         population = self.init_population()
         for epoch in range(n_epoch):
             # selecting two of the best options we have (elitism)
@@ -117,11 +126,12 @@ class EAHCARP(BaseHCARP):
 
             for i in range(len(population) // 2 - 1):
                 # CROSSOVER
-                parent1 = population[np.random.choice(self.idxs_org, size=self.pathnament_size, p=prob)[0]]
-                parent2 = population[np.random.choice(self.idxs_org, size=self.pathnament_size, p=prob)[0]]
+                parent1 = self.get_parent(population, prob)
+                parent2 = self.get_parent(population, prob)
                 if random() < self.crossover_rate:
                     child1 = self.cross_over(parent1, parent2, randint(1, len(parent1)))
-                    child2 = self.cross_over(parent2, parent1, randint(1, len(parent1)))
+                    child2 = self.cross_over(parent2, parent1, randint(1, len(parent2)))
+
                 # If crossover not happen
                 else:
                     child1 = parent1
@@ -135,8 +145,11 @@ class EAHCARP(BaseHCARP):
                 new_population.extend([child1, child2])
 
             population = new_population
-            # if epoch % 10 == 0:
-            #     print(f"epoch {epoch}:", self.l_early[-1])
+            if verbose:
+                if epoch % 10 == 0:
+                    obj = self.calc_obj(population)
+                    idx = np.argsort(obj)[-1]
+                    print(f"epoch {epoch}:", obj[idx])
 
 
         routes = population[self.calc_obj(population).argmax()]
@@ -144,82 +157,67 @@ class EAHCARP(BaseHCARP):
     
 
 class ACOHCARP(BaseHCARP):
-    def __init__(self, n_ant=100, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0, k=4):
+    def __init__(self, n_ant=100, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0):
         super().__init__()
         self.n_ant = n_ant
         self.alpha = alpha
         self.beta = beta
         self.rho = rho
         self.del_tau = del_tau
-        self.k = k
-
-    def is_valid(self,route):
-        if self.demands[route].sum() > 1:
-            return False
-        return True
-    
-    def calc_obj(self, population):
-        w = np.array([1e3, 1e1, 1e-1])
-        rewards = get_Ts(self.vars, actions=population)
-        obj = rewards @ w
-        return -obj
 
     def init_population(self):
-        pheromones = np.zeros_like(self.dms) 
-        heads = []
-        for _ in range(self.n_ant):
-            head = permutation(range(1, len(self.s)))[:self.k]
-            while not self.is_valid(head):
-                head = permutation(range(1, len(self.s)))[:self.k]
-            heads.append(head)
+        pheromones = np.zeros_like(self.dms)
+        ants = permutation(range(1, len(self.s)))
+        ants = np.concatenate([ants[:self.n_ant], np.random.choice(ants, size=self.n_ant - len(ants))])
+        np.add.at(pheromones, (np.zeros_like(ants), ants), self.del_tau)
+        return ants[:, None], pheromones
 
-        heads = np.array(heads) 
-        np.add.at(pheromones, (heads[:,:-1], heads[:,1:]), self.del_tau)
-        np.add.at(pheromones, (np.zeros_like(heads[:, 0]), heads[:, 0]), self.del_tau)
-        return heads, pheromones
-    
-    def __call__(self, n_epoch=500, variant='P', is_local_search = True):
+
+    def find_tour(self, ant, pheromones):
+        tour = ant.tolist()
+        sub = tour.copy()
+        while len(tour) < len(self.s):
+            mask = pheromones[tour[-1]].copy()
+            mask[tour] -= 1e8
+            next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+            while not self.is_valid(sub + [next]):
+                mask[next] -= 1e8
+                next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+            tour.append(next)
+            sub.append(next)
+            if next == 0:
+                sub = []
+        return tour
+
+    def update_pheromones(self, best_ants, pheromones):
+        pheromones[best_ants[:-1], best_ants[1:]] += self.del_tau
+        pheromones *= (1 - self.rho)
+        return pheromones
+
+    def __call__(self, n_epoch=500, variant='P', is_local_search = True, verbose=False):
         assert self.has_instance, "please import instance first"
         
-        heads, pheromones = self.init_population()
-        i_max, max_obj = 0, -np.inf
-        
+        ants, pheromones = self.init_population()
+        best_obj = -np.inf
         elitist_epochs = []
         for epoch in range(n_epoch):
-            elitist_ants = []
-            for head in heads:
-                tour = head.tolist()
-                sub = tour.copy()
-                while len(tour) < len(self.s):
-                    mask = pheromones[tour[-1]].copy()
-                    mask[tour] -= 1e8
-                    next = np.argmax(mask)
-                    while not self.is_valid(sub + [next]):
-                        mask[next] -= 1e8
-                        next = np.argmax(mask)
-                    tour.append(next)
-                    sub.append(next)
-                    if next == 0:
-                        sub = []
-                elitist_ants.append(tour)
 
+            # Constructing tour of ants
+            elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants]
+            
+            # refine tours by local search
             if is_local_search:
-                n = len(elitist_ants[0])
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)
-                elitist_ants = deserialize_tours_batch(tours, n)
+                elitist_ants = deserialize_tours_batch(tours, len(self.s))
 
-            # Update elite pheromones
-            obj = self.calc_obj(elitist_ants)
-            i_objmax = obj.argmax()
-            if obj[i_objmax] > max_obj:
-                max_obj = obj[i_objmax]
-                i_max = epoch
-            elitist = np.int32(elitist_ants[i_objmax])
-            pheromones[elitist[:-1], elitist[1:]] += self.del_tau
-            pheromones *= (1 - self.rho)
+            # Update pheromones 
+            ant_obj, best_ants = self.get_best(elitist_ants)
+            pheromones = self.update_pheromones(best_ants, pheromones)
 
-            elitist_epochs.append(elitist)
-            # if epoch % 10 == 0:
-            #     print(f"epoch {epoch}:", max_obj)
+            best_obj = max(best_obj, ant_obj)
+            elitist_epochs.append(best_ants)
+            if verbose:
+                if epoch % 10 == 0:
+                    print(f"epoch {epoch}:", best_obj)
         
-        return get_Ts(self.vars, actions=elitist_epochs[i_max][None])
+        return get_Ts(self.vars, actions=self.get_best(elitist_epochs)[1][None])

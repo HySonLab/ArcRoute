@@ -39,7 +39,7 @@ class PPO(LightningModule):
         },
         lr_scheduler_interval: str = "step",
         lr_scheduler_monitor: str = "val/reward",
-        shuffle_train_dataloader: bool = False,
+        shuffle_train_dataloader: bool = True,
         dataloader_num_workers: int = 0,
     ):
         super().__init__()
@@ -292,8 +292,9 @@ class PPO(LightningModule):
         """
         # Only update if not in the first epoch
         # If last epoch, we don't need to update since we will not use the dataset anymore
-        if self.current_epoch < self.trainer.max_epochs - 1:
-            self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"])
+        # if self.current_epoch < self.trainer.max_epochs - 1:
+        #     self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"])
+        pass
 
     def _dataloader(self, dataset, batch_size, shuffle=False):
         """Handle both single datasets and list / dict of datasets"""
