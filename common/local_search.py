@@ -13,21 +13,21 @@ def ls(vars, variant, actions=None, tours_batch=None):
 
     for _ in range(3):
         for k in [1,2,3]:
-            if random() > 0.5:
-                tours_batch = run_parallel(intraU if variant=='U' else intraP, 
-                                        tours_batch,
-                                        adj=vars['adj'], 
-                                        service=vars['service_time'], 
-                                        clss=vars['clss'], 
-                                        k = k)
-            if random() > 0.5:
-                tours_batch = run_parallel(interU if variant=='U' else interP, 
-                                        tours_batch,
-                                        adj=vars['adj'], 
-                                        service=vars['service_time'], 
-                                        clss=vars['clss'],
-                                        demand=vars['demand'],
-                                        k = k)
+            # if random() > 0.5:
+            tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                    tours_batch,
+                                    adj=vars['adj'], 
+                                    service=vars['service_time'], 
+                                    clss=vars['clss'], 
+                                    k = k)
+            # if random() > 0.5:
+            tours_batch = run_parallel(interU if variant=='U' else interP, 
+                                    tours_batch,
+                                    adj=vars['adj'], 
+                                    service=vars['service_time'], 
+                                    clss=vars['clss'],
+                                    demand=vars['demand'],
+                                    k = k)
 
     return tours_batch
 

@@ -7,6 +7,7 @@ import numpy as np
 from common.ops import import_instance, batchify
 from glob import glob
 from time import time
+import argparse
 
 class RLHCARP:
     def __init__(self, pw, device='cuda'):
@@ -40,13 +41,27 @@ class RLHCARP:
             obj = obj[idx]
         return obj
 
-if __name__ == "__main__":
-    torch.manual_seed(6868)
-    np.random.seed(6868)
 
-    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
-    al = RLHCARP('/usr/local/rsa/cpkts/bestP_20_2.ckpt')
+def parse_args():
+    parser = argparse.ArgumentParser(description="RLHCARP")
+    
+    # Add arguments
+    parser.add_argument('--seed', type=int, default=6868, help='Random seed')
+    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--num_sample', type=int, default=500, help='num_sample')
+    parser.add_argument('--cpkt', type=str, default='/usr/local/rsa/cpkts/bestP_20_2.ckpt', help='cpkt')
+    parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
+    
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    files = glob(args.path + '/*/*.npz')
+    al = RLHCARP(args.cpkt)
     for f in files:
         al.import_instance(f)
         t1 = time()
-        print(f,':::', al(num_sample=100),':::', time() - t1)
+        print(f,':::', al(num_sample=args.num_sample),':::', time() - t1)
