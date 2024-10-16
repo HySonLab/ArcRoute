@@ -4,7 +4,7 @@ import numpy as np
 from numpy.random import random, randint, permutation
 
 from common.ops import import_instance
-from common.nb_utils import deserialize_tours, deserialize_tours_batch, convert_prob
+from common.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
 from common.cal_reward import get_Ts
 from common.local_search import ls
 
@@ -18,7 +18,8 @@ class BaseHCARP:
         self.demands, self.clss, self.s, self.d = demands, clss, s, d
         self.edge_indxs = edge_indxs
         self.has_instance = True
-        self.max_seq = len(self.s) + (len(M) - 2)
+        self.nv = len(M)
+        self.nseq = len(self.s) + (self.nv - 2)
 
         self.vars = {
             'adj': self.dms,
@@ -34,8 +35,13 @@ class BaseHCARP:
         return np.random.choice(len(prob), size=size, p=prob)[0]
         
 
-    def is_valid(self, path):
+    def is_valid_once(self, path):
         if self.demands[path].sum() > 1:
+            return False
+        return True
+    
+    def is_valid(self, routes):
+        if (self.demands[gen_tours(routes)].sum(-1) > 1).sum() > 0:
             return False
         return True
     
@@ -51,10 +57,6 @@ class BaseHCARP:
         return obj[idx], samples[idx]
 
 class InsertCheapestHCARP(BaseHCARP):
-    
-    def calc_len(self, path):
-        return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
-
     def get_once(self):
         routes = [[0] for _ in self.M]
         for p in self.P:
@@ -62,7 +64,7 @@ class InsertCheapestHCARP(BaseHCARP):
             for e in edges:
                 paths = [routes[m] + [e] for m in self.M]
                 idxs = [i for i, path in enumerate(paths) if self.is_valid(path)]
-                costs = [self.calc_len(paths[i]) for i in idxs]
+                costs = [self.is_valid_once(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
         
@@ -167,31 +169,39 @@ class ACOHCARP(BaseHCARP):
         self.del_tau = del_tau
 
     def init_population(self):
-        pheromones = np.zeros_like(self.dms)
-        ants = permutation(range(1, self.max_seq))
-        ants = np.concatenate([ants[:self.n_ant], np.random.choice(ants, size=self.n_ant - len(ants))])
-        np.add.at(pheromones, (np.zeros_like(ants), ants), self.del_tau)
-        return ants[:, None], pheromones
+        pheromones = np.zeros((self.nv, *(self.dms.shape)))
+        ants = np.int32([np.stack([np.zeros(self.nv), 
+                        permutation(range(1, self.nseq))[:self.nv]]).T
+                        for _ in range(self.n_ant)])
+        for m in self.M:
+            ant = ants[:, m]
+            np.add.at(pheromones[m], (ant[:, :-1], ant[:, 1:]), self.del_tau)
+        return ants, pheromones
 
 
     def find_tour(self, ant, pheromones):
-        tour = ant.tolist()
-        sub = tour.copy()
-        while len(tour) < self.max_seq:
-            mask = pheromones[tour[-1]].copy()
-            mask[tour] -= 1e8
-            next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-            while not self.is_valid(sub + [next]):
-                mask[next] -= 1e8
-                next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-            tour.append(next)
-            sub.append(next)
-            if next == 0:
-                sub = []
-        return tour
+        while True:
+            visited = np.unique(ant).tolist()
+            _ant = ant.tolist()
+            while len(visited) < len(self.s):
+                for i in self.M:
+                    tour = _ant[i]
+                    mask = pheromones[i][tour[-1]].copy()
+                    mask[visited] -= 1e8
+                    next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+                    while not self.is_valid_once(tour + [next]):
+                        mask[next] -= 1e8
+                        next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+                    _ant[i].append(next)
+                    visited.append(next)
+            routes = np.int32(np.concatenate(_ant))
+            if self.is_valid(routes):
+                return routes[1:]
 
     def update_pheromones(self, best_ants, pheromones):
-        pheromones[best_ants[:-1], best_ants[1:]] += self.del_tau
+        best_ants = gen_tours(best_ants)
+        for m in self.M:
+            np.add.at(pheromones[m], (best_ants[m, :-1], best_ants[m, 1:]), 1)
         pheromones *= (1 - self.rho)
         return pheromones
 
@@ -205,11 +215,11 @@ class ACOHCARP(BaseHCARP):
 
             # Constructing tour of ants
             elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants]
-            
+
             # refine tours by local search
             if is_local_search:
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)
-                elitist_ants = deserialize_tours_batch(tours, self.max_seq)
+                elitist_ants = deserialize_tours_batch(tours, self.nseq)
 
             # Update pheromones 
             ant_obj, best_ants = self.get_best(elitist_ants)
@@ -220,5 +230,6 @@ class ACOHCARP(BaseHCARP):
             if verbose:
                 if epoch % 10 == 0:
                     print(f"epoch {epoch}:", best_obj)
-        
-        return get_Ts(self.vars, actions=self.get_best(elitist_epochs)[1][None])
+                    
+        best = self.get_best(elitist_epochs)[1][None]
+        return get_Ts(self.vars, actions=best)
