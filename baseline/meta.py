@@ -57,14 +57,16 @@ class BaseHCARP:
         return obj[idx], samples[idx]
 
 class InsertCheapestHCARP(BaseHCARP):
+    def calc_len(self, path):
+        return self.s[path].sum() + self.dms[path[:-1], path[1:]].sum()
     def get_once(self):
         routes = [[0] for _ in self.M]
         for p in self.P:
             edges = np.where(self.clss==p)[0]
             for e in edges:
                 paths = [routes[m] + [e] for m in self.M]
-                idxs = [i for i, path in enumerate(paths) if self.is_valid(path)]
-                costs = [self.is_valid_once(paths[i]) for i in idxs]
+                idxs = [i for i, path in enumerate(paths) if self.is_valid_once(path)]
+                costs = [self.calc_len(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
         
@@ -74,7 +76,7 @@ class InsertCheapestHCARP(BaseHCARP):
         assert self.has_instance, "please import instance first"
         actions = [self.get_once() for _ in range(num_sample)]
         tours_batch = ls(self.vars, variant=variant, actions=actions)
-        actions = deserialize_tours_batch(tours_batch, self.max_seq)
+        actions = deserialize_tours_batch(tours_batch, self.nseq)
         _, best = self.get_best(actions)
         return get_Ts(self.vars, actions=best[None])
 
@@ -87,7 +89,7 @@ class EAHCARP(BaseHCARP):
         self.crossover_rate = crossover_rate
 
     def init_population(self):
-        routes = np.int32(list(range(1, self.max_seq)) + [0]*(len(self.M)-1))
+        routes = np.int32(list(range(1, self.nseq)) + [0]*(len(self.M)-1))
         population = []
         for _ in range(self.n_population):
             routes = permutation(routes)
