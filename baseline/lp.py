@@ -154,10 +154,20 @@ def LPHCARP(es):
     T = None if runtime >= 180 else np.array([T[1].x, T[2].x, T[3].x])
     model.dispose()
     return T
+import argparse
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="LPHCARP")
+    
+    # Add arguments
+    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
+    
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
+    args = parse_args()
+    files = glob(args.path + '/*/*.npz')
     for f in files:
         t1 = time()
         try:
