@@ -35,11 +35,6 @@ def gen_tours(action):
     return padded
 
 def gen_tours_batch(actions):
-    if isinstance(actions, list):
-        actions = np.int32(actions)
-    if not isinstance(actions, np.ndarray):
-        actions = actions.cpu().numpy().astype(np.int32)
-       
     tours_batch = run_parallel(gen_tours, actions)
     return tours_batch
 

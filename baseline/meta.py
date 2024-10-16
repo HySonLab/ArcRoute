@@ -19,7 +19,8 @@ class BaseHCARP:
         self.edge_indxs = edge_indxs
         self.has_instance = True
         self.nv = len(M)
-        self.nseq = len(self.s) + (self.nv - 2)
+        self.nseq = len(self.s)
+        self.max_len = self.nseq + (self.nv - 2)
 
         self.vars = {
             'adj': self.dms,
@@ -40,9 +41,12 @@ class BaseHCARP:
             return False
         return True
     
-    def is_valid(self, routes):
+    def is_valid(self, routes, only_check_demand=False):
         if (self.demands[gen_tours(routes)].sum(-1) > 1).sum() > 0:
             return False
+        if not only_check_demand:
+            if (routes == 0).sum() >= len(self.M):
+                return False
         return True
     
     def calc_obj(self, actions):
@@ -99,21 +103,21 @@ class EAHCARP(BaseHCARP):
         population = np.array(population)
         return population
     
-    def _cross_over(self, p1, p2, k):
+    def _cross_over(self, p1, p2):
+        k = randint(1, len(p1))
         child = p1[:k]
         child = np.concatenate((child, p2[~np.isin(p2, child)]))
         return child
     
-    def cross_over(self, p1, p2, k):
-        child = self._cross_over(p1, p2, k)
+    def cross_over(self, p1, p2):
+        child = self._cross_over(p1.copy(), p2.copy())
         while not self.is_valid(child):
-            child = self._cross_over(p1, p2, k)
+            child = self._cross_over(p1.copy(), p2.copy())
         return child
 
     def mutate(self, tours, variant):
-        n = len(tours)
         tours = ls(self.vars, variant=variant, actions=tours[None])
-        return deserialize_tours(tours[0], n)
+        return deserialize_tours(tours[0], self.max_len)
     
     def get_parent(self, population, prob):
         return population[self.get_idx(prob, strategy='sampling', size=self.pathnament_size)]
@@ -128,14 +132,13 @@ class EAHCARP(BaseHCARP):
             idxs = np.argsort(obj)
             new_population = [population[idxs[-1]], population[idxs[-2]]]
             prob = convert_prob(obj)
-
             for i in range(len(population) // 2 - 1):
                 # CROSSOVER
                 parent1 = self.get_parent(population, prob)
                 parent2 = self.get_parent(population, prob)
                 if random() < self.crossover_rate:
-                    child1 = self.cross_over(parent1, parent2, randint(1, len(parent1)))
-                    child2 = self.cross_over(parent2, parent1, randint(1, len(parent2)))
+                    child1 = self.cross_over(parent1, parent2)
+                    child2 = self.cross_over(parent2, parent1)
 
                 # If crossover not happen
                 else:
@@ -143,7 +146,7 @@ class EAHCARP(BaseHCARP):
                     child2 = parent2
 
                 # MUTATION
-                if random() <self.mutation_rate:
+                if random() < self.mutation_rate:
                     child1 = self.mutate(child1, variant)
                     child2 = self.mutate(child1, variant)
 
@@ -171,13 +174,12 @@ class ACOHCARP(BaseHCARP):
         self.del_tau = del_tau
 
     def init_population(self):
-        pheromones = np.zeros((self.nv, *(self.dms.shape)))
+        pheromones = np.zeros_like(self.dms)
         ants = np.int32([np.stack([np.zeros(self.nv), 
                         permutation(range(1, self.nseq))[:self.nv]]).T
                         for _ in range(self.n_ant)])
         for m in self.M:
-            ant = ants[:, m]
-            np.add.at(pheromones[m], (ant[:, :-1], ant[:, 1:]), self.del_tau)
+            np.add.at(pheromones, (ants[:, m, :-1], ants[:, m, 1:]), self.del_tau)
         return ants, pheromones
 
 
@@ -185,10 +187,10 @@ class ACOHCARP(BaseHCARP):
         while True:
             visited = np.unique(ant).tolist()
             _ant = ant.tolist()
-            while len(visited) < len(self.s):
-                for i in self.M:
+            while len(visited) < self.nseq:
+                for i in range(len(_ant)):
                     tour = _ant[i]
-                    mask = pheromones[i][tour[-1]].copy()
+                    mask = pheromones[tour[-1]].copy()
                     mask[visited] -= 1e8
                     next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
                     while not self.is_valid_once(tour + [next]):
@@ -197,13 +199,13 @@ class ACOHCARP(BaseHCARP):
                     _ant[i].append(next)
                     visited.append(next)
             routes = np.int32(np.concatenate(_ant))
-            if self.is_valid(routes):
+            if self.is_valid(routes, only_check_demand=True):
                 return routes[1:]
 
     def update_pheromones(self, best_ants, pheromones):
         best_ants = gen_tours(best_ants)
         for m in self.M:
-            np.add.at(pheromones[m], (best_ants[m, :-1], best_ants[m, 1:]), 1)
+            np.add.at(pheromones, (best_ants[m, :-1], best_ants[m, 1:]), 1)
         pheromones *= (1 - self.rho)
         return pheromones
 
@@ -232,6 +234,6 @@ class ACOHCARP(BaseHCARP):
             if verbose:
                 if epoch % 10 == 0:
                     print(f"epoch {epoch}:", best_obj)
-                    
+
         best = self.get_best(elitist_epochs)[1][None]
         return get_Ts(self.vars, actions=best)
