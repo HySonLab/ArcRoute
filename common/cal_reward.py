@@ -48,8 +48,8 @@ def reward_ins(tours, adj, service, clss, k):
         candidate = tour[:pos[-1] + 1]
         length = calc_length(adj, service, candidate)
         r = max(r, length)
-    return r + 1000*max(0, len(tours) - 2)
-    # return r 
+    # return r + 1000*max(0, len(tours) - 2)
+    return r 
 
 @nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)
 def reward_in(adj, service, clss, tour, k):

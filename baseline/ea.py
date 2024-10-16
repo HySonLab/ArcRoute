@@ -27,5 +27,6 @@ if __name__ == "__main__":
     al = EAHCARP(n_population=args.n_population) # EA
     for f in files:
         al.import_instance(f)
+        print(f)
         t1 = time()
         print(f,':::' , al(n_epoch=args.max_epoch, variant=args.variant),':::' , time() - t1)

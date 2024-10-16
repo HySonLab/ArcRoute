@@ -3,6 +3,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from tensordict.tensordict import TensorDict
 import torch
+import numpy as np
 from env.generator import CARPGenerator, TensorDictDataset
 from common.cal_reward import get_reward, get_Ts_RL
 from common.local_search import lsRL
@@ -105,13 +106,13 @@ class CARPEnv:
         return self.dataset_cls(td)
 
     def get_objective(self, td, actions, is_local_search=True):
-        tours_batch = gen_tours_batch(actions)
+        tours_batch = gen_tours_batch(actions.cpu().numpy().astype(np.int32))
         if is_local_search:
             tours_batch = lsRL(td, tours_batch=tours_batch, variant=self.variant, is_train=False)  
         return get_Ts_RL(td, tours_batch=tours_batch)
 
     def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
-        tours_batch = gen_tours_batch(actions)
+        tours_batch = gen_tours_batch(actions.cpu().numpy().astype(np.int32))
         tours_batch = lsRL(td, tours_batch=tours_batch, variant=self.variant, is_train=True)
         r = get_reward(td, tours_batch=tours_batch)
         r = -torch.tensor(r, device=td.device)
