@@ -7,6 +7,7 @@ from common.ops import import_instance
 from common.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
 from common.cal_reward import get_Ts
 from common.local_search import ls
+from copy import deepcopy
 
 class BaseHCARP:
     def __init__(self):
@@ -34,7 +35,6 @@ class BaseHCARP:
             return np.argmax(prob)
         
         return np.random.choice(len(prob), size=size, p=prob)[0]
-        
 
     def is_valid_once(self, path):
         if self.demands[path].sum() > 1:
@@ -55,37 +55,37 @@ class BaseHCARP:
         obj = rewards @ w
         return -obj
     
+    def calc_len(self, path):
+        return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
+    
     def get_best(self, samples):
         obj = self.calc_obj(samples)
         idx = obj.argmax()
         return obj[idx], samples[idx]
-
-class InsertCheapestHCARP(BaseHCARP):
-    def calc_len(self, path):
-        return self.s[path].sum() + self.dms[path[:-1], path[1:]].sum()
-    def get_once(self):
-        routes = [[0] for _ in self.M]
+    
+    def get_once(self, M, clss):
+        routes = [[0] for _ in M]
         for p in self.P:
-            edges = np.where(self.clss==p)[0]
+            edges = np.where(clss==p)[0]
             for e in edges:
-                paths = [routes[m] + [e] for m in self.M]
+                paths = [routes[m] + [e] for m in M]
                 idxs = [i for i, path in enumerate(paths) if self.is_valid_once(path)]
                 costs = [self.calc_len(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
         
-        return np.int32([a for tour in routes for a in tour])
+        return np.int32([a for tour in routes for a in tour])[1:]
 
+class InsertCheapestHCARP(BaseHCARP):
     def __call__(self, variant='P', num_sample=20):
         assert self.has_instance, "please import instance first"
-        actions = [self.get_once() for _ in range(num_sample)]
+        actions = [self.get_once(self.M, self.clss) for _ in range(num_sample)]
         tours_batch = ls(self.vars, variant=variant, actions=actions)
         actions = deserialize_tours_batch(tours_batch, self.nseq)
         _, best = self.get_best(actions)
         return get_Ts(self.vars, actions=best[None])
-
 class EAHCARP(BaseHCARP):
-    def __init__(self, n_population=500, pathnament_size=4, mutation_rate=0.5, crossover_rate=0.9):
+    def __init__(self, n_population=50, pathnament_size=4, mutation_rate=0.5, crossover_rate=0.9):
         super().__init__()
         self.n_population = n_population
         self.pathnament_size = pathnament_size
@@ -102,17 +102,26 @@ class EAHCARP(BaseHCARP):
             population.append(routes)
         population = np.array(population)
         return population
-    
+
     def _cross_over(self, p1, p2):
-        k = randint(1, len(p1))
-        child = p1[:k]
-        child = np.concatenate((child, p2[~np.isin(p2, child)]))
-        return child
+        child1 = p1[:np.where(p1==0)[0][0]]
+        child2 = p2[:np.where(p2==0)[0][0]]
+        clss = self.clss.copy()
+        clss[child1] = 0
+        clss[child2] = 0
+        child = self.get_once(range(len(self.M)-2), clss) if len(self.M)-2 > 0 else []
+        clss = self.clss.copy()
+        clss[child] = 0
+        if len(self.M)-2 > 0:
+            return np.concatenate([child, np.int32([0]), self.get_once(range(2), clss)])
+        return np.int32(self.get_once(range(2), clss))
     
     def cross_over(self, p1, p2):
-        child = self._cross_over(p1.copy(), p2.copy())
+        child = self._cross_over(p1, p2)
+        
         while not self.is_valid(child):
-            child = self._cross_over(p1.copy(), p2.copy())
+            child = self._cross_over(p1, p2)
+        # print(child)
         return child
 
     def mutate(self, tours, variant):
@@ -122,7 +131,7 @@ class EAHCARP(BaseHCARP):
     def get_parent(self, population, prob):
         return population[self.get_idx(prob, strategy='sampling', size=self.pathnament_size)]
 
-    def __call__(self, n_epoch=500, variant='P', verbose=False):
+    def __call__(self, n_epoch=50, variant='P', verbose=False):
         assert self.has_instance, "please import instance first"
         
         population = self.init_population()
@@ -159,13 +168,11 @@ class EAHCARP(BaseHCARP):
                     idx = np.argsort(obj)[-1]
                     print(f"epoch {epoch}:", obj[idx])
 
-
         routes = population[self.calc_obj(population).argmax()]
         return get_Ts(self.vars, actions=routes[None])
-    
 
 class ACOHCARP(BaseHCARP):
-    def __init__(self, n_ant=100, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0):
+    def __init__(self, n_ant=50, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0):
         super().__init__()
         self.n_ant = n_ant
         self.alpha = alpha
@@ -175,32 +182,51 @@ class ACOHCARP(BaseHCARP):
 
     def init_population(self):
         pheromones = np.zeros_like(self.dms)
-        ants = np.int32([np.stack([np.zeros(self.nv), 
-                        permutation(range(1, self.nseq))[:self.nv]]).T
-                        for _ in range(self.n_ant)])
-        for m in self.M:
-            np.add.at(pheromones, (ants[:, m, :-1], ants[:, m, 1:]), self.del_tau)
+        ants = []
+        idx_clss = np.unique(self.clss)[1:]
+        l_idxs = [np.where(self.clss == k)[0].tolist() for k in idx_clss]
+        for _ in range(self.n_ant):
+            tours = []
+            for vs in l_idxs:
+                for v in permutation(vs):
+                    if len(tours) == len(self.M): break
+                    tours.append([0, v])
+            ants.append(tours)
         return ants, pheromones
 
+    def get_next(self, path, mask):
+        if (mask < 0).all(): return False, None
+        next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+        while not self.is_valid_once(path + [next]):
+            if (mask < 0).all(): return False, None
+            mask[next] -= 1e8
+            next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+        return True, next
 
-    def find_tour(self, ant, pheromones):
-        while True:
-            visited = np.unique(ant).tolist()
-            _ant = ant.tolist()
+    def find_tour(self, ant, pheromones, attemp=20):
+        for _ in range(attemp):
+            a = deepcopy(ant)
+            visited = np.unique(a).tolist()
             while len(visited) < self.nseq:
-                for i in range(len(_ant)):
-                    tour = _ant[i]
-                    mask = pheromones[tour[-1]].copy()
+                check = False
+                for t in a:
+                    mask = pheromones[t[-1]].copy()
                     mask[visited] -= 1e8
-                    next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-                    while not self.is_valid_once(tour + [next]):
-                        mask[next] -= 1e8
-                        next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-                    _ant[i].append(next)
-                    visited.append(next)
-            routes = np.int32(np.concatenate(_ant))
+                    idxs = np.where(mask >= 0)[0]
+                    idxs = idxs[self.clss[idxs] < self.clss[t[-1]]]
+                    mask[idxs] -= 1e8
+                    is_find, next = self.get_next(t, mask)
+                    check = check or is_find
+                    if is_find:
+                        t.append(next)
+                        visited.append(next)
+                if not check: 
+                    a = deepcopy(ant)
+                    visited = np.unique(a).tolist()
+            routes = np.int32(np.concatenate(a))
             if self.is_valid(routes, only_check_demand=True):
                 return routes[1:]
+        return None
 
     def update_pheromones(self, best_ants, pheromones):
         best_ants = gen_tours(best_ants)
@@ -216,9 +242,10 @@ class ACOHCARP(BaseHCARP):
         best_obj = -np.inf
         elitist_epochs = []
         for epoch in range(n_epoch):
-
+            
             # Constructing tour of ants
-            elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants]
+            elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants[:20] if ant is not None]
+            elitist_ants.extend([self.get_once(self.M, self.clss) for _ in range(30)])
 
             # refine tours by local search
             if is_local_search:
