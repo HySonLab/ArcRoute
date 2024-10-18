@@ -54,7 +54,9 @@ def deserialize_tours_batch(tours_batch, n):
     return np.array(new_actions)
 
 
-def convert_prob(a):
-    a = a - np.min(a) + np.float32(1e-4)
-    a = a / np.sum(a, axis=0)
-    return a
+def convert_prob(x):
+    # a = a - np.min(a) + np.float32(1e-4)
+    # a = a / np.sum(a, axis=0)
+    # return a
+    a = np.logaddexp.reduce(x)
+    return np.exp(x - a)
