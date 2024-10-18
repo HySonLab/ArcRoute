@@ -59,7 +59,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    files = glob(args.path + '/*/*.npz')
+    files = sorted(glob(args.path + '/*/*.npz'))
     al = RLHCARP(args.cpkt)
     for f in files:
         al.import_instance(f)

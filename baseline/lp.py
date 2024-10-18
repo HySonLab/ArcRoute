@@ -167,7 +167,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    files = glob(args.path + '/*/*.npz')
+    files = sorted(glob(args.path + '/*/*.npz'))
     for f in files:
         t1 = time()
         try:

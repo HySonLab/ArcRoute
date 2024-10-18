@@ -21,7 +21,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     np.random.seed(args.seed)
-    files = glob(args.path + '/*/*.npz')
+    files = sorted(glob(args.path + '/*/*.npz'))
 
     al = InsertCheapestHCARP() # ILS
     for f in files:
