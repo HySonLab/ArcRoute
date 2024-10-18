@@ -125,6 +125,12 @@ def run_parallel(operation, *args, **kwargs):
         futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
         return [f.result() for f in futures]
 
+def run_parallel2(operation, *args, **kwargs):
+    with concurrent.futures.ProcessPoolExecutor(5) as executor:
+        futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
+    
+    return [f.result() for f in futures]
+
 def convert_vars_np(td):
     adj = td['adj'].detach().clone()
     torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))

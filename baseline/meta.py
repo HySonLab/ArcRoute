@@ -3,7 +3,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import numpy as np
 from numpy.random import random, randint, permutation
 
-from common.ops import import_instance
+from common.ops import import_instance, run_parallel2
 from common.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
 from common.cal_reward import get_Ts
 from common.local_search import ls
@@ -192,40 +192,47 @@ class ACOHCARP(BaseHCARP):
                     if len(tours) == len(self.M): break
                     tours.append([0, v])
             ants.append(tours)
+        for i, mask in enumerate(pheromones):
+            mask[self.clss < self.clss[i]] = -np.inf
+        
         return ants, pheromones
 
-    def get_next(self, path, mask):
-        if (mask < 0).all(): return False, None
+    def get_next(self, t, mask):
+        if (mask < 0).all(): return None
         next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-        while not self.is_valid_once(path + [next]):
-            if (mask < 0).all(): return False, None
-            mask[next] -= 1e8
+        while not self.is_valid_once(t + [next]):
+            mask[next] = -np.inf
+            if (mask < 0).all(): return None
             next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-        return True, next
+        return next
 
-    def find_tour(self, ant, pheromones, attemp=20):
-        for _ in range(attemp):
-            a = deepcopy(ant)
-            visited = np.unique(a).tolist()
-            while len(visited) < self.nseq:
-                check = False
-                for t in a:
-                    mask = pheromones[t[-1]].copy()
-                    mask[visited] -= 1e8
-                    idxs = np.where(mask >= 0)[0]
-                    idxs = idxs[self.clss[idxs] < self.clss[t[-1]]]
-                    mask[idxs] -= 1e8
-                    is_find, next = self.get_next(t, mask)
-                    check = check or is_find
-                    if is_find:
-                        t.append(next)
-                        visited.append(next)
-                if not check: 
-                    a = deepcopy(ant)
-                    visited = np.unique(a).tolist()
-            routes = np.int32(np.concatenate(a))
-            if self.is_valid(routes, only_check_demand=True):
-                return routes[1:]
+    def find_tour(self, ant, pheromones):
+        a = deepcopy(ant)
+        org_visited = np.unique(a)
+        visited = org_visited.copy().tolist()
+        org_masks = pheromones.copy()
+        org_masks[:, org_visited] = -np.inf
+        masks = org_masks.copy()
+        while len(visited) < self.nseq:
+            check = False
+            ii = permutation(range(len(a)))
+            for i in ii:
+                t = a[i]
+                mask = masks[t[-1]].copy()
+                next = self.get_next(t, mask)
+                check = check or next is not None
+                if next is None: continue
+                t.append(next)
+                visited.append(next)
+                masks[:, next] = -np.inf
+            if not check:
+                a = deepcopy(ant)
+                visited = org_visited.copy().tolist()
+                masks = org_masks.copy()
+            
+        routes = np.int32(np.concatenate(a))
+        if self.is_valid(routes, only_check_demand=True):
+            return routes[1:]
         return None
 
     def update_pheromones(self, best_ants, pheromones):
@@ -244,8 +251,9 @@ class ACOHCARP(BaseHCARP):
         for epoch in range(n_epoch):
             
             # Constructing tour of ants
-            elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants[:20] if ant is not None]
-            elitist_ants.extend([self.get_once(self.M, self.clss) for _ in range(30)])
+            # elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants]
+            elitist_ants = run_parallel2(self.find_tour, ants, pheromones=pheromones)
+
 
             # refine tours by local search
             if is_local_search:
