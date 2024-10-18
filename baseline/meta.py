@@ -180,7 +180,7 @@ class ACOHCARP(BaseHCARP):
         self.rho = rho
         self.del_tau = del_tau
 
-    def init_population(self):
+    def init_population(self, variant):
         pheromones = np.zeros_like(self.dms)
         ants = []
         idx_clss = np.unique(self.clss)[1:]
@@ -192,8 +192,10 @@ class ACOHCARP(BaseHCARP):
                     if len(tours) == len(self.M): break
                     tours.append([0, v])
             ants.append(tours)
-        for i, mask in enumerate(pheromones):
-            mask[self.clss < self.clss[i]] = -np.inf
+
+        if variant == 'U':
+            for i, mask in enumerate(pheromones):
+                mask[self.clss < self.clss[i]] = -np.inf
         
         return ants, pheromones
 
@@ -245,7 +247,7 @@ class ACOHCARP(BaseHCARP):
     def __call__(self, n_epoch=500, variant='P', is_local_search = True, verbose=False):
         assert self.has_instance, "please import instance first"
         
-        ants, pheromones = self.init_population()
+        ants, pheromones = self.init_population(variant)
         best_obj = -np.inf
         elitist_epochs = []
         for epoch in range(n_epoch):
