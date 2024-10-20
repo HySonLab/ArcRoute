@@ -1,2 +1,7 @@
+numpy
 torch
+tensordict
+lightning 
+einops
+gurobipy 
 numba
