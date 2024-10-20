@@ -147,11 +147,11 @@ def LPHCARP(es):
             
     model.setParam(GRB.Param.OutputFlag, 0)
     model.Params.lazyConstraints = 1
-    model.setParam('TimeLimit', 180)
+    model.setParam('TimeLimit', 600)
     model.setObjective(T[1]*1000 + T[2]*10 + T[3]*0.1, GRB.MINIMIZE)
     model.optimize(subtour_elimination)
     runtime = model.Runtime
-    T = None if runtime >= 180 else np.array([T[1].x, T[2].x, T[3].x])
+    T = None if runtime >= 600 else np.array([T[1].x, T[2].x, T[3].x])
     model.dispose()
     return T
 import argparse

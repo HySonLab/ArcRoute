@@ -84,6 +84,7 @@ class InsertCheapestHCARP(BaseHCARP):
         actions = deserialize_tours_batch(tours_batch, self.nseq)
         _, best = self.get_best(actions)
         return get_Ts(self.vars, actions=best[None])
+    
 class EAHCARP(BaseHCARP):
     def __init__(self, n_population=50, pathnament_size=4, mutation_rate=0.5, crossover_rate=0.9):
         super().__init__()
@@ -116,13 +117,12 @@ class EAHCARP(BaseHCARP):
             return np.concatenate([child, np.int32([0]), self.get_once(range(2), clss)])
         return np.int32(self.get_once(range(2), clss))
     
-    def cross_over(self, p1, p2):
-        child = self._cross_over(p1, p2)
-        
-        while not self.is_valid(child):
+    def cross_over(self, p1, p2, attemp=10):
+        for _ in range(attemp):
             child = self._cross_over(p1, p2)
-        # print(child)
-        return child
+            if self.is_valid(child):
+                return child
+        return p1
 
     def mutate(self, tours, variant):
         tours = ls(self.vars, variant=variant, actions=tours[None])
@@ -193,48 +193,49 @@ class ACOHCARP(BaseHCARP):
                     tours.append([0, v])
             ants.append(tours)
 
-        if variant == 'U':
+        if variant == 'P':
             for i, mask in enumerate(pheromones):
                 mask[self.clss < self.clss[i]] = -np.inf
         
         return ants, pheromones
 
-    def get_next(self, t, mask):
-        if (mask < 0).all(): return None
-        next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-        while not self.is_valid_once(t + [next]):
-            mask[next] = -np.inf
+    def get_next(self, t, mask, attemp=10):
+        for _ in range(attemp):
             if (mask < 0).all(): return None
             next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
-        return next
+            if self.is_valid_once(t + [next]):
+                return next
+            mask[next] = -np.inf
+        return None
 
-    def find_tour(self, ant, pheromones):
-        a = deepcopy(ant)
-        org_visited = np.unique(a)
-        visited = org_visited.copy().tolist()
-        org_masks = pheromones.copy()
-        org_masks[:, org_visited] = -np.inf
-        masks = org_masks.copy()
+    def _construct_route(self, a, masks):
+        visited = list(np.unique(a))
         while len(visited) < self.nseq:
-            check = False
-            ii = permutation(range(len(a)))
-            for i in ii:
-                t = a[i]
-                mask = masks[t[-1]].copy()
-                next = self.get_next(t, mask)
-                check = check or next is not None
-                if next is None: continue
-                t.append(next)
+            all_none = True
+            for i in permutation(range(len(a))):
+                mask = masks[a[i][-1]].copy()
+                next = self.get_next(a[i], mask)
+                if next is None: 
+                    continue
+                a[i].append(next)
                 visited.append(next)
                 masks[:, next] = -np.inf
-            if not check:
-                a = deepcopy(ant)
-                visited = org_visited.copy().tolist()
-                masks = org_masks.copy()
+                all_none = False
+            if all_none: return None
             
         routes = np.int32(np.concatenate(a))
         if self.is_valid(routes, only_check_demand=True):
             return routes[1:]
+        return None
+    
+    def construct_route(self, ant, pheromones, attemp=10):
+        pheromones = pheromones.copy()
+        pheromones[:, np.unique(ant)] = -np.inf
+
+        for _ in range(attemp):
+            route = self._construct_route(deepcopy(ant), pheromones.copy())
+            if route is not None:
+                return route
         return None
 
     def update_pheromones(self, best_ants, pheromones):
@@ -253,8 +254,9 @@ class ACOHCARP(BaseHCARP):
         for epoch in range(n_epoch):
             
             # Constructing tour of ants
-            # elitist_ants = [self.find_tour(ant, pheromones=pheromones) for ant in ants]
-            elitist_ants = run_parallel2(self.find_tour, ants, pheromones=pheromones)
+            # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
+            elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
+            elitist_ants = filter(lambda x: x is not None, elitist_ants)
 
 
             # refine tours by local search
