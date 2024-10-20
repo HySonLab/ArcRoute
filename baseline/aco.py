@@ -23,9 +23,9 @@ if __name__ == "__main__":
     args = parse_args()
     np.random.seed(args.seed)
     files = sorted(glob(args.path + '/*/*.npz'))
-    print(files)
-    # al = ACOHCARP(n_ant=args.n_ant) # ACO
-    # for f in files:
-    #     al.import_instance(f)
-    #     t1 = time()
-    #     print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant),':::', time() - t1)
+    
+    al = ACOHCARP(n_ant=args.n_ant) # ACO
+    for f in files:
+        al.import_instance(f)
+        t1 = time()
+        print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant),':::', time() - t1)

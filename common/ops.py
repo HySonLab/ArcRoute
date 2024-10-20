@@ -126,7 +126,7 @@ def run_parallel(operation, *args, **kwargs):
         return [f.result() for f in futures]
 
 def run_parallel2(operation, *args, **kwargs):
-    with concurrent.futures.ProcessPoolExecutor(2) as executor:
+    with concurrent.futures.ProcessPoolExecutor(5) as executor:
         futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
     
     return [f.result() for f in futures]
