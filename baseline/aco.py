@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=100, help='num epoch')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
-    parser.add_argument('--n_ant', type=int, default=100, help='num epoch')
+    parser.add_argument('--n_ant', type=int, default=50, help='num epoch')
     parser.add_argument('--path', type=str, default='data/5m', help='path to instances')
     
     return parser.parse_args()
@@ -22,10 +22,10 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     np.random.seed(args.seed)
-    files = sorted(glob(args.path + '/*/*.npz'))
+    files = sorted(glob(args.path + '/*/*.npz'))[2:10]
     
     al = ACOHCARP(n_ant=args.n_ant) # ACO
     for f in files:
         al.import_instance(f)
         t1 = time()
-        print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant),':::', time() - t1)
+        print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant, verbose=True),':::', time() - t1)

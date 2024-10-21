@@ -13,7 +13,7 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
-    parser.add_argument('--num_sample', type=int, default=1, help='num_sample')
+    parser.add_argument('--num_sample', type=int, default=10, help='num_sample')
     parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
     
     return parser.parse_args()

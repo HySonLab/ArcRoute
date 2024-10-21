@@ -63,19 +63,23 @@ class BaseHCARP:
         idx = obj.argmax()
         return obj[idx], samples[idx]
     
-    def get_once(self, M, clss):
-        routes = [[0] for _ in M]
-        for p in self.P:
-            edges = np.where(clss==p)[0]
-            for e in edges:
-                paths = [routes[m] + [e] for m in M]
+    def get_once(self, M, clss, attemp=10):
+        for _ in range(attemp):
+            routes = [[0] for _ in M]
+            edges = [e for p in self.P for e in permutation(np.where(clss==p)[0])]
+            i = 0
+            while i < len(edges):
+                paths = [routes[m] + [edges[i]] for m in M]
                 idxs = [i for i, path in enumerate(paths) if self.is_valid_once(path)]
-                if len(idxs) == 0: return None
+                if len(idxs) == 0: 
+                    break
                 costs = [self.calc_len(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
-        
-        return np.int32([a for tour in routes for a in tour])[1:]
+                i += 1
+            if i >= len(edges):
+                return np.int32([a for tour in routes for a in tour])[1:]
+        return None
 
 class InsertCheapestHCARP(BaseHCARP):
     def __call__(self, variant='P', num_sample=20):
@@ -95,19 +99,12 @@ class EAHCARP(BaseHCARP):
         self.crossover_rate = crossover_rate
 
     def init_population(self):
-        routes = np.int32(list(range(1, self.nseq)) + [0]*(len(self.M)-1))
-        population = []
-        for _ in range(self.n_population):
-            routes = permutation(routes)
-            while not self.is_valid(routes):
-                routes = permutation(routes)
-            population.append(routes)
-        population = np.array(population)
+        population = np.array([self.get_once(self.M, self.clss) for _ in range(self.n_population)])
         return population
 
     def _cross_over(self, p1, p2):
-        child1 = p1[:np.where(p1==0)[0][0]]
-        child2 = p2[:np.where(p2==0)[0][0]]
+        child1 = p1[:np.where(p1==0)[0][0]+1]
+        child2 = p2[:np.where(p2==0)[0][0]+1]
         
         clss = self.clss.copy()
         clss[child1] = 0
@@ -137,6 +134,27 @@ class EAHCARP(BaseHCARP):
     def get_parent(self, population, prob):
         return population[self.get_idx(prob, strategy='sampling', size=self.pathnament_size)]
 
+    def operate(self, prob, population, variant):
+        # CROSSOVER
+        parent1 = self.get_parent(population, prob)
+        parent2 = self.get_parent(population, prob)
+
+        if random() < self.crossover_rate:
+            # print(parent1, parent2)
+            child1 = self.cross_over(parent1, parent2)
+            child2 = self.cross_over(parent2, parent1)
+
+        # If crossover not happen
+        else:
+            child1 = parent1
+            child2 = parent2
+
+        # MUTATION
+        if random() < self.mutation_rate:
+            child1 = self.mutate(child1, variant)
+            child2 = self.mutate(child1, variant)
+        return child1, child2
+
     def __call__(self, n_epoch=50, variant='P', verbose=False):
         assert self.has_instance, "please import instance first"
         
@@ -147,28 +165,9 @@ class EAHCARP(BaseHCARP):
             idxs = np.argsort(obj)
             new_population = [population[idxs[-1]], population[idxs[-2]]]
             prob = convert_prob(obj)
-            for i in range(len(population) // 2 - 1):
-                # CROSSOVER
-                parent1 = self.get_parent(population, prob)
-                parent2 = self.get_parent(population, prob)
-
-                if random() < self.crossover_rate:
-                    # print(parent1, parent2)
-                    child1 = self.cross_over(parent1, parent2)
-                    child2 = self.cross_over(parent2, parent1)
-
-                # If crossover not happen
-                else:
-                    child1 = parent1
-                    child2 = parent2
-
-                # MUTATION
-                if random() < self.mutation_rate:
-                    child1 = self.mutate(child1, variant)
-                    child2 = self.mutate(child1, variant)
-
-                new_population.extend([child1, child2])
-
+            nb = len(population) // 2 - 1
+            new_population += [c for cs in run_parallel2(self.operate, [prob]*nb, population=population, variant=variant) 
+                               for c in cs]
             population = new_population
             if verbose:
                 if epoch % 10 == 0:
@@ -262,9 +261,9 @@ class ACOHCARP(BaseHCARP):
         for epoch in range(n_epoch):
             
             # Constructing tour of ants
-            elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants if ant is not None]
-            # elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
-            # elitist_ants = [ant for ant in elitist_ants if ant is not None]
+            elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
+            # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
+            elitist_ants = [ant for ant in elitist_ants if ant is not None]
             
             # refine tours by local search
             if is_local_search:
