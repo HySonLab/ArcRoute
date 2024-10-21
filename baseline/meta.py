@@ -240,8 +240,8 @@ class ACOHCARP(BaseHCARP):
 
     def update_pheromones(self, best_ants, pheromones):
         best_ants = gen_tours(best_ants)
-        for m in self.M:
-            np.add.at(pheromones, (best_ants[m, :-1], best_ants[m, 1:]), 1)
+        for tour in best_ants:
+            np.add.at(pheromones, (tour[:-1], tour[1:]), 1)
         pheromones *= (1 - self.rho)
         return pheromones
 
@@ -256,9 +256,8 @@ class ACOHCARP(BaseHCARP):
             # Constructing tour of ants
             # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
             elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
-            elitist_ants = filter(lambda x: x is not None, elitist_ants)
-
-
+            elitist_ants = [ant for ant in elitist_ants if ant is not None]
+            # print(elitist_ants)
             # refine tours by local search
             if is_local_search:
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)

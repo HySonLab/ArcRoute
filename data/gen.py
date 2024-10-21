@@ -28,7 +28,7 @@ def check():
     from glob import glob
     from collections import defaultdict
 
-    files = glob('/usr/local/rsa/ArcRoute/data/instances/*/*.npz')
+    files = glob('instances/*/*.npz')
     l = defaultdict(list)
     for file in files:
         l[int(file.split('/')[-2])].append(file)
@@ -88,7 +88,7 @@ def gen_graph(num_loc, num_arc):
         if capacity is None:
             closest_num_loc = min(CAPACITIES.keys(), key=lambda x: abs(x - num_arc))
             capacity = CAPACITIES[closest_num_loc]
-        capacity = capacity * 5
+        capacity = capacity * 1
 
         clss = torch.randint(1, 3+1, size=(num_arc, 1))
         a, b = 1, 2
@@ -111,7 +111,7 @@ def gen_graph(num_loc, num_arc):
         break
     
     fpath = f'{dir}/{len(req)+len(nonreq)}_{num_loc}_{np.random.randint(0,1000):03d}'
-    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=2, C=capacity)
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=5, C=capacity)
     return fpath + '.npz', len(req)+len(nonreq)
 
 

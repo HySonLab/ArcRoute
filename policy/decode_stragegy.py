@@ -1,4 +1,4 @@
-from common.ops import calculate_entropy, get_log_likelihood, batchify, gather_by_index, unbatchify_and_gather, unbatchify
+from common.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
 import torch
 import torch
 import abc
