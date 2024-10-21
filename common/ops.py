@@ -1,4 +1,3 @@
-import torch
 import numpy as np
 import concurrent.futures
 
@@ -37,29 +36,6 @@ def batchify(x, shape):
         x = _batchify_single(x, s) if s > 0 else x
     return x
 
-def get_distance(x, y):
-    """Euclidean distance between two tensors of shape `[..., n, dim]`"""
-    return (x - y).norm(p=2, dim=-1)
-
-def get_tour_length(ordered_locs):
-    """Compute the total tour distance for a batch of ordered tours.
-    Computes the L2 norm between each pair of consecutive nodes in the tour and sums them up.
-
-    Args:
-        ordered_locs: Tensor of shape [batch_size, num_nodes, 2] containing the ordered locations of the tour
-    """
-    ordered_locs_next = torch.roll(ordered_locs, -1, dims=-2)
-    return get_distance(ordered_locs_next, ordered_locs).sum(-1)
-
-def calculate_entropy(logprobs):
-    """Calculate the entropy of the log probabilities distribution
-    logprobs: Tensor of shape [batch, decoder_steps, num_actions]
-    """
-    logprobs = torch.nan_to_num(logprobs, nan=0.0)
-    entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
-    entropy = entropy.sum(dim=1)  # [batch] -- sum over decoding steps
-    assert entropy.isfinite().all(), "Entropy is not finite"
-    return entropy
 
 def get_log_likelihood(logprobs, actions=None, mask=None, return_sum: bool = True):
     """Get log likelihood of selected actions.
@@ -78,10 +54,6 @@ def get_log_likelihood(logprobs, actions=None, mask=None, return_sum: bool = Tru
     # Optional: mask out actions irrelevant to objective so they do not get reinforced
     if mask is not None:
         logprobs[~mask] = 0
-
-    # assert (
-    #     logprobs > -1000
-    # ).data.all(), "Logprobs should not be -inf, check sampling procedure!"
 
     # Calculate log_likelihood
     if return_sum:
@@ -132,6 +104,7 @@ def run_parallel2(operation, *args, **kwargs):
     return [f.result() for f in futures]
 
 def convert_vars_np(td):
+    import torch
     adj = td['adj'].detach().clone()
     torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))
     return {

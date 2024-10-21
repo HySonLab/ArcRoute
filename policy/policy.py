@@ -2,10 +2,21 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch.nn as nn
-from common.ops import calculate_entropy, get_log_likelihood
+import torch
+from common.ops import get_log_likelihood
 from .encoder import Encoder 
 from .decoder import Decoder 
 from .decode_stragegy import get_decoding_strategy
+
+def calculate_entropy(logprobs):
+    """Calculate the entropy of the log probabilities distribution
+    logprobs: Tensor of shape [batch, decoder_steps, num_actions]
+    """
+    logprobs = torch.nan_to_num(logprobs, nan=0.0)
+    entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
+    entropy = entropy.sum(dim=1)  # [batch] -- sum over decoding steps
+    assert entropy.isfinite().all(), "Entropy is not finite"
+    return entropy
 
 class AttentionModelPolicy(nn.Module):
     def __init__(
