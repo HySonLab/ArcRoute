@@ -70,6 +70,7 @@ class BaseHCARP:
             for e in edges:
                 paths = [routes[m] + [e] for m in M]
                 idxs = [i for i, path in enumerate(paths) if self.is_valid_once(path)]
+                if len(idxs) == 0: return None
                 costs = [self.calc_len(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
                 routes[idx] = paths[idx]
@@ -107,19 +108,24 @@ class EAHCARP(BaseHCARP):
     def _cross_over(self, p1, p2):
         child1 = p1[:np.where(p1==0)[0][0]]
         child2 = p2[:np.where(p2==0)[0][0]]
+        
         clss = self.clss.copy()
         clss[child1] = 0
         clss[child2] = 0
-        child = self.get_once(range(len(self.M)-2), clss) if len(self.M)-2 > 0 else []
+        child = self.get_once(np.arange(len(self.M)-2), clss) if len(self.M)-2 > 0 else []
+        if child is None: return None
         clss = self.clss.copy()
         clss[child] = 0
+        remain = self.get_once(range(2), clss)
+        if remain is None: return None
         if len(self.M)-2 > 0:
-            return np.concatenate([child, np.int32([0]), self.get_once(range(2), clss)])
-        return np.int32(self.get_once(range(2), clss))
+            return np.concatenate([child, np.int32([0]), remain])
+        return np.int32(remain)
     
     def cross_over(self, p1, p2, attemp=10):
         for _ in range(attemp):
             child = self._cross_over(p1, p2)
+            if child is None: continue
             if self.is_valid(child):
                 return child
         return p1
@@ -145,7 +151,9 @@ class EAHCARP(BaseHCARP):
                 # CROSSOVER
                 parent1 = self.get_parent(population, prob)
                 parent2 = self.get_parent(population, prob)
+
                 if random() < self.crossover_rate:
+                    # print(parent1, parent2)
                     child1 = self.cross_over(parent1, parent2)
                     child2 = self.cross_over(parent2, parent1)
 
@@ -254,10 +262,10 @@ class ACOHCARP(BaseHCARP):
         for epoch in range(n_epoch):
             
             # Constructing tour of ants
-            # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
-            elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
-            elitist_ants = [ant for ant in elitist_ants if ant is not None]
-            # print(elitist_ants)
+            elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants if ant is not None]
+            # elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
+            # elitist_ants = [ant for ant in elitist_ants if ant is not None]
+            
             # refine tours by local search
             if is_local_search:
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)
