@@ -41,12 +41,9 @@ class BaseHCARP:
             return False
         return True
     
-    def is_valid(self, routes, only_check_demand=False):
+    def is_valid(self, routes):
         if (self.demands[gen_tours(routes)].sum(-1) > 1).sum() > 0:
             return False
-        if not only_check_demand:
-            if (routes == 0).sum() >= len(self.M):
-                return False
         return True
     
     def calc_obj(self, actions):
@@ -88,6 +85,8 @@ class InsertCheapestHCARP(BaseHCARP):
         tours_batch = ls(self.vars, variant=variant, actions=actions)
         actions = deserialize_tours_batch(tours_batch, self.nseq)
         _, best = self.get_best(actions)
+        # print(best)
+        # print(gen_tours(best))
         return get_Ts(self.vars, actions=best[None])
     
 class EAHCARP(BaseHCARP):
@@ -218,6 +217,7 @@ class ACOHCARP(BaseHCARP):
     def _construct_route(self, a, masks):
         visited = list(np.unique(a))
         while len(visited) < self.nseq:
+            # print(sorted(visited))
             all_none = True
             for i in permutation(range(len(a))):
                 mask = masks[a[i][-1]].copy()
@@ -231,7 +231,7 @@ class ACOHCARP(BaseHCARP):
             if all_none: return None
             
         routes = np.int32(np.concatenate(a))
-        if self.is_valid(routes, only_check_demand=True):
+        if self.is_valid(routes):
             return routes[1:]
         return None
     
@@ -241,6 +241,7 @@ class ACOHCARP(BaseHCARP):
 
         for _ in range(attemp):
             route = self._construct_route(deepcopy(ant), pheromones.copy())
+            # print(route)
             if route is not None:
                 return route
         return None
@@ -262,7 +263,10 @@ class ACOHCARP(BaseHCARP):
             
             # Constructing tour of ants
             elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
+            # self.construct_route(ants[0], pheromones=pheromones)
+            # exit()
             # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
+            # print(elitist_ants)
             elitist_ants = [ant for ant in elitist_ants if ant is not None]
             
             # refine tours by local search
@@ -279,6 +283,6 @@ class ACOHCARP(BaseHCARP):
             if verbose:
                 if epoch % 10 == 0:
                     print(f"epoch {epoch}:", best_obj)
-
+            # print(f"epoch {epoch}:", best_obj)
         best = self.get_best(elitist_epochs)[1][None]
         return get_Ts(self.vars, actions=best)

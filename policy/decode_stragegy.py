@@ -1,8 +1,7 @@
-from common.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
-import torch
 import torch
 import abc
 import torch.nn.functional as F
+from common.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
 
 def modify_logits_for_top_k_filtering(logits, top_k):
     """Set the logits for none top-k values to -inf. Done out-of-place.
@@ -84,6 +83,16 @@ def process_logits(
     # Compute log probabilities
     return F.log_softmax(logits, dim=-1)
 
+def calculate_entropy(logprobs):
+    """Calculate the entropy of the log probabilities distribution
+    logprobs: Tensor of shape [batch, decoder_steps, num_actions]
+    """
+    logprobs = torch.nan_to_num(logprobs, nan=0.0)
+    entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
+    entropy = entropy.sum(dim=1)  # [batch] -- sum over decoding steps
+    assert entropy.isfinite().all(), "Entropy is not finite"
+    return entropy
+
 class DecodingStrategy(metaclass=abc.ABCMeta):
     """Base class for decoding strategies. Subclasses should implement the :meth:`_step` method.
     Includes hooks for pre and post main decoding operations.
@@ -134,47 +143,16 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         self.actions = []
         self.logprobs = []
 
+    def reset(self):
+        self.actions = []
+        self.logprobs = []
+
     @abc.abstractmethod
     def _step(self, logprobs,mask,td,action = None,**kwargs):
         raise NotImplementedError("Must be implemented by subclass")
 
     def pre_decoder_hook(self, td, env, action = None):
-        """Pre decoding hook. This method is called before the main decoding operation."""
-
-        # Multi-start decoding. If num_starts is None, we use the number of actions in the action mask
-        if self.multistart or self.multisample:
-            if self.num_starts is None:
-                self.num_starts = env.get_num_starts(td)
-        else:
-            self.num_starts = 0
-
-        # Multi-start decoding: first action is chosen by ad-hoc node selection
-        if self.num_starts >= 1:
-            if self.multistart:
-                if action is None:  # if action is provided, we use it as the first action
-                    if self.select_start_nodes_fn is not None:
-                        action = self.select_start_nodes_fn(td, env, self.num_starts)
-                    else:
-                        action = env.select_start_nodes(td, num_starts=self.num_starts)
-
-                # Expand td to batch_size * num_starts
-                td = batchify(td, self.num_starts)
-
-                td.set("action", action)
-                td = env.step(td)["next"]
-                # first logprobs is 0, so p = logprobs.exp() = 1
-                if self.store_all_logp:
-                    logprobs = torch.zeros_like(td["action_mask"])  # [B, N]
-                else:
-                    logprobs = torch.zeros_like(action, device=td.device)  # [B]
-
-                self.logprobs.append(logprobs)
-                self.actions.append(action)
-            else:
-                # Expand td to batch_size * num_samplestarts
-                td = batchify(td, self.num_starts)
-
-        return td, env, self.num_starts
+        pass
 
     def post_decoder_hook(self, td, env):
         assert (
@@ -182,8 +160,6 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         ), "No logprobs were collected because all environments were done. Check your initial state"
         logprobs = torch.stack(self.logprobs, 1)
         actions = torch.stack(self.actions, 1)
-        if self.num_starts > 0 and self.select_best:
-            logprobs, actions, td, env = self._select_best(logprobs, actions, td, env)
         return logprobs, actions, td, env
 
     def step( self, logits, mask, td=None, action = None, **kwargs):
