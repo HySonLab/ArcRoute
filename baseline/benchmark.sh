@@ -31,3 +31,19 @@ nohup python3 -u baseline/ea.py --variant U --path data/3m > logs/3m/U/ea.out &
 # nohup python3 -u baseline/aco.py --variant U --path data/3m > logs/3m/U/aco.out &
 # nohup python3 -u baseline/ils.py --variant U --path data/3m > logs/3m/U/ils.out &
 # nohup python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/bestU.ckpt --path data/3m > logs/3m/U/rl_hyb.out &
+
+# nohup python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/50P/epoch=008.ckpt --path data/5m > logs/5m/U/rl_hybnew.out &
+
+
+# nohup python3 -u baseline/aco.py --variant U --path data/5m40 > logs/5m40/U/aco.out &
+# nohup python3 -u baseline/ils.py --variant U --path data/5m40 > logs/5m40/U/ils.out &
+
+# nohup python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/60U/epoch=049.ckpt --path data/5m60 > logs/5m60/U/rl_hyb.out &
+# nohup python3 -u baseline/ils.py --variant U --path data/5m60 > logs/5m60/U/ils.out &
+# nohup python3 -u baseline/ea.py --variant U --path data/5m60 > logs/5m60/U/ea.out &
+# nohup python3 -u baseline/aco.py --variant U --path data/5m60 > logs/5m60/U/aco.out &
+nohup python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/best60U.ckpt --path data/5m60 > logs/5m60/U/rl_hyb.out &
+
+nohup python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/best60U.ckpt --path data/5m60 > logs/5m60/U/rl_hyb.out &
+
+python3 -u baseline/rl_hyb.py --variant U --cpkt ../cpkts/bestU.ckpt --path data/5m

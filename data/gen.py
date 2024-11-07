@@ -88,7 +88,7 @@ def gen_graph(num_loc, num_arc):
         if capacity is None:
             closest_num_loc = min(CAPACITIES.keys(), key=lambda x: abs(x - num_arc))
             capacity = CAPACITIES[closest_num_loc]
-        capacity = capacity * 1
+        capacity = capacity * 2
 
         clss = torch.randint(1, 3+1, size=(num_arc, 1))
         a, b = 1, 2
@@ -129,7 +129,7 @@ if __name__ == "__main__":
 
     save = 'instances'
     if not os.path.isdir(save): os.mkdir(save)
-    for i in range(2, 20):
+    for i in range(6, 20):
         n = 10*i
         pdir = f'{save}/{n+10}/'
         if not os.path.isdir(pdir): os.mkdir(pdir)
@@ -138,7 +138,7 @@ if __name__ == "__main__":
 
         count = 0
         while count < 20:
-            fpath, n_arc = gen_graph(num_loc=np.random.randint(*nums[min(i-2, len(nums)-1)]), num_arc=20)
+            fpath, n_arc = gen_graph(num_loc=np.random.randint(*nums[min(i-2, len(nums)-1)]), num_arc=60)
             if not ((n_arc <= high) & (n_arc >= low)) or os.path.isfile(pdir + fpath.split('/')[-1]):
                 continue
             shutil.move(fpath, pdir)

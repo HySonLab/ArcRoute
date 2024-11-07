@@ -164,9 +164,8 @@ class MultiHeadAttention(nn.Module):
         # Modify attention using adjacency matrix
         # Here we multiply the attention scores by the adjacency matrix to mask out non-neighbors
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if adj is not None:
-            attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
-            attn_weights = attn_weights * adj.unsqueeze(1)  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
+        attn_weights = attn_weights * adj.unsqueeze(1)  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
+        attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
 
         attn_weights = nn.Softmax(dim=-1)(attn_weights)
 
@@ -233,7 +232,7 @@ class GraphAttentionNetwork(nn.Module):
         num_heads: int,
         embed_dim: int,
         num_layers: int,
-        normalization: str = "batch",
+        normalization: str = "instance",
         feedforward_hidden: int = 512,
         sdpa_fn: Optional[Callable] = None,
         moe_kwargs: Optional[dict] = None,
@@ -266,8 +265,6 @@ class Encoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 128,
-        init_embedding: nn.Module = None,
-        env_name: str = "tsp",
         num_heads: int = 8,
         num_layers: int = 3,
         normalization: str = "instance",
