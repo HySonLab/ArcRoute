@@ -123,4 +123,4 @@ pip install -r requirements.txt
 This project is licensed under the MIT License. See the LICENSE file for more details.
 
 ## Contact
-For questions or collaboration inquiries, please reach out to ...
+For questions or collaboration inquiries, please reach out to Truong-Son Hy at thy@uab.edu
