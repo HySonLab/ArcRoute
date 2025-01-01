@@ -13,9 +13,9 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=100, help='num epoch')
-    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--variant', type=str, default='U', help='Environment variant')
     parser.add_argument('--n_population', type=int, default=200, help='num epoch')
-    parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
+    parser.add_argument('--path', type=str, default='data/5m60', help='path to instances')
     
     return parser.parse_args()
 

@@ -14,9 +14,10 @@ def get_reward(vars, actions=None, tours_batch=None):
         vars = convert_vars_np(vars)
      
     reward1 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 1)
-    reward2 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 2)
-    reward3 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 3)
-    return np.float32([reward1, reward2, reward3]).T @ np.float32([1e2, 1e0, 1e-2])
+    # reward2 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 2)
+    # reward3 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 3)
+    # return np.float32([reward1, reward2, reward3]).T @ np.float32([1e2, 1e0, 1e-2])
+    return reward1
 
 def get_Ts(vars, actions=None, tours_batch=None):
     if tours_batch is None:
@@ -48,7 +49,6 @@ def reward_ins(tours, adj, service, clss, k):
         candidate = tour[:pos[-1] + 1]
         length = calc_length(adj, service, candidate)
         r = max(r, length)
-    # return r + 1000*max(0, len(tours) - 2)
     return r 
 
 @nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)

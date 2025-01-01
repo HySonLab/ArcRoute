@@ -39,23 +39,30 @@ def lsRL(vars, variant, actions=None, tours_batch=None, is_train=True):
         vars = convert_vars_np(vars)
 
     if is_train:
-        tours_batch = run_parallel(intraU if variant=='U' else intraP, 
-                                tours_batch,
-                                vars['adj'], 
-                                vars['service_time'], 
-                                vars['clss'], 
-                                k = 1)
+        for _ in range(2):
+            tours_batch = run_parallel(intraU if variant=='U' else intraP, 
+                                    tours_batch,
+                                    vars['adj'], 
+                                    vars['service_time'], 
+                                    vars['clss'], 
+                                    k = 1)
+            tours_batch = run_parallel(interU if variant=='U' else interP, 
+                                    tours_batch,
+                                    vars['adj'], 
+                                    vars['service_time'], 
+                                    vars['clss'],
+                                    vars['demand'],
+                                    k = 1)
+        
     else:
         for _ in range(3):
             for k in [1,2,3]:
-                # if random() > 0.5:
                 tours_batch = run_parallel(intraU if variant=='U' else intraP, 
                                         tours_batch,
                                         vars['adj'], 
                                         vars['service_time'], 
                                         vars['clss'], 
                                         k = k)
-                # if random() > 0.5:
                 tours_batch = run_parallel(interU if variant=='U' else interP, 
                                         tours_batch,
                                         vars['adj'], 
