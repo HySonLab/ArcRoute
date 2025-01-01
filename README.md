@@ -53,7 +53,7 @@ hdcarp/
 │   ├── critic.py
 │   ├── ppo.py                # Proximal Policy Optimization (PPO) algorithm
 │   ├── policy.py             # Policy network for RL
-│   ├── trainer.py 
+│   ├── trainer.py
 ├── .gitignore                # Git ignore file
 ├── requirements.txt          # Python dependencies
 ├── train.py                  # Main script to start training the models
@@ -117,9 +117,9 @@ pip install -r requirements.txt
 ## Results
 
 ## Weight_and_Data
-[Weight of RL](https://drive.google.com/drive/folders/16R3gudbrDpMo9sZn-iLxHVXkXTHUCVQi)
+[Weight of HDRA](https://drive.google.com/drive/folders/16R3gudbrDpMo9sZn-iLxHVXkXTHUCVQi)
 
-[Testing data](https://drive.google.com/drive/folders/1kRUS93f4qysnuC8ULqD2spfG4xgldVQM)
+[Data](https://drive.google.com/drive/folders/1JAgkaH1TnPz7zls_oCbsjJP2nGpkTRPm)
 
 ## License
 This project is licensed under the MIT License. See the LICENSE file for more details.
