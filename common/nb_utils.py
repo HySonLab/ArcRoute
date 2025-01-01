@@ -53,6 +53,65 @@ def deserialize_tours_batch(tours_batch, n):
     new_actions = run_parallel(deserialize_tours, tours_batch, n=n)
     return np.array(new_actions)
 
+@nb.njit(nb.int32[:](nb.int32[:], nb.int32[:]), nogil=True)
+def prob_idxs(a1, a2):
+    idx = []
+    i,j = 0,0
+    while j < len(a2) and i < len(a1):
+        if a2[j] == a1[i]:
+            idx.append(i)
+            j += 1
+        i += 1
+    return np.array(idx, dtype=np.int32)
+        
+@nb.njit(nb.int32[:](nb.int32[:], nb.float32[:], nb.int32), nogil=True)
+def refine_routes(actions, demands, max_vehicles=5):
+    # Initialize routes
+    routes = np.zeros((max_vehicles, len(actions)), dtype=np.int32)
+    capacities = np.zeros(max_vehicles, dtype=np.float32)
+    route_lengths = np.zeros(max_vehicles, dtype=np.int32)
+
+    # Current vehicle index
+    vehicle_idx = 0
+    for arc in actions:
+        if arc == 0:
+            # Move to the next vehicle if possible
+            if vehicle_idx + 1 < max_vehicles:
+                vehicle_idx += 1
+            continue
+        
+        demand = demands[arc]
+
+        # Check if the current vehicle can take this arc
+        if capacities[vehicle_idx] + demand <= 1.0:
+            routes[vehicle_idx, route_lengths[vehicle_idx]] = arc
+            route_lengths[vehicle_idx] += 1
+            capacities[vehicle_idx] += demand
+        else:
+            # Try to fit arc in any subsequent vehicle
+            placed = False
+            for i in range(vehicle_idx + 1, max_vehicles):
+                if capacities[i] + demand <= 1.0:
+                    routes[i, route_lengths[i]] = arc
+                    route_lengths[i] += 1
+                    capacities[i] += demand
+                    placed = True
+                    break
+            # If no vehicle can take it, put it in the current vehicle (may exceed capacity if no option)
+            if not placed:
+                if vehicle_idx == max_vehicles - 1:
+                    routes[vehicle_idx, route_lengths[vehicle_idx]] = arc
+                    route_lengths[vehicle_idx] += 1
+                    capacities[vehicle_idx] += demand
+
+    # Flatten the routes while removing empty slots
+    result = []
+    for i in range(max_vehicles):
+        if route_lengths[i] > 0:
+            result.append(0)  # Start of a new route
+            result.extend(routes[i, :route_lengths[i]])
+    
+    return np.array(result[1:], dtype=np.int32)  # Remove the leading 0
 
 def convert_prob(x):
     # a = a - np.min(a) + np.float32(1e-4)

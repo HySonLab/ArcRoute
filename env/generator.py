@@ -71,7 +71,7 @@ class CARPGenerator:
             closest_num_loc = min(CAPACITIES.keys(), key=lambda x: abs(x - num_arc))
             self.capacity = CAPACITIES[closest_num_loc]
         
-        self.capacity = self.capacity * 5
+        self.capacity = self.capacity * 2
 
     def __call__(self, batch_size):
         # Sample arc demands and define arcs as pairs of nodes
@@ -83,6 +83,7 @@ class CARPGenerator:
         arc_indices = gather_by_index(combinations, idxs, squeeze=False)
         demands = self.demand_sampler.sample((batch_size, self.num_arc))
         demands = (demands.int() + 1).float()
+        demands = torch.cat((torch.zeros(batch_size, 1), demands), dim=-1)
         arc0 = torch.zeros(batch_size*2).reshape(batch_size, 1, 2)
         arc_indices = torch.cat([arc0, arc_indices], dim=-2).type(torch.int32)
         # Sample capacities

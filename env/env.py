@@ -11,7 +11,6 @@ from common.nb_utils import gen_tours_batch
 from common.ops import gather_by_index
 
 class CARPEnv:
-    name = "tsp"
     def __init__(
         self,
         generator_params: dict = {},
@@ -25,11 +24,10 @@ class CARPEnv:
 
     def step(self, td: TensorDict):
         current_node = td["action"][:, None]  # Add dimension for step
-        n_loc = td["demand"].size(-1)  # Excludes depot
 
         # Not selected_demand is demand of first node (by clamp) so incorrect for nodes that visit depot!
         selected_demand = gather_by_index(
-            td["demand"], torch.clamp(current_node - 1, 0, n_loc - 1), squeeze=False)
+            td["demand"], current_node, squeeze=False)
 
         # Increase capacity if depot is not visited, otherwise set to 0
         used_capacity = (td["used_capacity"] + selected_demand) * (
@@ -54,13 +52,19 @@ class CARPEnv:
 
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
         # For demand steps_dim is inserted by indexing with id, for used_capacity insert node dim for broadcasting
+        # print(td["demand"][:, None, :].shape, td["used_capacity"][..., None].shape, td["vehicle_capacity"][..., None].shape)
+        # exit()
         exceeds_cap = (
-            td["demand"][:, None, :] + td["used_capacity"][..., None] > td["vehicle_capacity"][..., None]
+            td["demand"][..., 1:][:, None, :] + td["used_capacity"][..., None] > td["vehicle_capacity"][..., None]
         )
+        # print(exceeds_cap.shape)
+        # exit()
         # Nodes that cannot be visited are already visited or too much demand to be served now
         mask_loc = td["visited"][..., 1:].to(exceeds_cap.dtype) | exceeds_cap
         # Cannot visit the depot if just visited and still unserved nodes
         mask_depot = (td["current_node"] == 0) & ((mask_loc == 0).int().sum(-1) > 0)
+        # print(mask_loc.shape, mask_depot.shape)
+        # exit()
         if self.variant == 'P':
             clss_min = gather_by_index(td['clss'], td["current_node"])
             mask_loc = mask_loc | ((td['clss'][..., 1:] - clss_min[..., None] < 0).unsqueeze(1))
@@ -93,7 +97,6 @@ class CARPEnv:
                 'traveling_time': td["traveling_time"],
                 'adj': td["adj"],
                 "done": torch.zeros(batch_size, td["service_time"].shape[1], dtype=torch.bool),
-                'num_vehicle': torch.full((batch_size, 1), fill_value=2, dtype=torch.long)
             },
             batch_size=batch_size,
         ).to(td.device)

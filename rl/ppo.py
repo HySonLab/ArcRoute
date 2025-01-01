@@ -158,10 +158,11 @@ class PPO(LightningModule):
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
-        # Evaluate old actions, log probabilities, and rewards
+        
         with torch.no_grad():
             td = self.env.reset(batch)  # note: clone needed for dataloader
-            out = self.policy(td.clone(), self.env, phase=phase, return_actions=True)
+            out = self.policy(td.clone(), self.env, 
+                              phase=phase, calc_reward=True, return_sum_log_likelihood=True)
 
         if phase == "train":
             batch_size = out["actions"].shape[0]
@@ -200,7 +201,7 @@ class PPO(LightningModule):
                         actions=sub_td["action"],
                         env=self.env,
                         return_entropy=True,
-                        return_sum_log_likelihood=False,
+                        calc_reward=False
                     )
                     ll, entropy = out["log_likelihood"], out["entropy"]
 

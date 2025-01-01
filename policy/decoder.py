@@ -169,7 +169,6 @@ class Decoder(nn.Module):
         self,
         td: TensorDict,
         cached: PrecomputedCache,
-        num_starts: int = 0,
     ) -> Tuple[Tensor, Tensor]:
 
         glimpse_q = self._compute_q(cached, td)
@@ -182,18 +181,17 @@ class Decoder(nn.Module):
         return logits, mask
 
     def pre_decoder_hook(
-        self, td, env, embeddings, num_starts: int = 0):
+        self, td, env, embeddings):
         """Precompute the embeddings cache before the decoder is called"""
-        return td, env, self._precompute_cache(embeddings, num_starts=num_starts)
+        return td, env, self._precompute_cache(embeddings)
 
     def _precompute_cache(
-        self, embeddings: torch.Tensor, num_starts: int = 0
+        self, embeddings: torch.Tensor
     ) -> PrecomputedCache:
         """Compute the cached embeddings for the pointer attention.
 
         Args:
             embeddings: Precomputed embeddings for the nodes
-            num_starts: Number of starts for the multi-start decoding
         """
         # The projection of the node embeddings for the attention is calculated once up front
         (
