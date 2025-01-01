@@ -23,8 +23,8 @@ This project provides a solution to the **Hierarchical Directed Capacitated Arc 
 The project implements multiple approaches:
 
 - **Exact methods** for solving smaller instances.
-- **Heuristic algorithms** (inter-route and intra-route heuristics) for scalable solutions.
-- **Hybrid algorithm combining Reinforcement Learning (RL) and heuristics** for more complex instances.
+- **Meta Heuristic algorithms** (ea, aco, ils).
+- **Hybrid algorithm combining Reinforcement Learning (RL) and heuristics**.
 
 ## Key Components
 
@@ -33,16 +33,16 @@ The project is organized into several directories:
 ```
 hdcarp/
 ├── baseline/
-│   ├── hr.py                 # Heuristic algorithms
-│   ├── lp.py                 # Linear Programming based exact method
-│   ├── rl_infer.py           # Reinforcement Learning-based method
+│   ├── aco.py                 # aco algorithm
+│   ├── ea.py                  # ea algorithm
+│   ├── ils.py                 # ea algorithm
+│   ├── rl_hyb.py              # HRDA algorithm
+│   ├── lp.py                  # exact method
+│   ├── meta.py                # implemented code of Meta Heuristic algorithms
 ├── common/
-│   └── ops.py                # Common utilities shared across methods
 ├── env/
-│   ├── cal_reward.py         # Reward calculation for RL
 │   ├── env.py                # Environment setup for the routing problem
 │   ├── generator.py          # Problem instance generator
-│   ├── local_search.py       # Local search strategies (heuristic optimization)
 ├── policy/
 │   ├── context.py            # Contextual features for the RL model
 │   ├── encoder.py            # Encoding components
@@ -74,11 +74,13 @@ pip install -r requirements.txt
 
 ### Generate Problem Instances
 ```python
-    python3 ...
+    python3 data/gen.py
 ```
-### Run Heuristic Algorithms
+### Run Meta Heuristic Algorithms
 ```python
-    python3 baseline/hr.py --data_path "/home/project/ArcRoute/data/instances/30/61_20.npz"
+    python3 baseline/ils.py --data_path "data/instances/30/61_20.npz"
+    python3 baseline/ea.py --data_path "data/instances/30/61_20.npz"
+    python3 baseline/aco.py --data_path "data/instances/30/61_20.npz"
 ```
 
 ### Run Exact Method
@@ -88,8 +90,8 @@ pip install -r requirements.txt
 ### Run RL Method
 ```python
     python3 baseline/rl_infer.py \
-    --checkpoint_path "/home/project/checkpoints/cl1_old/best.ckpt" \
-    --data_path "/home/project/data/data/15/28_20.npz"
+    --checkpoint_path "best.ckpt" \
+    --data_path "data/30/61_20.npz"
 ```
 
 ### RL Training
