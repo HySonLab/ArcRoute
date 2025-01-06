@@ -124,5 +124,19 @@ pip install -r requirements.txt
 ## License
 This project is licensed under the MIT License. See the LICENSE file for more details.
 
+## Please cite our work!
+
+```bibtex
+@misc{nguyen2025hybridisingreinforcementlearningheuristics,
+      title={Hybridising Reinforcement Learning and Heuristics for Hierarchical Directed Arc Routing Problems}, 
+      author={Van Quang Nguyen and Quoc Chuong Nguyen and Thu Huong Dang and Truong-Son Hy},
+      year={2025},
+      eprint={2501.00852},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2501.00852}, 
+}
+```
+
 ## Contact
 For questions or collaboration inquiries, please reach out to Truong-Son Hy at thy@uab.edu
