@@ -1,6 +1,6 @@
 numpy
-torch
-tensordict
+torch==2.4.0
+tensordict==0.6.2
 lightning 
 einops
 gurobipy 
