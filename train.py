@@ -28,6 +28,9 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=24, help='Number of workers for data loader') 
     parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
     parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
+    parser.add_argument('--path_train_data', type=str, default="../data/train_data.cache", help='path_train_data')
+    parser.add_argument('--path_val_data', type=str, default="../data/val_data.cache", help='path_val_data')
+    parser.add_argument('--path_test_data', type=str, default="../data/test_data.cache", help='path_test_data')
     
     return parser.parse_args()
 
@@ -50,6 +53,9 @@ if __name__ == "__main__":
     # Initialize PPO model
     model = PPO(env, 
                 policy,
+                path_train_data=args.path_train_data,
+                path_val_data=args.path_val_data,
+                path_test_data=args.path_test_data,
                 batch_size=args.batch_size,
                 mini_batch_size=args.mini_batch_size,
                 train_data_size=args.train_data_size,
