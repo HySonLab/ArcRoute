@@ -1,25 +1,27 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from tensordict.tensordict import TensorDict
 import torch
 import numpy as np
-from env.generator import CARPGenerator, TensorDictDataset
+from env.generator import CARPGenerator
 from common.cal_reward import get_reward, get_Ts_RL
 from common.local_search import lsRL
 from common.nb_utils import gen_tours_batch
 from common.ops import gather_by_index
+from torch.utils.data import DataLoader
 
 class CARPEnv:
     def __init__(
         self,
-        generator_params: dict = {},
+        num_loc=60,
+        num_arc=60,
+        num_vehicle=3,
         variant= 'P',
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.generator = CARPGenerator(**generator_params)
-        self.dataset_cls = TensorDictDataset
+        self.generator = CARPGenerator
+        self.num_loc = num_loc
+        self.num_arc = num_arc
+        self.num_vehicle = num_vehicle
         self.variant = variant
 
     def step(self, td: TensorDict):
@@ -70,33 +72,24 @@ class CARPEnv:
             mask_loc = mask_loc | ((td['clss'][..., 1:] - clss_min[..., None] < 0).unsqueeze(1))
         return ~torch.cat((mask_depot[..., None], mask_loc), -1).squeeze(-2)
 
-    def reset(self, td: TensorDict = None, batch_size=None):
-        if batch_size is None:
-            batch_size = self.batch_size if td is None else td.batch_size
-            if not isinstance(batch_size, int):
-                batch_size = batch_size[0]        
-        
-        if td is None or td.is_empty():
-            td = self.generator(batch_size=batch_size)
-
-        # Create reset TensorDict
+    def reset(self, td):
+        batch_size = td.batch_size[0]      
         td_reset = TensorDict(
             {
-                "demand": td["demand"],
+                "demand": td["demands"],
                 "current_node": torch.zeros(
                     batch_size, 1, dtype=torch.long),
                 "used_capacity": torch.zeros((batch_size, 1)),
-                "vehicle_capacity": torch.full(
-                    (batch_size, 1), self.generator.vehicle_capacity),
+                "vehicle_capacity": torch.full((batch_size, 1), 1),
                 "visited": torch.zeros(
-                    (batch_size, 1, td["service_time"].shape[1]),
+                    (batch_size, 1, td["service_times"].shape[1]),
                     dtype=torch.uint8
                 ),
                 'clss': td["clss"],
-                'service_time': td["service_time"],
-                'traveling_time': td["traveling_time"],
+                'service_times': td["service_times"],
+                'traversal_times': td["traversal_times"],
                 'adj': td["adj"],
-                "done": torch.zeros(batch_size, td["service_time"].shape[1], dtype=torch.bool),
+                "done": torch.zeros(batch_size, td["service_times"].shape[1], dtype=torch.bool),
             },
             batch_size=batch_size,
         ).to(td.device)
@@ -104,9 +97,18 @@ class CARPEnv:
         return td_reset
     
     
-    def dataset(self, batch_size, phase=None):
-        td = self.generator(batch_size)
-        return self.dataset_cls(td)
+    def dataset(self, data_size, 
+                batch_size=128, 
+                shuffle=False, 
+                num_workers=24,
+                path_data='carp_data.pt'):
+        return DataLoader(
+            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle, path_data=path_data),
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=self.generator.collate_fn
+        )
 
     def get_objective(self, td, actions, is_local_search=True):
         tours_batch = gen_tours_batch(actions.cpu().numpy().astype(np.int32))

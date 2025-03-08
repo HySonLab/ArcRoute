@@ -4,6 +4,7 @@ from tensordict.tensordict import TensorDict
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import os
+
 def get_sampler(
     distribution: str,
     low: float = 0.0,
@@ -61,7 +62,7 @@ def sample_priority_classes(num_arc):
 
     return priority_classes
 
-def generate(num_loc, num_arc, num_vehicle):
+def generate(num_loc, num_arc):
     coord_sampler = get_sampler("uniform", low=0, high=1)
     arcs = sample_arcs(num_loc, num_arc)
     clss = sample_priority_classes(num_arc)
@@ -72,69 +73,84 @@ def generate(num_loc, num_arc, num_vehicle):
     td = TensorDict(
             {
                 'clss': clss,
-                "demands": demands / vehicle_capacity,
-                "capacity": 1,
-                "service_times": servicing_time,
-                "traversal_times": traversal_time,
-                "adj": dists_edges,
-                "num_vehicle": num_vehicle
+                "demand": demands / vehicle_capacity,
+                "capacity": vehicle_capacity,
+                "service_time": servicing_time,
+                "traversal_time": traversal_time,
+                "adj": dists_edges
             },
         )
     td = td.unsqueeze(0)
     td.batch_size=torch.Size([1]) 
     return td
 
-def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
-    class WrapDataset(Dataset):
-        def __init__(self, num_samples, num_loc, num_arc, num_vehicle):
+class CARPGenerator(Dataset):
+    def __init__(self, num_samples, num_loc, num_arc, cache_file="carp_data.pt"):
 
-            self.num_samples = num_samples
-            self.num_loc = num_loc
-            self.num_arc = num_arc
-            self.num_vehicle = num_vehicle
+        self.num_samples = num_samples
+        self.num_loc = num_loc
+        self.num_arc = num_arc
+        self.cache_file = cache_file
 
-        def __len__(self):
-            return self.num_samples
+        # Creating dataset ...
+        if os.path.exists(self.cache_file):
+            print(f"Loading dataset from {self.cache_file}...")
+            self.data = torch.load(self.cache_file)
+        else:
+            print("Generating new dataset...")
+            self.data = []
 
-        def __getitem__(self, idx):
-            return generate(self.num_loc, self.num_arc, self.num_vehicle)
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+
+        if len(self.data) < self.num_samples:
+            self.data.append(generate(self.num_loc, self.num_arc))
+            return self.data[-1]
         
-        @staticmethod
-        def collate_fn(batch):
-            return torch.cat(batch, dim=0) 
+        return self.data[idx]
+    
+
+def collate_fn(batch):
+    return torch.cat(batch, dim=0) 
+
+def save_cache(cache_file):
 
     dataloader = DataLoader(
-        WrapDataset(num_sample, num_loc, num_arc, num_vehicle),
+        CARPGenerator(100000, 60, 60),
         batch_size=128,
         shuffle=False,
         num_workers=24,
-        collate_fn=WrapDataset.collate_fn,
+        collate_fn=collate_fn,
     )
     tds = []
     for td in tqdm(dataloader):
         tds.append(td)
     
-    tds = torch.cat(tds, dim=0)
+    # tds = torch.cat(tds, dim=0)
 
-    print(f"Saving dataset to {path_data}...")
-    torch.save(tds, path_data)
+    print(f"Saving dataset to {cache_file}...")
+    torch.save(tds, cache_file)
+    
+if __name__ == "__main__":
+    torch.manual_seed(10)
 
-class CARPGenerator(Dataset):
-    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, path_data="carp_data.pt"):
-        if isinstance(path_data, str):
-            if not os.path.exists(path_data):
-                print(f"Don't have {path_data}, generating...")
-                save_cache(num_samples, num_loc, num_arc, num_vehicle, path_data)
-            self.data = torch.load(path_data)
-        else:
-            self.data = path_data
+    # data = torch.load("carp_data.pt")
+    # print(data)
+    # save_cache("carp_data.pt")
+    dataloader = DataLoader(
+        CARPGenerator(100000, 60, 60),
+        batch_size=128,
+        shuffle=False,
+        num_workers=24,
+        collate_fn=collate_fn,
+    )
 
-    def __len__(self):
-        return len(self.data)
+    for i in range(3):
+        for td in tqdm(dataloader):
+            pass
 
-    def __getitem__(self, idx):
-        return self.data[idx:idx+1]
-
-    @staticmethod
-    def collate_fn(batch):
-        return torch.cat(batch, dim=0) 
+    
+    
+    

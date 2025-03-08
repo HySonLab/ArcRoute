@@ -73,7 +73,7 @@ def generate(num_loc, num_arc, num_vehicle):
             {
                 'clss': clss,
                 "demands": demands / vehicle_capacity,
-                "capacity": 1,
+                "capacity": vehicle_capacity,
                 "service_times": servicing_time,
                 "traversal_times": traversal_time,
                 "adj": dists_edges,
@@ -98,17 +98,16 @@ def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.p
 
         def __getitem__(self, idx):
             return generate(self.num_loc, self.num_arc, self.num_vehicle)
-        
-        @staticmethod
-        def collate_fn(batch):
-            return torch.cat(batch, dim=0) 
+
+    def collate_fn(batch):
+        return torch.cat(batch, dim=0) 
 
     dataloader = DataLoader(
         WrapDataset(num_sample, num_loc, num_arc, num_vehicle),
         batch_size=128,
         shuffle=False,
         num_workers=24,
-        collate_fn=WrapDataset.collate_fn,
+        collate_fn=collate_fn,
     )
     tds = []
     for td in tqdm(dataloader):
@@ -128,6 +127,8 @@ class CARPGenerator(Dataset):
             self.data = torch.load(path_data)
         else:
             self.data = path_data
+        
+        # self.data = self.data.cuda()
 
     def __len__(self):
         return len(self.data)
@@ -135,6 +136,41 @@ class CARPGenerator(Dataset):
     def __getitem__(self, idx):
         return self.data[idx:idx+1]
 
-    @staticmethod
-    def collate_fn(batch):
-        return torch.cat(batch, dim=0) 
+def collate_fn(batch):
+    return torch.cat(batch, dim=0) 
+    
+if __name__ == "__main__":
+    torch.manual_seed(10)
+
+    dataloader = DataLoader(
+        CARPGenerator(100000, 60, 60, 3, "train_data.pt"),
+        batch_size=128,
+        shuffle=False,
+        num_workers=24,
+        collate_fn=collate_fn
+    )
+
+    for i in range(1):
+        for td in tqdm(dataloader):
+            td = torch.stack([*td]*3)
+            idxs = torch.randperm(td.size(0))
+            td = td[idxs]
+            for i in range(0, td.size(0), 32):
+                id_sub = idxs[i:i+32]
+                td_sub = td[id_sub]
+                print(td_sub.shape)
+            # print(td.shape)
+            # sub_dataloader = DataLoader(
+            #     CARPGenerator(path_data=td),
+            #     batch_size=32,
+            #     shuffle=True,
+            #     collate_fn=collate_fn,
+            #     num_workers=24,
+            # )
+            # for _ in range(3):
+            #     for sub in sub_dataloader:
+            #         pass
+
+    
+    
+    

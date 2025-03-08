@@ -109,7 +109,7 @@ def convert_vars_np(td):
     torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))
     return {
         'adj': adj.cpu().numpy(),
-        'service_time': td['service_time'].detach().cpu().numpy(),
+        'service_time': td['service_times'].detach().cpu().numpy(),
         'clss': td['clss'].detach().cpu().numpy().astype(np.int32),
         'demand': td['demand'].detach().cpu().numpy()
     }

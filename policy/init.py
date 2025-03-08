@@ -11,8 +11,8 @@ class ARPInitEmbedding(nn.Module):
         node_feats = torch.cat((            
                        td["demand"][..., None], 
                        td["clss"][..., None],
-                       td["service_time"][..., None],
-                       td["traveling_time"][..., None],
+                       td["service_times"][..., None],
+                       td["traversal_times"][..., None],
                        ), -1)
         
         # node_feats = torch.nan_to_num(node_feats, nan=0.0, posinf=0.0, neginf=0.0)
