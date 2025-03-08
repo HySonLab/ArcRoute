@@ -115,9 +115,9 @@ def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.p
         tds.append(td)
     
     tds = torch.cat(tds, dim=0)
-
-    print(f"Saving dataset to {path_data}...")
+    
     torch.save(tds, path_data)
+    print(f"Saved dataset to {path_data}...")
 
 class CARPGenerator(Dataset):
     def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, path_data="carp_data.pt"):
@@ -125,7 +125,7 @@ class CARPGenerator(Dataset):
             if not os.path.exists(path_data):
                 print(f"Don't have {path_data}, generating...")
                 save_cache(num_samples, num_loc, num_arc, num_vehicle, path_data)
-            self.data = torch.load(path_data)
+            self.data = torch.load(path_data, weights_only=False)
         else:
             self.data = path_data
 

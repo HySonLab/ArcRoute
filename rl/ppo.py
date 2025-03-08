@@ -32,6 +32,7 @@ class PPO(LightningModule):
         lr_scheduler_monitor: str = "val/reward",
         shuffle_train_dataloader: bool = True,
         dataloader_num_workers: int = 24,
+        reload_train_dataloader: int = 4,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -42,6 +43,7 @@ class PPO(LightningModule):
 
         self.instantiate_metrics(metrics)
         self.log_on_step = log_on_step
+        self.reload_train_dataloader = reload_train_dataloader
 
 
         self.ppo_cfg = {
@@ -106,13 +108,7 @@ class PPO(LightningModule):
         )
         return metrics
 
-    def setup(self, stage="fit"):
-
-        print(">>>>>>>>>>>>>")
-        print(f"train_data_size={self.data_cfg['train_data_size']}   bs={self.data_cfg['batch_size']}")
-        print(f"val_data_size={self.data_cfg['val_data_size']}   bs={self.data_cfg['batch_size']}")
-        print(f"test_data_size={self.data_cfg['test_data_size']}   bs={self.data_cfg['batch_size']}")
-
+    def load_dataloader(self):
         self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"], batch_size=self.data_cfg["batch_size"], 
                                               shuffle=True, path_data='train_data.pt', 
                                               num_workers=self.dataloader_num_workers)
@@ -122,6 +118,15 @@ class PPO(LightningModule):
         self.test_dataset = self.env.dataset(self.data_cfg["test_data_size"], batch_size=self.data_cfg["batch_size"], 
                                              shuffle=False, path_data='test_data.pt',
                                              num_workers=self.dataloader_num_workers) 
+
+    def setup(self, stage="fit"):
+
+        print(">>>>>>>>>>>>>")
+        print(f"train_data_size={self.data_cfg['train_data_size']}   bs={self.data_cfg['batch_size']}")
+        print(f"val_data_size={self.data_cfg['val_data_size']}   bs={self.data_cfg['batch_size']}")
+        print(f"test_data_size={self.data_cfg['test_data_size']}   bs={self.data_cfg['batch_size']}")
+
+        self.load_dataloader()
         self.dataloader_names = None
         self.setup_loggers()
 
@@ -282,7 +287,8 @@ class PPO(LightningModule):
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()
 
-        if self.current_epoch % 3 == 0:
-            os.remove('train_data.pt')
-            os.remove('val_data.pt')
-            os.remove('test_data.pt')
+        if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
+            if os.path.exists('train_data.pt'):
+                print("DELETED train_data.pt")
+                os.remove('train_data.pt')
+            self.load_dataloader()
