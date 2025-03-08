@@ -12,6 +12,9 @@ class PPO(LightningModule):
         self,
         env,
         policy,
+        path_train_data: str,
+        path_val_data: str,
+        path_test_data: str,
         critic_kwargs: dict = {},
         clip_range: float = 0.2,  # epsilon of PPO
         ppo_epochs: int = 2,  # inner epoch, K
@@ -69,6 +72,9 @@ class PPO(LightningModule):
             "train_data_size": train_data_size,
             "val_data_size": val_data_size,
             "test_data_size": test_data_size,
+            "path_train_data": path_train_data,
+            "path_val_data": path_val_data,
+            "path_test_data": path_test_data,
         }
 
         self.lr_scheduler_monitor=lr_scheduler_monitor
@@ -110,13 +116,13 @@ class PPO(LightningModule):
 
     def load_dataloader(self):
         self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                              shuffle=True, path_data='train_data.pt', 
+                                              shuffle=True, path_data=self.data_cfg["path_train_data"], 
                                               num_workers=self.dataloader_num_workers)
         self.val_dataset = self.env.dataset(self.data_cfg["val_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                            shuffle=False, path_data='val_data.pt', 
+                                            shuffle=False, path_data=self.data_cfg["path_val_data"], 
                                             num_workers=self.dataloader_num_workers)
         self.test_dataset = self.env.dataset(self.data_cfg["test_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                             shuffle=False, path_data='test_data.pt',
+                                             shuffle=False, path_data=self.data_cfg["path_test_data"],
                                              num_workers=self.dataloader_num_workers) 
 
     def setup(self, stage="fit"):
@@ -288,7 +294,7 @@ class PPO(LightningModule):
             sch.step()
 
         if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
-            if os.path.exists('train_data.pt'):
+            if os.path.exists(self.data_cfg["path_train_data"]):
                 print("DELETED train_data.pt")
-                os.remove('train_data.pt')
+                os.remove(self.data_cfg["path_train_data"])
             self.load_dataloader()
