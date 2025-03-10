@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
 from torchvision.datasets import MNIST
 
-# 1️⃣ DataModule: Quản lý dữ liệu MNIST
+
 class MNISTDataModule(pl.LightningDataModule):
     def __init__(self, batch_size=64):
         super().__init__()
@@ -13,7 +13,7 @@ class MNISTDataModule(pl.LightningDataModule):
         self.transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
 
     def prepare_data(self):
-        MNIST(root="data", train=True, download=True)  # Tải dataset nếu chưa có
+        MNIST(root="data", train=True, download=True)  
 
     def setup(self, stage=None):
         dataset = MNIST(root="data", train=True, transform=self.transform)
@@ -29,7 +29,6 @@ class MNISTDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         return DataLoader(self.test_data, batch_size=self.batch_size, num_workers=4)
 
-# 2️⃣ Model: Mạng MLP đơn giản
 class MLP(pl.LightningModule):
     def __init__(self, input_dim=28*28, hidden_dim=128, output_dim=10, lr=1e-3):
         super().__init__()
@@ -63,7 +62,6 @@ class MLP(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
-# 3️⃣ Training
 data_module = MNISTDataModule(batch_size=64)
 model = MLP()
 
