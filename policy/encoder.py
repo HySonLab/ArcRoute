@@ -8,7 +8,7 @@ from typing import Tuple, Union
 from einops import rearrange
 from torch.nn.functional import scaled_dot_product_attention
 import math
-from .init import ARPInitEmbedding
+from policy.init import ARPInitEmbedding
     
 class SkipConnection(nn.Module):
     def __init__(self, module):

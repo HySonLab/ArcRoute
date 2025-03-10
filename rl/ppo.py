@@ -22,7 +22,6 @@ class PPO(LightningModule):
         train_data_size: int=100000,
         val_data_size: int=10000,
         test_data_size: int=1000,
-        generate_default_data: bool = False,
         mini_batch_size: Union[int, float] = 0.25,  # 0.25,
         vf_lambda: float = 0.5,  # lambda of Value function fitting
         entropy_lambda: float = 0.0,  # lambda of entropy bonus
@@ -49,26 +48,25 @@ class PPO(LightningModule):
         self.reload_train_dataloader = reload_train_dataloader
 
 
+        if batch_size > train_data_size or batch_size > val_data_size:
+            print("batch_size should be less than or equal to train_data_size.")
+            batch_size = min(train_data_size, val_data_size)
+
         self.ppo_cfg = {
             "clip_range": clip_range,
             "ppo_epochs": ppo_epochs,
-            "mini_batch_size": mini_batch_size,
+            "mini_batch_size": batch_size//4 if mini_batch_size >= batch_size else mini_batch_size,
             "vf_lambda": vf_lambda,
             "entropy_lambda": entropy_lambda,
             "normalize_adv": normalize_adv,
             "max_grad_norm": max_grad_norm,
         }
 
-        # print("<<<<<<<<<<", train_data_size, test_data_size, val_data_size, batch_size)
-        if batch_size > train_data_size or batch_size > val_data_size:
-            print("batch_size should be less than or equal to train_data_size.")
-            batch_size = min(train_data_size, val_data_size)
 
         self.data_cfg = {
             "batch_size": batch_size,
             "val_batch_size": batch_size,
             "test_batch_size": batch_size,
-            "generate_default_data": generate_default_data,
             "train_data_size": train_data_size,
             "val_data_size": val_data_size,
             "test_data_size": test_data_size,
@@ -116,13 +114,13 @@ class PPO(LightningModule):
 
     def load_dataloader(self):
         self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                              shuffle=True, path_data=self.data_cfg["path_train_data"], 
+                                              shuffle=True, data=self.data_cfg["path_train_data"], 
                                               num_workers=self.dataloader_num_workers)
         self.val_dataset = self.env.dataset(self.data_cfg["val_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                            shuffle=False, path_data=self.data_cfg["path_val_data"], 
+                                            shuffle=False, data=self.data_cfg["path_val_data"], 
                                             num_workers=self.dataloader_num_workers)
         self.test_dataset = self.env.dataset(self.data_cfg["test_data_size"], batch_size=self.data_cfg["batch_size"], 
-                                             shuffle=False, path_data=self.data_cfg["path_test_data"],
+                                             shuffle=False, data=self.data_cfg["path_test_data"],
                                              num_workers=self.dataloader_num_workers) 
 
     def setup(self, stage="fit"):
@@ -159,11 +157,10 @@ class PPO(LightningModule):
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
-        
+        # Evaluate old actions, log probabilities, and rewards
         with torch.no_grad():
             td = self.env.reset(batch)  # note: clone needed for dataloader
-            out = self.policy(td.clone(), self.env, 
-                              phase=phase, calc_reward=True, return_sum_log_likelihood=True)
+            out = self.policy(td.clone(), self.env, phase=phase)
 
         if phase == "train":
             batch_size = out["actions"].shape[0]
@@ -183,18 +180,12 @@ class PPO(LightningModule):
             td.set("logprobs", out["log_likelihood"])
             td.set("reward", out["reward"])
             td.set("action", out["actions"])
-            
-            
-            # repeat self.ppo_cfg["ppo_epochs"] times and permute the data for td
-            td = torch.stack([*td]*self.ppo_cfg["ppo_epochs"])
-            td = td.to(td.device)
-            idxs = torch.randperm(td.size(0))
-            td = td[idxs]
 
-            
 
-            for i in range(0, td.size(0), mini_batch_size):
-                id_sub = idxs[i:i+mini_batch_size]
+            idxs = torch.cat([torch.randperm(td.size(0)) for _ in range(self.ppo_cfg["ppo_epochs"])])
+            size_inner = td.size(0)*self.ppo_cfg["ppo_epochs"]
+            for i in range(0, size_inner, self.ppo_cfg["mini_batch_size"]):
+                id_sub = idxs[i:i+self.ppo_cfg["mini_batch_size"]]
                 sub_td = td[id_sub]
                 previous_reward = sub_td["reward"].view(-1, 1)
                 out = self.policy(  # note: remember to clone to avoid in-place replacements!
@@ -202,7 +193,8 @@ class PPO(LightningModule):
                     actions=sub_td["action"],
                     env=self.env,
                     return_entropy=True,
-                    calc_reward=False
+                    calc_reward=False,
+                    return_sum_log_likelihood=False,
                 )
                 ll, entropy = out["log_likelihood"], out["entropy"]
 
@@ -239,6 +231,9 @@ class PPO(LightningModule):
                     + self.ppo_cfg["vf_lambda"] * value_loss
                     - self.ppo_cfg["entropy_lambda"] * entropy.mean()
                 )
+
+                # perform manual optimization following the Lightning routine
+                # https://lightning.ai/docs/pytorch/stable/common/optimization.html
 
                 opt = self.optimizers()
                 opt.zero_grad()
@@ -292,7 +287,7 @@ class PPO(LightningModule):
         # If the selected scheduler is a MultiStepLR scheduler.
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()
-
+        # print("---> self.current_epoch", self.current_epoch, (self.current_epoch + 1) % self.reload_train_dataloader == 0)
         if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
             if os.path.exists(self.data_cfg["path_train_data"]):
                 print("DELETED train_data.pt")

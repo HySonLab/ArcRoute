@@ -4,6 +4,7 @@ from tensordict.tensordict import TensorDict
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import os
+
 def get_sampler(
     distribution: str,
     low: float = 0.0,
@@ -120,14 +121,14 @@ def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.p
     print(f"Saved dataset to {path_data}...")
 
 class CARPGenerator(Dataset):
-    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, path_data="carp_data.pt"):
-        if isinstance(path_data, str):
-            if not os.path.exists(path_data):
-                print(f"Don't have {path_data}, generating...")
-                save_cache(num_samples, num_loc, num_arc, num_vehicle, path_data)
-            self.data = torch.load(path_data, weights_only=False)
+    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, data="carp_data.pt"):
+        if isinstance(data, str):
+            if not os.path.exists(data):
+                print(f"Don't have {data}, generating...")
+                save_cache(num_samples, num_loc, num_arc, num_vehicle, data)
+            self.data = torch.load(data, weights_only=False)
         else:
-            self.data = path_data
+            self.data = data
 
     def __len__(self):
         return len(self.data)

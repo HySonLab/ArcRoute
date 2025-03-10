@@ -1,6 +1,3 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from dataclasses import dataclass
 from typing import Tuple, Union
 import torch
@@ -10,7 +7,7 @@ from tensordict import TensorDict
 from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention
 import math
-from .context import ARPContext
+from policy.context import ARPContext
 
 class StaticEmbedding(nn.Module):
     """Static embedding for general problems.
@@ -184,7 +181,12 @@ class Decoder(nn.Module):
         self, td, env, embeddings):
         """Precompute the embeddings cache before the decoder is called"""
         return td, env, self._precompute_cache(embeddings)
-
+    
+    def post_decoder_hook(self, td, env):
+        logprobs = torch.stack(self.logprobs, 1)
+        actions = torch.stack(self.actions, 1)
+        return logprobs, actions, td, env
+    
     def _precompute_cache(
         self, embeddings: torch.Tensor
     ) -> PrecomputedCache:

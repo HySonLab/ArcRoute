@@ -1,14 +1,10 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import torch.nn as nn
 import torch
 from common.ops import get_log_likelihood
-from .encoder import Encoder 
-from .decoder import Decoder 
-from .decode_stragegy import get_decoding_strategy, calculate_entropy
-from common.nb_utils import run_parallel, refine_routes, prob_idxs
-from common.ops import gather_by_index
+from policy.encoder import Encoder 
+from policy.decoder import Decoder 
+from policy.decode_stragegy import get_decoding_strategy, calculate_entropy
+from common.ops import gather_by_index, refine_routes, prob_idxs, run_parallel
 import numpy as np
 
 
@@ -46,9 +42,10 @@ class AttentionModelPolicy(nn.Module):
         td,
         env,
         phase: str = "train",
-        calc_reward: bool = False,
+        calc_reward: bool = True,
         return_entropy: bool = False,
         return_hidden: bool = False,
+        return_actions: bool = True,
         return_init_embeds: bool = False,
         return_sum_log_likelihood: bool = True,
         actions=None,
@@ -93,36 +90,32 @@ class AttentionModelPolicy(nn.Module):
             td = env.step(td)
             step += 1
             if step > max_steps:
+                print(
+                    f"Exceeded maximum number of steps ({max_steps}) duing decoding"
+                )
                 break
-        
-        actions = torch.stack(decode_strategy.actions, dim=1)
-        actions = actions.cpu().numpy().astype(np.int32)
-        actions_org = actions.copy()
-        actions = run_parallel(refine_routes, actions, td["demand"].cpu().numpy(), max_vehicles=5)
-        max_pad = max(map(lambda x: len(x), actions))
-        actions_np = np.array([np.pad(x, (0, max_pad - len(x)), 'constant') for x in actions])
 
-        out = {}
-        out["actions"] = torch.tensor(actions_np, dtype=torch.int64, device=td.device)
-        
+        # Post-decoding hook: used for the final step(s) of the decoding strategy
+        logprobs, actions, td, env = decode_strategy.post_decoder_hook(td, env)
+
+        # Output dictionary construction
         if calc_reward:
-            td.set("reward", env.get_reward(td, out["actions"]))
-            out["reward"] = td["reward"]
+            td.set("reward", env.get_reward(td, actions))
 
-        if phase != 'infer':
-            logprobs = torch.stack(decode_strategy.logprobs, dim=1)        
-            idxs = np.array(run_parallel(prob_idxs, actions_org, actions_np))
-            idxs = torch.tensor(idxs, dtype=torch.int64, device=td.device)
-            logprobs = gather_by_index(logprobs, idxs, dim=1)
+        outdict = {
+            "reward": td["reward"],
+            "log_likelihood": get_log_likelihood(
+                logprobs, actions, td.get("mask", None), return_sum_log_likelihood
+            ),
+        }
 
-            out['log_likelihood'] = get_log_likelihood(
-                logprobs, out["actions"], td.get("mask", None), return_sum_log_likelihood)
+        if return_actions:
+            outdict["actions"] = actions
+        if return_entropy:
+            outdict["entropy"] = calculate_entropy(logprobs)
+        if return_hidden:
+            outdict["hidden"] = hidden
+        if return_init_embeds:
+            outdict["init_embeds"] = init_embeds
 
-            if return_entropy:
-                out["entropy"] = calculate_entropy(logprobs)
-            if return_hidden:
-                out["hidden"] = hidden
-            if return_init_embeds:
-                out["init_embeds"] = init_embeds
-
-        return out
+        return outdict

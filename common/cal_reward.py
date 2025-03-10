@@ -1,62 +1,40 @@
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-import numba as nb
 import numpy as np
-from common.ops import run_parallel, convert_vars_np
-from common.nb_utils import gen_tours_batch, calc_length
+import torch
+from common.local_search import lsRL
 
+def action_to_tours(action):
+    zero_indices = np.where(action == 0)[0]
+    split_indices = np.concatenate(([-1], zero_indices, [len(action)]))
+    lengths = np.diff(split_indices) - 1
+    valid_lengths = lengths[lengths > 0]
+    nonzero_action = action[action != 0]
+    tours = np.split(nonzero_action, np.cumsum(valid_lengths)[:-1])
+    # Tìm độ dài lớn nhất để padding
+    max_len = max(len(r) for r in tours)
 
-def get_reward(vars, actions=None, tours_batch=None):
-    if tours_batch is None:
-        tours_batch = gen_tours_batch(actions)
-    if not isinstance(vars, dict):
-        vars = convert_vars_np(vars)
-     
-    reward1 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 1)
-    # reward2 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 2)
-    # reward3 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 3)
-    # return np.float32([reward1, reward2, reward3]).T @ np.float32([1e2, 1e0, 1e-2])
-    return reward1
+    # Padding để đảm bảo tất cả có cùng kích thước
+    padded = np.zeros((len(tours), max_len+2), dtype=np.int32)
+    for idx, tour in enumerate(tours):
+        padded[idx][1:len(tour)+1] = tour
+    return padded
 
-def get_Ts(vars, actions=None, tours_batch=None):
-    if tours_batch is None:
-        tours_batch = gen_tours_batch(actions)
-    reward1 = run_parallel(reward_ins, tours_batch, adj=vars['adj'], service=vars['service_time'], clss=vars['clss'], k = 1)
-    reward2 = run_parallel(reward_ins, tours_batch, adj=vars['adj'], service=vars['service_time'], clss=vars['clss'], k = 2)
-    reward3 = run_parallel(reward_ins, tours_batch, adj=vars['adj'], service=vars['service_time'], clss=vars['clss'], k = 3)
-    return np.float32([reward1, reward2, reward3]).T
-
-def get_Ts_RL(vars, actions=None, tours_batch=None):
-    if tours_batch is None:
-        tours_batch = gen_tours_batch(actions)
-        
-    if not isinstance(vars, dict):
-        vars = convert_vars_np(vars)
-                                        
-    reward1 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 1)
-    reward2 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 2)
-    reward3 = run_parallel(reward_ins, tours_batch, vars['adj'], vars['service_time'], vars['clss'], k = 3)
-    return np.float32([reward1, reward2, reward3]).T
-
-@nb.njit(nb.float32(nb.int32[:, :], nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32), nogil=True)
-def reward_ins(tours, adj, service, clss, k):
-    r = 0.0
-    for tour in tours:
-        pos = np.where(clss[tour] == k)[0]
-        if len(pos) <= 0:
-            continue
-        candidate = tour[:pos[-1] + 1]
-        length = calc_length(adj, service, candidate)
-        r = max(r, length)
-    return r 
-
-@nb.njit(nb.float32(nb.float32[:, :], nb.float32[:], nb.int32[:], nb.int32[:], nb.int32), nogil=True)
-def reward_in(adj, service, clss, tour, k):
-    r = 0.0
-    pos = np.where(clss[tour] == k)[0]
-    if len(pos) > 0:
-        candidate = tour[:pos[-1] + 1]
-        length = calc_length(adj, service, candidate)
-        r = max(r, length)
-    return r
+def calc_reward(action, td, pos_val=[1,2,3], **kwargs):
+    tours = action_to_tours(action)
+    prior = td['clss'][tours]
+    total_time = td['service_times'][tours]
+    shortest_traversal_time = td['adj'][tours[:, :-1], tours[:, 1:]]
+    total_time[:, 1:] += shortest_traversal_time
+    total_time = torch.cumsum(total_time, dim=1)
+    # if kwargs.get("local_search", False):
+    #     tours = lsRL(td, tours)
+    rs = []
+    for p in pos_val:
+        pos = torch.nonzero(prior == p, as_tuple=True)
+        if len(pos[0]) == 0:
+            pos = [[0], [0]]
+        rs.append(total_time[pos].max())
+    if kwargs.get("return_list", False):
+        return rs
+    if kwargs.get("return_numpy", False):
+        return np.array(rs)
+    return torch.tensor(rs)

@@ -2,10 +2,8 @@ from tensordict.tensordict import TensorDict
 import torch
 import numpy as np
 from env.generator import CARPGenerator
-from common.cal_reward import get_reward, get_Ts_RL
-from common.local_search import lsRL
-from common.nb_utils import gen_tours_batch
-from common.ops import gather_by_index
+from common.cal_reward import calc_reward
+from common.ops import gather_by_index, run_parallel
 from torch.utils.data import DataLoader
 
 class CARPEnv:
@@ -101,24 +99,24 @@ class CARPEnv:
                 batch_size=128, 
                 shuffle=False, 
                 num_workers=24,
-                path_data='carp_data.pt'):
+                data='carp_data.pt'):
         return DataLoader(
-            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle, path_data=path_data),
+            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle, data=data),
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
             collate_fn=self.generator.collate_fn
         )
 
-    def get_objective(self, td, actions, is_local_search=True):
-        tours_batch = gen_tours_batch(actions.cpu().numpy().astype(np.int32))
-        if is_local_search:
-            tours_batch = lsRL(td, tours_batch=tours_batch, variant=self.variant, is_train=False)  
-        return get_Ts_RL(td, tours_batch=tours_batch)
+    def get_objective(self, td, actions, local_search=True):
+        actions = actions.clone().detach().cpu().numpy()
+        td = td.clone().detach().cpu()
+        return run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10, local_search=local_search)
 
-    def get_reward(self, td: TensorDict, actions: TensorDict) -> TensorDict:
-        tours_batch = gen_tours_batch(actions.cpu().numpy().astype(np.int32))
-        tours_batch = lsRL(td, tours_batch=tours_batch, variant=self.variant, is_train=True)
-        r = get_reward(td, tours_batch=tours_batch)
-        r = -torch.tensor(r, device=td.device)
-        return r
+    def get_reward(self, td, actions):
+        actions = actions.clone().detach().cpu().numpy()
+        td = td.clone().detach().cpu()
+        rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10, local_search=False, return_torch=True)
+        rs = -rs[:, :1].to(td.device)
+        # print(actions.shape, td.shape, rs.shape)
+        return rs

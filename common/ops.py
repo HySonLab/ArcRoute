@@ -1,5 +1,57 @@
 import numpy as np
-import concurrent.futures
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import torch
+
+def run_parallel(operation, *param_set, **kwargs):
+    def padding(batch):
+        if kwargs.get("return_numpy", False):
+            max_len = max([len(x) for x in batch])
+            padded = np.array([np.pad(x, (0, max_len - len(x)), 'constant') for x in batch])
+        else:
+            padded = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)
+        return padded
+
+    class WrapDataset(Dataset):
+        def __init__(self, operation, *param_set, **kwargs):
+            self.operation = operation
+            self.param_set = param_set
+            self.kwargs = kwargs
+
+        def __len__(self):
+            return len(self.param_set[0])
+
+        def __getitem__(self, i):
+            sliced_params = [param[i] for param in self.param_set]
+            return self.operation(*sliced_params, **self.kwargs)
+        
+        @classmethod
+        def collate_fn(self, batch):
+            return padding(batch)
+
+        
+    dataloader = DataLoader(
+        WrapDataset(operation, *param_set, **kwargs),
+        batch_size=len(param_set[0])//kwargs.get("num_epochs", 24),
+        shuffle=False,
+        num_workers=kwargs.get("num_workers", 10),
+        collate_fn=WrapDataset.collate_fn if kwargs.get("must_padding", False) else None
+    )
+    
+    is_tqdm=kwargs.get("is_tqdm", False)
+    ts = []
+    for t in tqdm(dataloader) if is_tqdm else dataloader:
+        ts.append(t)
+    
+    # if kwargs.get("ts_padding", False):
+    #     padded = padding(ts)
+    #     return padded
+    if kwargs.get("return_list", False):
+        return ts
+    if kwargs.get("return_numpy", False):
+        return np.concatenate(ts, 0)
+    return torch.cat(ts, 0)
+
 
 def gather_by_index(src, idx, dim=1, squeeze=True):
     """Gather elements from src by index idx along specified dim
@@ -91,28 +143,75 @@ def unbatchify_and_gather(x, idx, n):
     x = unbatchify(x, n)
     return gather_by_index(x, idx, dim=idx.dim())
 
+def prob_idxs(a1, a2, **kwargs):
+    idx = []
+    i,j = 0,0
+    while j < len(a2) and i < len(a1):
+        if a2[j] == a1[i]:
+            idx.append(i)
+            j += 1
+        i += 1
+    while len(idx) < kwargs['npad']:
+        idx.append(0)
+    if kwargs.get("return_numpy", False):
+        idx = np.array(idx, dtype=np.int64)
+    else:
+        idx = torch.tensor(idx, dtype=torch.int64)
+    # print("---> prob_idxs", idx.shape)
+    return idx
+        
+def refine_routes(actions, demands, max_vehicles=3, **kwargs):
+    actions = actions.tolist()
+    # Khởi tạo danh sách các route và sức chứa
+    routes = [[] for _ in range(max_vehicles)]  # Danh sách các route cho mỗi vehicle
+    capacities = [0.0] * max_vehicles  # Tổng demand của mỗi vehicle
     
-def run_parallel(operation, *args, **kwargs):
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
-        return [f.result() for f in futures]
-
-def run_parallel2(operation, *args, **kwargs):
-    with concurrent.futures.ProcessPoolExecutor(50) as executor:
-        futures = [executor.submit(operation, *param_set, **kwargs) for param_set in zip(*args)]
+    # Chỉ số vehicle hiện tại
+    vehicle_idx = 0
     
-    return [f.result() for f in futures]
+    for arc in actions:
+        if arc == 0:
+            # Chuyển sang vehicle tiếp theo nếu còn chỗ
+            if vehicle_idx + 1 < max_vehicles:
+                vehicle_idx += 1
+            continue
+        
+        demand = demands[arc]
+        
+        # Kiểm tra xem vehicle hiện tại có thể chứa arc không
+        if capacities[vehicle_idx] + demand <= 1.0:
+            routes[vehicle_idx].append(arc)
+            capacities[vehicle_idx] += demand
+        else:
+            # Thử đặt arc vào các vehicle tiếp theo
+            placed = False
+            for i in range(vehicle_idx + 1, max_vehicles):
+                if capacities[i] + demand <= 1.0:
+                    routes[i].append(arc)
+                    capacities[i] += demand
+                    placed = True
+                    break
+            # Nếu không tìm được vehicle nào, đặt vào vehicle hiện tại (có thể vượt quá sức chứa)
+            if not placed and vehicle_idx == max_vehicles - 1:
+                routes[vehicle_idx].append(arc)
+                capacities[vehicle_idx] += demand
+    ret = []
+    for route in routes:
+        if len(route) > 0:
+            ret.extend([0] + route)
 
-def convert_vars_np(td):
-    import torch
-    adj = td['adj'].detach().clone()
-    torch.diagonal(adj, dim1=1, dim2=2).fill_(float('inf'))
-    return {
-        'adj': adj.cpu().numpy(),
-        'service_time': td['service_times'].detach().cpu().numpy(),
-        'clss': td['clss'].detach().cpu().numpy().astype(np.int32),
-        'demand': td['demand'].detach().cpu().numpy()
-    }
+    ret += [0]*(max_vehicles + len(demands) - len(ret))
+    if kwargs.get("return_numpy", False):
+        ret = np.array(ret[1:], dtype=np.int64)
+    else:
+        ret = torch.tensor(ret[1:])
+
+    # print("---> refine_routes", ret.shape)
+    return ret
+
+def convert_prob(x):
+    a = np.logaddexp.reduce(x)
+    return np.exp(x - a)
 
 
 def convert_adjacency_matrix(n1, n2, d):
