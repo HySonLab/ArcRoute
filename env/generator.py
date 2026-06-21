@@ -189,50 +189,108 @@ def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
     td.batch_size=torch.Size([1])
     return td
 
-def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
-    # Bucketing (Phase 1 §1.3): the encoder cannot mix sizes in one batch
-    # (collate = torch.cat of (1,n,n); encoder asserts mask is None). So resolve
-    # any ranges to ONE concrete size here -> a cache file is a single bucket.
-    num_loc = _pick(num_loc)
-    num_arc = _pick(num_arc)
-    num_vehicle = _pick(num_vehicle)
+def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
+                     progress=False):
+    """Generate `num_samples` instances of ONE size in parallel; returns a single
+    batched TensorDict (all the same size, so torch.cat is valid)."""
+    num_loc, num_arc, num_vehicle = _pick(num_loc), _pick(num_arc), _pick(num_vehicle)
 
     class WrapDataset(Dataset):
-        def __init__(self, num_samples, num_loc, num_arc, num_vehicle):
-
-            self.num_samples = num_samples
-            self.num_loc = num_loc
-            self.num_arc = num_arc
-            self.num_vehicle = num_vehicle
-
         def __len__(self):
-            return self.num_samples
+            return num_samples
 
         def __getitem__(self, idx):
-            return generate(self.num_loc, self.num_arc, self.num_vehicle)
+            return generate(num_loc, num_arc, num_vehicle)
 
         @staticmethod
         def collate_fn(batch):
             return torch.cat(batch, dim=0)
 
     dataloader = DataLoader(
-        WrapDataset(num_sample, num_loc, num_arc, num_vehicle),
-        batch_size=128,
-        shuffle=False,
-        num_workers=24,
-        collate_fn=WrapDataset.collate_fn,
+        WrapDataset(), batch_size=128, shuffle=False,
+        num_workers=num_workers, collate_fn=WrapDataset.collate_fn,
     )
-    tds = []
-    for td in tqdm(dataloader):
-        tds.append(td)
+    it = tqdm(dataloader) if progress else dataloader
+    return torch.cat([td for td in it], dim=0)
 
-    tds = torch.cat(tds, dim=0)
+
+def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
+    # Bucketing (Phase 1 §1.3): the encoder cannot mix sizes in one batch
+    # (collate = torch.cat of (1,n,n); encoder asserts mask is None). So resolve
+    # any ranges to ONE concrete size here -> a cache file is a single bucket.
+    tds = generate_dataset(num_sample, num_loc, num_arc, num_vehicle, progress=True)
 
     parent_dir = os.path.dirname(path_data)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
     torch.save(tds, path_data)
     print(f"Saved dataset to {path_data}...")
+
+
+class SizeBucketBatchSampler:
+    """Phase 6: yields batches whose indices all live in the SAME size bucket, so
+    every collated batch is single-size (the encoder cannot mix sizes). Indices
+    within a bucket and the batch order are reshuffled each epoch when shuffle."""
+
+    def __init__(self, bucket_ranges, batch_size, shuffle=True):
+        self.bucket_ranges = list(bucket_ranges)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self._len = sum((en - st + batch_size - 1) // batch_size
+                        for st, en in self.bucket_ranges)
+
+    def __iter__(self):
+        batches = []
+        for st, en in self.bucket_ranges:
+            idx = torch.arange(st, en)
+            if self.shuffle:
+                idx = idx[torch.randperm(len(idx))]
+            idx = idx.tolist()
+            for i in range(0, len(idx), self.batch_size):
+                batches.append(idx[i:i + self.batch_size])
+        if self.shuffle:
+            batches = [batches[i] for i in torch.randperm(len(batches)).tolist()]
+        return iter(batches)
+
+    def __len__(self):
+        return self._len
+
+
+class MultiSizeCARPGenerator(Dataset):
+    """Phase 6: a training dataset spanning several sizes (the |A_r| ladder). Data
+    is grouped into per-size buckets; pair with SizeBucketBatchSampler to keep
+    each batch single-size. `sizes` is a list of (num_loc, num_arc) pairs."""
+
+    def __init__(self, num_samples, sizes, num_vehicle, num_workers=24, data=None):
+        if isinstance(data, str) and os.path.exists(data):
+            payload = torch.load(data, weights_only=False)
+            self.buckets, self.bucket_ranges = payload["buckets"], payload["ranges"]
+        else:
+            per = max(1, num_samples // len(sizes))
+            self.buckets, self.bucket_ranges, start = [], [], 0
+            for (nl, na) in sizes:
+                tds = generate_dataset(per, nl, na, num_vehicle, num_workers)
+                self.buckets.append(tds)
+                self.bucket_ranges.append((start, start + len(tds)))
+                start += len(tds)
+            if isinstance(data, str):
+                parent = os.path.dirname(data)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                torch.save({"buckets": self.buckets, "ranges": self.bucket_ranges}, data)
+        self._map = [(bi, li) for bi, (st, en) in enumerate(self.bucket_ranges)
+                     for li in range(en - st)]
+
+    def __len__(self):
+        return len(self._map)
+
+    def __getitem__(self, gidx):
+        bi, li = self._map[gidx]
+        return self.buckets[bi][li:li + 1]
+
+    @staticmethod
+    def collate_fn(batch):
+        return torch.cat(batch, dim=0)
 
 class CARPGenerator(Dataset):
     def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, data="carp_data.pt"):

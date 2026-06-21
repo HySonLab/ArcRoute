@@ -1,7 +1,8 @@
 from tensordict.tensordict import TensorDict
 import torch
 import numpy as np
-from env.generator import CARPGenerator
+from env.generator import (CARPGenerator, MultiSizeCARPGenerator,
+                           SizeBucketBatchSampler)
 from common.cal_reward import calc_reward
 from common.ops import gather_by_index, run_parallel
 from torch.utils.data import DataLoader
@@ -13,6 +14,7 @@ class CARPEnv:
         num_arc=60,
         num_vehicle=3,
         variant= 'P',
+        sizes=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -21,6 +23,9 @@ class CARPEnv:
         self.num_arc = num_arc
         self.num_vehicle = num_vehicle
         self.variant = variant
+        # Phase 6: if `sizes` (list of (num_loc, num_arc)) is given, train over a
+        # size LADDER (bucketed so each batch stays single-size). Else single-size.
+        self.sizes = sizes
 
     def step(self, td: TensorDict):
         current_node = td["action"][:, None]  # Add dimension for step
@@ -95,11 +100,18 @@ class CARPEnv:
         return td_reset
     
     
-    def dataset(self, data_size, 
-                batch_size=128, 
-                shuffle=False, 
+    def dataset(self, data_size,
+                batch_size=128,
+                shuffle=False,
                 num_workers=24,
                 data='carp_data.pt'):
+        if self.sizes is not None:
+            # Multi-size: bucket by size, each batch single-size (Phase 6).
+            ds = MultiSizeCARPGenerator(data_size, self.sizes, self.num_vehicle,
+                                        num_workers=num_workers, data=data)
+            sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
+            return DataLoader(ds, batch_sampler=sampler, num_workers=num_workers,
+                              collate_fn=ds.collate_fn)
         return DataLoader(
             self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle, data=data),
             batch_size=batch_size,

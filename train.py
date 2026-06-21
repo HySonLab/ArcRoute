@@ -24,14 +24,17 @@ def parse_args():
     parser.add_argument('--num_loc', type=int, default=20, help='Number of nodes')
     parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
     parser.add_argument('--num_vehicle', type=int, default=3, help='Number of arcs')
+    parser.add_argument('--sizes', type=str, default=None,
+                        help='Phase 6 multi-size training: "nloc:narc,..." e.g. '
+                             '"20:40,30:60,40:80,50:100,40:120". Overrides num_loc/num_arc.')
     parser.add_argument('--variant', type=str, default='U', help='Environment variant')
-    parser.add_argument('--checkpoint_dir', type=str, default='../cpkts/60arcs', help='Checkpoint directory')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/60arcs', help='Checkpoint directory')
     parser.add_argument('--num_workers', type=int, default=24, help='Number of workers for data loader') 
     parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
     parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
-    parser.add_argument('--path_train_data', type=str, default="../data/train_data.data", help='path_train_data')
-    parser.add_argument('--path_val_data', type=str, default="../data/val_data.data", help='path_val_data')
-    parser.add_argument('--path_test_data', type=str, default="../data/test_data.data", help='path_test_data')
+    parser.add_argument('--path_train_data', type=str, default="data/train_data.data", help='path_train_data')
+    parser.add_argument('--path_val_data', type=str, default="data/val_data.data", help='path_val_data')
+    parser.add_argument('--path_test_data', type=str, default="data/test_data.data", help='path_test_data')
     
     return parser.parse_args()
 
@@ -42,8 +45,15 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Phase 6: parse the optional size ladder "nloc:narc,nloc:narc,...".
+    sizes = None
+    if args.sizes:
+        sizes = [tuple(int(x) for x in pair.split(":")) for pair in args.sizes.split(",")]
+        print(f"Multi-size training over (num_loc, num_arc) buckets: {sizes}")
+
     # Initialize environment
-    env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=args.num_vehicle, variant=args.variant)
+    env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=args.num_vehicle,
+                  variant=args.variant, sizes=sizes)
     
     # Initialize policy
     policy = AttentionModelPolicy(

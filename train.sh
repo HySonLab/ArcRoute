@@ -15,13 +15,17 @@ VAL_DATA_SIZE=10000
 EMBED_DIM=128
 NUM_ENCODER_LAYERS=12
 NUM_HEADS=8
-# Paper F1: |A| = n*d, d in {1.5,2,2.5,3}. Here n=40, d=2 -> |A|=80, and the
-# ¼-split (F2) gives |A_r| = 3*floor(80/4) = 60 required arcs (paper's main cfg).
-# Constraint (Phase 0 §0.6): NUM_ARC >= NUM_LOC (a Hamiltonian cycle needs n arcs).
+# Phase 6: train over a SIZE LADDER (bucketed; each batch stays single-size).
+# Pairs are "nloc:narc"; ¼-split gives |A_r| = 3*floor(narc/4):
+#   20:40->30  30:60->45  40:80->60  50:100->75  40:120->90   (all <= cap 100)
+# This is what gives size-generalization. NUM_LOC/NUM_ARC are the single-size
+# fallback (used only when SIZES is empty). Fleet M is fixed (policy isn't
+# M-conditioned, so sweeping M would be noise) and topology stays unit_square.
+SIZES="20:40,30:60,40:80,50:100,40:120"
 NUM_LOC=40
 NUM_ARC=80
 VARIANT=P
-CHECKPOINT_DIR=checkpoints/cl123_Ar60
+CHECKPOINT_DIR=checkpoints/clP_ladder
 ACCELERATOR=gpu
 DEVICES=1
 
@@ -37,6 +41,7 @@ uv run python train.py \
     --num_heads "$NUM_HEADS" \
     --num_loc "$NUM_LOC" \
     --num_arc "$NUM_ARC" \
+    --sizes "$SIZES" \
     --variant "$VARIANT" \
     --checkpoint_dir "$CHECKPOINT_DIR" \
     --accelerator "$ACCELERATOR" \
