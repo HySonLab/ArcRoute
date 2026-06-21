@@ -6,7 +6,7 @@
 - [Key Components](#key-components)
 - [Installation](#installation)
 - [Usage](#usage)
-  - [Generate Problem Instances](#generate-problem-instances)
+  - [Generate Test Benchmark Grid](#generate-test-benchmark-grid)
   - [Run Heuristic Algorithms](run-heuristic-algorithms)
   - [Run Exact Method](#train-reinforcement-learning-model)
   - [Run RL method](#evaluate-performance)
@@ -55,7 +55,8 @@ hdcarp/
 │   ├── policy.py             # Policy network for RL
 │   ├── trainer.py
 ├── .gitignore                # Git ignore file
-├── requirements.txt          # Python dependencies
+├── pyproject.toml            # Python dependencies (managed with uv)
+├── setup.sh                  # One-step environment setup via uv
 ├── train.py                  # Main script to start training the models
 ├── README.md                 # Project documentation
 ├── LICENSE                   # License information
@@ -64,18 +65,62 @@ hdcarp/
 
 ## Installation
 
-To install the required dependencies, run:
+### Using uv (recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package/environment manager. Just run:
 
 ```bash
-pip install -r requirements.txt
+./setup.sh
+```
+
+This installs uv (if missing), creates a `.venv`, and installs all dependencies from `pyproject.toml`. Then either activate the env or prefix commands with `uv run`:
+
+```bash
+source .venv/bin/activate        # then: python train.py ...
+# or
+uv run python train.py --help
 ```
 
 ## Usage
 
-### Generate Problem Instances
-```python
-    python3 data/gen.py
+### Generate Test Benchmark Grid
+
+Test instances are written as `.npz` files under `data/ood/<topology>/<|A|>/` (one
+folder per total-arc bucket `|A|`). Each instance follows the paper's F1–F5 formulas
+(¼-split required arcs, balanced priority classes, `Q = Σq/3 + 0.5`). The fleet size
+`M` is a **solve-time** parameter (stored as a nominal value, overridden at eval), so
+arcs are generated **once** — not per `M`.
+
+**Synthetic topologies (no internet / osmnx required):**
+```bash
+# unit_square (in-distribution, paper F1)  -> data/ood/unit_square/<|A|>/*.npz
+uv run python data/gen.py --topology unit_square \
+    --density 1.5 2.0 2.5 3.0 --per_bucket 20 --min_arc 40 --seed 6868
+
+# cluster (OOD, Gaussian clusters)         -> data/ood/cluster/<|A|>/*.npz
+uv run python data/gen.py --topology cluster \
+    --density 1.5 2.0 2.5 3.0 --per_bucket 20 --min_arc 40 --seed 6868
 ```
+
+**Real road networks from OpenStreetMap (requires `uv add osmnx`):**
+```bash
+# city A = Da Nang  -> data/ood/osm_cityA/<|A|>/*.npz
+uv run python data/gen.py --topology osm --out data/ood/osm_cityA \
+    --per_bucket 20 --min_arc 40 --tol 5 --seed 6868 \
+    --bbox 16.0741 16.0591 108.2187 108.1972
+
+# city B = Hanoi    -> data/ood/osm_cityB/<|A|>/*.npz
+uv run python data/gen.py --topology osm --out data/ood/osm_cityB \
+    --per_bucket 20 --min_arc 40 --tol 6 --seed 777 \
+    --bbox 21.0450 21.0180 105.8650 105.8350
+```
+
+Key flags: `--topology {unit_square,cluster,osm}`, `--density` (sweeps `d=|A|/|V|`),
+`--per_bucket` (instances per `|A|` bucket), `--min_arc` (smallest `|A|`, use 40 for the
+full size ladder), `--m_nominal` (nominal fleet stored in the `.npz`), `--tol`
+(accepted `|A|` deviation), `--bbox N S E W` (OSM only). Re-running tops up existing
+buckets, so it is safe to resume. Training data is generated on the fly (see
+[RL Training](#rl-training)) and does not need this script.
 ### Run Meta Heuristic Algorithms
 ```python
     python3 baseline/ils.py --data_path "data/instances/30/61_20.npz"

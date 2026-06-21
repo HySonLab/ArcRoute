@@ -29,7 +29,12 @@ CHECKPOINT_DIR=checkpoints/clP_ladder
 ACCELERATOR=gpu
 DEVICES=1
 
-uv run python train.py \
+mkdir -p logs
+TS=$(date +%Y%m%d_%H%M%S)
+LOG="logs/train_${TS}.out"
+
+# Run in the background via nohup so training survives a terminal close.
+nohup uv run python train.py \
     --seed "$SEED" \
     --max_epoch "$MAX_EPOCH" \
     --batch_size "$BATCH_SIZE" \
@@ -45,4 +50,9 @@ uv run python train.py \
     --variant "$VARIANT" \
     --checkpoint_dir "$CHECKPOINT_DIR" \
     --accelerator "$ACCELERATOR" \
-    --devices "$DEVICES"
+    --devices "$DEVICES" \
+    > "$LOG" 2>&1 &
+
+echo "Training started (PID $!)"
+echo "Log: $LOG"
+echo "Theo doi: tail -f $LOG"
