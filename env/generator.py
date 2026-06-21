@@ -8,6 +8,25 @@ import os
 
 from common.ops import dist_edges_from_file
 
+# Plan Phase 1: hard cap |A_r| <= 100 (n <= 101) so every config fits one 4090
+# without AMP/checkpointing. With ¼-split |A_r| = 3*floor(|A|/4), this means
+# |A| <= 135 (3*floor(135/4)=99). Configs above raise (fail-fast).
+MAX_REQUIRED = 100
+
+
+def required_arcs(num_arc):
+    """|A_r| = 3*floor(|A|/4) (paper F2 ¼-split)."""
+    return 3 * (num_arc // 4)
+
+
+def _pick(v):
+    """Resolve a hyperparameter that may be a scalar or an inclusive (lo, hi)
+    range into a concrete int (uniform random within the range)."""
+    if isinstance(v, (tuple, list)):
+        return int(torch.randint(int(v[0]), int(v[1]) + 1, (1,)))
+    return int(v)
+
+
 def get_sampler(
     distribution: str,
     low: float = 0.0,
@@ -99,6 +118,17 @@ def build_sparse_adj(edges, d, req_mask):
     return torch.from_numpy(dms).float()
 
 def generate(num_loc, num_arc, num_vehicle):
+    # Phase 1: each arg may be a scalar or an inclusive (lo, hi) range. A single
+    # generate() call resolves to ONE concrete size (the dataloader must keep a
+    # batch single-size; see save_cache + the encoder's `assert mask is None`).
+    num_loc = _pick(num_loc)
+    num_arc = _pick(num_arc)
+    num_vehicle = _pick(num_vehicle)
+    assert required_arcs(num_arc) <= MAX_REQUIRED, (
+        f"|A_r|={required_arcs(num_arc)} (|A|={num_arc}) exceeds the hard cap "
+        f"{MAX_REQUIRED}; pick a smaller num_arc (|A| <= 135)."
+    )
+
     coord_sampler = get_sampler("uniform", low=0, high=1)
     coords = coord_sampler.sample((num_loc, 2))
     edges = sample_arcs(num_loc, num_arc)
@@ -138,6 +168,13 @@ def generate(num_loc, num_arc, num_vehicle):
     return td
 
 def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
+    # Bucketing (Phase 1 §1.3): the encoder cannot mix sizes in one batch
+    # (collate = torch.cat of (1,n,n); encoder asserts mask is None). So resolve
+    # any ranges to ONE concrete size here -> a cache file is a single bucket.
+    num_loc = _pick(num_loc)
+    num_arc = _pick(num_arc)
+    num_vehicle = _pick(num_vehicle)
+
     class WrapDataset(Dataset):
         def __init__(self, num_samples, num_loc, num_arc, num_vehicle):
 

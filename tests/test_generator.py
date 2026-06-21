@@ -189,5 +189,40 @@ class TestGenerateEndToEnd(unittest.TestCase):
         self.assertGreater(float(td["demands"][0].sum()), 2.0)
 
 
+class TestPhase1SizeCap(unittest.TestCase):
+    """Plan Phase 1: hard cap |A_r| <= 100, range support, single-size batches."""
+
+    def test_cap_boundary(self):
+        # |A|=135 -> |A_r|=3*33=99 (ok); |A|=136 -> 3*34=102 (> cap, raise).
+        torch.manual_seed(0)
+        td = generate(num_loc=50, num_arc=135, num_vehicle=3)
+        self.assertEqual(tuple(td["adj"].shape), (1, 99 + 1, 99 + 1))
+        with self.assertRaises(AssertionError):
+            generate(num_loc=50, num_arc=136, num_vehicle=3)
+
+    def test_range_support(self):
+        seen = set()
+        for _ in range(30):
+            torch.manual_seed(len(seen) + 1)
+            td = generate(num_loc=(20, 50), num_arc=(40, 120), num_vehicle=(2, 7))
+            n = td["adj"].shape[1]
+            self.assertLessEqual(n, 101)              # within the cap
+            self.assertIn(int(td["num_vehicle"]) if not torch.is_tensor(td["num_vehicle"])
+                          else int(td["num_vehicle"][0]), range(2, 8))
+            seen.add(n)
+        self.assertGreater(len(seen), 1)              # sizes actually vary
+
+    def test_batch_must_be_single_size(self):
+        # Same size -> collate (torch.cat) works.
+        torch.manual_seed(0)
+        a = generate(20, 40, 3)
+        b = generate(20, 40, 3)
+        torch.cat([a, b], dim=0)                       # |A_r|=30 both -> ok
+        # Different size -> torch.cat fails (this is WHY we bucket by size).
+        c = generate(20, 80, 3)                        # |A_r|=60
+        with self.assertRaises(RuntimeError):
+            torch.cat([a, c], dim=0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

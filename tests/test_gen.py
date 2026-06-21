@@ -114,6 +114,14 @@ class TestRequiredCount(unittest.TestCase):
             ratio = gen.required_count(num_arc) / num_arc
             self.assertAlmostEqual(ratio, 0.75, delta=0.05)
 
+    def test_bucket_cap(self):
+        # Phase 1: buckets with |A_r|=3*floor(|A|/4) <= 100 are kept; larger ones
+        # (|A| >= 140 -> |A_r| >= 105) are excluded.
+        keep = [b for b in range(30, 201, 10) if gen.required_count(b) <= 100]
+        self.assertTrue(all(gen.required_count(b) <= 100 for b in keep))
+        self.assertNotIn(140, keep)                   # 3*35 = 105 > 100
+        self.assertIn(130, keep)                      # 3*32 = 96 <= 100
+
 
 class TestRoundTripWithImportInstance(unittest.TestCase):
     """A generated .npz must load cleanly through common.ops.import_instance."""

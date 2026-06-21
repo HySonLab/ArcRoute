@@ -176,6 +176,8 @@ def main():
                    help="instances per |A| bucket (paper: 20)")
     p.add_argument("--tol", type=int, default=2,
                    help="accepted deviation of |A| from the bucket centre")
+    p.add_argument("--max_req", type=int, default=100,
+                   help="hard cap on |A_r| (Phase 1: fits one 4090). |A_r|=3*floor(|A|/4).")
     p.add_argument("--seed", type=int, default=6868)
     p.add_argument("--bbox", type=float, nargs=4, metavar=("N", "S", "E", "W"),
                    default=[16.0741, 16.0591, 108.2187, 108.1972],
@@ -188,7 +190,12 @@ def main():
     M = args.vehicles
     # Paper step 2: |A| in {30,...,200} for M=2, {70,...,200} for M=5.
     first = 30 if M == 2 else 70
-    buckets = list(range(first, 200 + 1, 10))
+    # Phase 1 hard cap: keep only buckets whose |A_r| = 3*floor(|A|/4) <= max_req.
+    buckets = [b for b in range(first, 200 + 1, 10)
+               if required_count(b) <= args.max_req]
+    if not buckets:
+        raise SystemExit(f"no |A| bucket satisfies |A_r| <= {args.max_req}")
+    print(f"[M={M}] buckets (|A_r|<={args.max_req}): {buckets}")
 
     out = args.out or f"data/{M}m"
     os.makedirs(out, exist_ok=True)
