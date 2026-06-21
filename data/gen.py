@@ -1,50 +1,120 @@
-import networkx as nx
-import osmnx as ox
+"""Generate HDCARP benchmark instances following the paper's
+"Create HDCARP instances" procedure (arXiv:2501.00852).
+
+Pipeline:
+  1. Extract a strongly-connected directed graph G=(V,A) from OpenStreetMap
+     via OSMnx (real road topology + real node coordinates).
+  2. Vehicle fleet |M| in {2, 5}.
+  3. Required arcs A_r: |A_r| ~ U[60,70] if |A| >= 80, else 75% of |A|.
+  4. Priority class of each required arc drawn uniformly from {1,2,3}.
+  5. Traversal time d_a = d'_a / d'_max (Euclidean, normalized); service = 2*d_a.
+  6. Demand q_a = d_a * 0.5 + 0.5.
+  7. Vehicle capacity Q = sum_{a in A_r} (q_a / 3 + 0.5).
+
+The per-instance physics live in `build_instance`, which is pure (no OSMnx) and
+unit-tested in tests/test_gen.py. OSMnx is only needed to run this script
+end to end; install it first, e.g. `uv add osmnx`.
+
+Usage:
+    uv run python data/gen.py --vehicles 5            # writes data/5m/<|A|>/*.npz
+    uv run python data/gen.py --vehicles 2            # writes data/2m/<|A|>/*.npz
+
+.npz schema (consumed by common/ops.import_instance):
+    req:    (|A_r|, 6)   columns [tail, head, demand, clss, service, traversal]
+    nonreq: (|A_nr|, 6)  columns [tail, head, 0, 0, 0, traversal]
+    P=3, M=<vehicles>, C=<capacity>
+"""
 import os
 import random
-import torch
-import numpy as np
+import argparse
 import shutil
-from torch.distributions import Uniform
 
-CAPACITIES = {
-        10: 20.0,
-        15: 25.0,
-        20: 30.0,
-        30: 33.0,
-        40: 37.0,
-        50: 40.0,
-        60: 43.0,
-        75: 45.0,
-        100: 50.0,
-        125: 55.0,
-        150: 60.0,
-        200: 70.0,
-        500: 100.0,
-        1000: 150.0,
-    }
+import numpy as np
+import networkx as nx
 
-def check():
-    from glob import glob
-    from collections import defaultdict
 
-    files = glob('instances/*/*.npz')
-    l = defaultdict(list)
-    for file in files:
-        l[int(file.split('/')[-2])].append(file)
-    for k in l.keys():
-        print(k, len(l[k]))
+# --------------------------------------------------------------------------- #
+# Instance physics (pure, OSMnx-free, unit-tested)
+# --------------------------------------------------------------------------- #
+def required_count(num_arc, rng=np.random):
+    """Paper F2 (¼-split): |A_r| = 3*floor(|A|/4) — each of the three priority
+    classes gets floor(|A|/4) arcs, the rest are non-required. This restores the
+    original scale-invariant ~75% ratio (HRDA's old 60-70 rule caused a scaling
+    defect where the required ratio collapsed as |A| grew)."""
+    return 3 * (num_arc // 4)
 
+
+def build_instance(edges, coords, M, rng=np.random):
+    """Build an HDCARP instance from a directed graph.
+
+    edges:  (|A|, 2) int array of (tail, head) node indices in 0..n-1
+    coords: (n, 2)   float array of node (x, y) positions (e.g. projected meters)
+    M:       number of vehicles
+    Returns (req, nonreq, C). Raises ValueError on a degenerate graph.
+    """
+    edges = np.asarray(edges, dtype=int)
+    coords = np.asarray(coords, dtype=np.float64)
+    num_arc = len(edges)
+
+    # Step 5: Euclidean distance per arc, normalized by the max over all arcs.
+    d_eucl = np.sqrt(((coords[edges[:, 0]] - coords[edges[:, 1]]) ** 2).sum(-1))
+    d_max = d_eucl.max()
+    if d_max <= 0:
+        raise ValueError("degenerate graph: all arc lengths are zero")
+    d = d_eucl / d_max                            # traversal time d_a in (0, 1]
+
+    # Step 3: pick the required arcs.
+    n_req = required_count(num_arc, rng)
+    if n_req >= num_arc:
+        raise ValueError("not enough arcs to select the required set")
+
+    idx = np.arange(num_arc)
+    idx_req = rng.choice(idx, size=n_req, replace=False)
+    # The depot (node 0) must be the tail of at least one required arc.
+    tries = 0
+    while 0 not in edges[idx_req, 0]:
+        idx_req = rng.choice(idx, size=n_req, replace=False)
+        tries += 1
+        if tries > 1000:
+            raise ValueError("could not place the depot on a required arc")
+    idx_nonreq = np.setdiff1d(idx, idx_req)
+
+    e_req, e_nonreq = edges[idx_req], edges[idx_nonreq]
+    d_req, d_nonreq = d[idx_req], d[idx_nonreq]
+
+    # Steps 5, 6: service = 2*d, demand q = 0.5*d + 0.5 (required arcs only).
+    s_req = 2.0 * d_req
+    q_req = 0.5 * d_req + 0.5
+
+    # Paper F2: balanced classes — each of {1,2,3} gets the same count (n_req/3).
+    per_class = n_req // 3
+    clss = np.concatenate([
+        np.repeat([1, 2, 3], per_class),
+        np.full(n_req - 3 * per_class, 3),        # remainder (n_req not /3) -> class 3
+    ])
+    rng.shuffle(clss)
+
+    # Paper F5: vehicle capacity Q = (sum over required arcs of q_a) / 3 + 0.5.
+    # (add 0.5 ONCE — the old `(q/3 + 0.5).sum()` added 0.5 per arc, ~75x too loose.)
+    C = float(q_req.sum() / 3.0 + 0.5)
+
+    req = np.column_stack([e_req, q_req, clss, s_req, d_req]).astype(np.float64)
+    z = np.zeros(len(e_nonreq))
+    nonreq = np.column_stack([e_nonreq, z, z, z, d_nonreq]).astype(np.float64)
+    return req, nonreq, C
+
+
+# --------------------------------------------------------------------------- #
+# OSMnx graph extraction
+# --------------------------------------------------------------------------- #
 def get_subgraph(G, num_nodes):
     if num_nodes > G.number_of_nodes():
         raise ValueError("num_nodes is greater than the number of nodes in the graph.")
-
     start_node = random.choice(list(G.nodes))
     bfs_tree = nx.bfs_tree(G, start_node)
     nodes_in_subgraph = list(bfs_tree.nodes)[:num_nodes]
+    return G.subgraph(nodes_in_subgraph).copy()
 
-    subgraph = G.subgraph(nodes_in_subgraph).copy()
-    return subgraph
 
 def get_random_connected_subgraph(G, num_nodes):
     subgraph = get_subgraph(G, num_nodes)
@@ -52,96 +122,103 @@ def get_random_connected_subgraph(G, num_nodes):
         subgraph = get_subgraph(G.copy(), num_nodes)
     return subgraph
 
-def gen_graph(num_loc, num_arc):
-    while True:
-        subgraph = get_random_connected_subgraph(G_proj.copy(), num_loc)
-        g = nx.DiGraph()
-        map_node = {vi:i for i, vi in enumerate(subgraph.nodes())}
-        for u,v,attr in subgraph.edges(data=True):
-            u,v = map_node[u],map_node[v]
-            g.add_edge(u,v)
 
-        if nx.is_empty(g):
+def load_osm_graph(north, south, east, west):
+    """Download and project an OSM drive graph for the given bounding box.
+    Handles both the legacy (north/south/east/west) and osmnx>=2.0 (bbox tuple)
+    signatures of graph_from_bbox.
+    """
+    import osmnx as ox
+    try:
+        G = ox.graph_from_bbox(north=north, south=south, east=east, west=west,
+                               network_type="drive")
+    except TypeError:
+        # osmnx >= 2.0: a single bbox = (left, bottom, right, top)
+        G = ox.graph_from_bbox(bbox=(west, south, east, north), network_type="drive")
+    return ox.project_graph(G)
+
+
+def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
+    """Sample one strongly-connected subgraph and write a paper-faithful instance."""
+    while True:
+        sub = get_random_connected_subgraph(G_proj.copy(), target_nodes)
+        node_map = {vi: i for i, vi in enumerate(sub.nodes())}
+        coords = np.array([[sub.nodes[vi]["x"], sub.nodes[vi]["y"]] for vi in node_map],
+                          dtype=np.float64)
+        edges = np.array([[node_map[u], node_map[v]] for u, v in sub.edges()], dtype=int)
+        if len(edges) == 0:
             continue
+
+        g = nx.DiGraph()
+        g.add_edges_from(edges.tolist())
         if not nx.is_strongly_connected(g):
             continue
 
-        idxs = np.arange(len(g.edges))
-        if num_arc >= len(idxs):
+        try:
+            req, nonreq, C = build_instance(edges, coords, M, rng=rng)
+        except ValueError:
             continue
-        idxs_req = np.random.choice(idxs, size=num_arc, replace=False)
-        e_req = np.array(list(g.edges()))[idxs_req]
-        while 0 not in e_req[:, 0]:
-            idxs = np.arange(len(g.edges))
-            idxs_req = np.random.choice(idxs, size=num_arc, replace=False)
-            e_req = np.array(list(g.edges()))[idxs_req]
-        e_nonreq = np.array(list(g.edges()))[np.setdiff1d(idxs, idxs_req)]
-
-        min_demand, max_demand = 1, 10
-        demand_sampler = Uniform(low=min_demand-1, high=max_demand-1)
-        demands = demand_sampler.sample((num_arc, 1))
-        demands = (demands.int() + 1).float()
-
-        
-        # Capacity
-        capacity = CAPACITIES.get(num_arc, None)
-        if capacity is None:
-            closest_num_loc = min(CAPACITIES.keys(), key=lambda x: abs(x - num_arc))
-            capacity = CAPACITIES[closest_num_loc]
-        capacity = capacity * 2
-
-        clss = torch.randint(1, 3+1, size=(num_arc, 1))
-        a, b = 1, 2
-        s = a + (b - a) * torch.rand(num_arc, 1)
-
-        dms = torch.rand(num_loc, num_loc)
-        dms[dms == 0] = float('inf')
-        torch.diagonal(dms, dim1=0, dim2=1).fill_(0)
-
-        d_nonreq = dms[e_nonreq[:, 0], e_nonreq[:, 1]][..., None]
-        d_req = dms[e_req[:, 0], e_req[:, 1]][..., None]
-
-        demands = demands.numpy()
-        clss = clss.numpy()
-        s = s.numpy()
-        d_req = d_req.numpy()
-
-        req = np.concatenate([e_req,demands,clss,s,d_req], axis=-1)
-        nonreq = np.concatenate([e_nonreq, np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),np.zeros_like(d_nonreq),d_nonreq], axis=-1)
         break
-    
-    fpath = f'{dir}/{len(req)+len(nonreq)}_{num_loc}_{np.random.randint(0,1000):03d}'
-    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=5, C=capacity)
-    return fpath + '.npz', len(req)+len(nonreq)
+
+    num_arc = len(req) + len(nonreq)
+    fpath = f"{save_dir}/{num_arc}_{len(coords)}_{rng.randint(0, 1000):03d}"
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C)
+    return fpath + ".npz", num_arc
+
+
+def main():
+    p = argparse.ArgumentParser(description="Generate paper-faithful HDCARP instances.")
+    p.add_argument("--vehicles", type=int, default=5, choices=[2, 5],
+                   help="fleet size |M| (paper uses {2, 5})")
+    p.add_argument("--out", type=str, default=None,
+                   help="output dir (default: data/<M>m)")
+    p.add_argument("--per_bucket", type=int, default=20,
+                   help="instances per |A| bucket (paper: 20)")
+    p.add_argument("--tol", type=int, default=2,
+                   help="accepted deviation of |A| from the bucket centre")
+    p.add_argument("--seed", type=int, default=6868)
+    p.add_argument("--bbox", type=float, nargs=4, metavar=("N", "S", "E", "W"),
+                   default=[16.0741, 16.0591, 108.2187, 108.1972],
+                   help="OSM bounding box: north south east west")
+    args = p.parse_args()
+
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    M = args.vehicles
+    # Paper step 2: |A| in {30,...,200} for M=2, {70,...,200} for M=5.
+    first = 30 if M == 2 else 70
+    buckets = list(range(first, 200 + 1, 10))
+
+    out = args.out or f"data/{M}m"
+    os.makedirs(out, exist_ok=True)
+
+    N, S, E, W = args.bbox
+    G_proj = load_osm_graph(N, S, E, W)
+
+    tmp = "temp"
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        for B in buckets:
+            pdir = os.path.join(out, str(B))
+            os.makedirs(pdir, exist_ok=True)
+            count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
+            while count < args.per_bucket:
+                target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
+                target_nodes = min(target_nodes, G_proj.number_of_nodes())
+                fpath, n_arc = gen_graph(G_proj, target_nodes, M, tmp)
+                if abs(n_arc - B) > args.tol or os.path.isfile(
+                    os.path.join(pdir, os.path.basename(fpath))
+                ):
+                    os.remove(fpath)
+                    continue
+                shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
+                count += 1
+                print(f"[M={M}] |A|~{B}: {count}/{args.per_bucket}  "
+                      f"(arcs={n_arc}, nodes={target_nodes})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
-
-    G_dump = ox.graph_from_bbox(north=16.0741, south=16.0591, east=108.1972, west=108.2187)
-    G_proj = ox.project_graph(G_dump)
-
-
-    nums = list(range(10, 90, 4))
-    nums = list(zip(nums[:-1], nums[1:]))
-
-    dir = "temp"
-    if not os.path.isdir(dir): os.mkdir(dir)
-
-    save = 'instances'
-    if not os.path.isdir(save): os.mkdir(save)
-    for i in range(6, 20):
-        n = 10*i
-        pdir = f'{save}/{n+10}/'
-        if not os.path.isdir(pdir): os.mkdir(pdir)
-
-        low, high = np.array([8, 12])+n
-
-        count = 0
-        while count < 20:
-            fpath, n_arc = gen_graph(num_loc=np.random.randint(*nums[min(i-2, len(nums)-1)]), num_arc=60)
-            if not ((n_arc <= high) & (n_arc >= low)) or os.path.isfile(pdir + fpath.split('/')[-1]):
-                continue
-            shutil.move(fpath, pdir)
-            count += 1
-
-    shutil.rmtree(dir)
+    main()

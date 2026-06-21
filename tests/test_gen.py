@@ -65,9 +65,14 @@ class TestBuildInstance(unittest.TestCase):
         self.assertTrue(np.allclose(self.req[:, 2], 0.5 * self.req[:, 5] + 0.5))
 
     def test_capacity_formula(self):
-        # Paper step 7: Q = sum over required arcs of (q_a / 3 + 0.5).
-        ref = (self.req[:, 2] / 3.0 + 0.5).sum()
+        # Paper F5: Q = (sum over required arcs of q_a) / 3 + 0.5  (add 0.5 ONCE).
+        ref = self.req[:, 2].sum() / 3.0 + 0.5
         self.assertAlmostEqual(self.C, float(ref), places=6)
+
+    def test_capacity_differs_from_old_buggy_formula(self):
+        # Old code added 0.5 per required arc -> ~75x too loose.
+        old = float((self.req[:, 2] / 3.0 + 0.5).sum())
+        self.assertGreater(abs(self.C - old), 0.5 * (len(self.req) - 1) - 1e-6)
 
     def test_priority_classes(self):
         clss = self.req[:, 3].astype(int)
@@ -75,32 +80,39 @@ class TestBuildInstance(unittest.TestCase):
         # non-required arcs carry class 0
         self.assertTrue(np.all(self.nonreq[:, 3] == 0))
 
+    def test_classes_balanced(self):
+        clss = self.req[:, 3].astype(int)
+        counts = [int((clss == c).sum()) for c in (1, 2, 3)]
+        self.assertLessEqual(max(counts) - min(counts), 1)
+
     def test_depot_on_required_arc(self):
         self.assertIn(0, self.req[:, 0].astype(int).tolist())
 
-    def test_required_count_large(self):
-        # |A| = 120 (>= 80) -> |A_r| in [60, 70]
-        self.assertGreaterEqual(len(self.req), 60)
-        self.assertLessEqual(len(self.req), 70)
+    def test_required_count_quarter_split(self):
+        # Paper F2: |A_r| = 3*floor(|A|/4).
+        num_arc = len(self.req) + len(self.nonreq)
+        self.assertEqual(len(self.req), 3 * (num_arc // 4))
 
     def test_required_count_small(self):
         rng = np.random.RandomState(1)
         edges, coords = make_strongly_connected_cycle(40, rng)
         req, nonreq, _ = gen.build_instance(edges, coords, M=2, rng=rng)
         num_arc = len(req) + len(nonreq)
-        self.assertEqual(len(req), max(1, round(0.75 * num_arc)))
+        self.assertEqual(len(req), 3 * (num_arc // 4))
 
 
 class TestRequiredCount(unittest.TestCase):
-    def test_small_is_75_percent(self):
+    def test_quarter_split(self):
         rng = np.random.RandomState(0)
-        self.assertEqual(gen.required_count(40, rng), 30)
-        self.assertEqual(gen.required_count(20, rng), 15)
+        self.assertEqual(gen.required_count(40, rng), 30)    # 3*10
+        self.assertEqual(gen.required_count(20, rng), 15)    # 3*5
+        self.assertEqual(gen.required_count(120, rng), 90)   # 3*30
 
-    def test_large_in_range(self):
-        rng = np.random.RandomState(0)
-        for _ in range(20):
-            self.assertTrue(60 <= gen.required_count(150, rng) <= 70)
+    def test_scale_invariant_ratio(self):
+        # No more 60-70 collapse: ratio stays ~0.75 at every size.
+        for num_arc in (40, 80, 120, 200):
+            ratio = gen.required_count(num_arc) / num_arc
+            self.assertAlmostEqual(ratio, 0.75, delta=0.05)
 
 
 class TestRoundTripWithImportInstance(unittest.TestCase):

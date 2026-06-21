@@ -1,9 +1,12 @@
 import torch
+import numpy as np
 from torch.distributions import Uniform, Normal
 from tensordict.tensordict import TensorDict
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import os
+
+from common.ops import dist_edges_from_file
 
 def get_sampler(
     distribution: str,
@@ -20,69 +23,118 @@ def get_sampler(
     else:
         raise ValueError(f"Unsupported distribution: {distribution}")
 
+# ---------------------------------------------------------------------------- #
+# Paper F1 graph (Hà 2024): a SPARSE, strongly-connected directed graph on the
+# unit square. NOTE (plan Phase 0 §0.6): the old generator used `cdist` over all
+# nodes -> `adj` was the COMPLETE-Euclidean metric (straight-line teleport),
+# whereas test (common.ops.import_instance) uses floyd-warshall over the SPARSE
+# arc set. That train/test metric gap is closed here: we build a real sparse
+# strongly-connected graph and compute `adj` with the SAME pipeline as test.
+# ---------------------------------------------------------------------------- #
 def sample_arcs(num_loc, num_arc):
-    coms = torch.combinations(torch.arange(num_loc), r=2)
-    coms = torch.stack([*coms, *coms[:, [1, 0]]])
-    
-    idxs = torch.randperm(coms.size(0))[:num_arc+1]
-    arcs = coms[idxs]
-    arcs[0] = torch.Tensor([0, 0])
-    return arcs
-
-def sample_traversal_time(num_loc, arcs, coord_sampler):
-    coords = coord_sampler.sample((num_loc, 2))
-    dists = torch.cdist(coords, coords, p=2)
-    traversal_time = dists[arcs[:, 0], arcs[:, 1]].clone()
-
-    for k in range(num_loc):
-        dists = torch.min(dists, dists[:, k].unsqueeze(1) + dists[k, :].unsqueeze(0))
-
-    dists_edges = dists[arcs[..., 1].unsqueeze(-1), arcs[..., 0].unsqueeze(0)]
-    return traversal_time, dists_edges
-
-def sample_service_time(traversal_time):
-    return traversal_time * 2
-
-def sample_demand(traversal_time, clss):
-    demand = traversal_time * 0.5 + 0.5
-    demand[clss] = 0
-    return demand
-
-def sample_vehicle_capacity(traversal_time, priority_classes):
-    return (traversal_time[priority_classes]/3 + 0.5).sum()
+    """Sparse strongly-connected directed graph on `num_loc` nodes (depot = 0)
+    with exactly `num_arc` distinct arcs. A random directed Hamiltonian cycle
+    guarantees strong connectivity; extra distinct, non-self-loop arcs are added
+    up to `num_arc`. Returns an (num_arc, 2) int tensor of (tail, head).
+    """
+    assert num_arc >= num_loc, (
+        f"num_arc({num_arc}) must be >= num_loc({num_loc}): a Hamiltonian cycle "
+        f"needs num_loc arcs (paper |A|=n*d, d>=1.5 always satisfies this)."
+    )
+    perm = torch.randperm(num_loc)
+    cycle = torch.stack([perm, torch.roll(perm, -1)], dim=1)   # (num_loc, 2)
+    edges = [(int(a), int(b)) for a, b in cycle.tolist()]
+    seen = set(edges)
+    while len(edges) < num_arc:
+        u = int(torch.randint(num_loc, (1,)))
+        v = int(torch.randint(num_loc, (1,)))
+        if u != v and (u, v) not in seen:
+            seen.add((u, v))
+            edges.append((u, v))
+    return torch.tensor(edges, dtype=torch.long)
 
 def sample_priority_classes(num_arc):
-    priority_classes = torch.randint(1, 3+1, size=(num_arc+1, ), dtype=torch.int64)
+    """Paper F2 (¼-split, balanced): each priority class in {1,2,3} gets exactly
+     floor(num_arc/4) arcs; the remainder are non-required (class 0). Returns a
+    per-arc class vector of length `num_arc` (NO depot row — the depot is a
+    prepended row in `generate`, mirroring common.ops.import_instance).
+    """
+    per_class = num_arc // 4
+    clss = torch.zeros(num_arc, dtype=torch.int64)
+    perm = torch.randperm(num_arc)
+    for c in (1, 2, 3):
+        idx = perm[(c - 1) * per_class: c * per_class]
+        clss[idx] = c
+    return clss
 
-    ids_0 = torch.randperm(num_arc)[:int(num_arc*25/100)+1]
-    if num_arc > 80:
-        ids_0 = torch.randperm(num_arc)[:num_arc - torch.randint(60, 70, (1, ))+1]
-    ids_0[0] = 0
-    priority_classes[ids_0] = 0
+def sample_service_time(traversal_time):
+    # Paper F4: service = 2 * traversal.
+    return traversal_time * 2
 
-    return priority_classes
+def sample_demand(traversal_time):
+    # Paper F4: q_a = 0.5 * d_a + 0.5 (required arcs only).
+    return traversal_time * 0.5 + 0.5
+
+def sample_vehicle_capacity(q_req):
+    # Paper F5: Q = (sum over required arcs of q_a) / 3 + 0.5  (add 0.5 ONCE).
+    return q_req.sum() / 3 + 0.5
+
+def build_sparse_adj(edges, d, req_mask):
+    """Shortest-path adjacency over the SPARSE arc set, restricted to required
+    arcs (+ a prepended depot row 0). Reuses common.ops.dist_edges_from_file so
+    the train metric is byte-identical to test (import_instance). `adj` only
+    depends on (tail, head, traversal), so demand/class/service columns are 0.
+    Returns a (|A_r|+1, |A_r|+1) float tensor.
+    """
+    e = edges.numpy().astype(np.float64)
+    dd = d.numpy().astype(np.float64)
+    m = np.asarray(req_mask)
+
+    def _cols(mask):
+        k = int(mask.sum())
+        z = np.zeros(k)
+        return np.column_stack([e[mask, 0], e[mask, 1], z, z, z, dd[mask]])
+
+    dms = dist_edges_from_file({"req": _cols(m), "nonreq": _cols(~m)})
+    return torch.from_numpy(dms).float()
 
 def generate(num_loc, num_arc, num_vehicle):
     coord_sampler = get_sampler("uniform", low=0, high=1)
-    arcs = sample_arcs(num_loc, num_arc)
-    clss = sample_priority_classes(num_arc)
-    traversal_time, dists_edges = sample_traversal_time(num_loc, arcs, coord_sampler)
-    servicing_time = sample_service_time(traversal_time)
-    demands = sample_demand(traversal_time, clss)
-    vehicle_capacity = sample_vehicle_capacity(demands, clss)
+    coords = coord_sampler.sample((num_loc, 2))
+    edges = sample_arcs(num_loc, num_arc)
+
+    # Per-arc Euclidean traversal time, normalized by the max (paper d_a=d'/d'max).
+    d_eucl = (coords[edges[:, 0]] - coords[edges[:, 1]]).pow(2).sum(-1).sqrt()
+    d = d_eucl / d_eucl.max()
+
+    clss_e = sample_priority_classes(num_arc)
+    req_mask = clss_e > 0
+
+    d_req = d[req_mask]
+    clss_req = clss_e[req_mask]
+    s_req = sample_service_time(d_req)
+    q_req = sample_demand(d_req)
+    C = sample_vehicle_capacity(q_req)
+
+    # Sparse shortest-path adjacency, identical pipeline to import_instance.
+    adj = build_sparse_adj(edges, d, req_mask.numpy())
+
+    # Prepend the depot row (all zeros) -> mirror common.ops.import_instance,
+    # which does `vstack([[0]*6, req])`. So index 0 is the depot.
+    z1 = torch.zeros(1)
     td = TensorDict(
             {
-                'clss': clss,
-                "demands": demands / vehicle_capacity,
+                'clss': torch.cat([torch.zeros(1, dtype=torch.int64), clss_req]),
+                "demands": torch.cat([z1, q_req]) / C,
                 "capacity": 1,
-                "service_times": servicing_time,
-                "traversal_times": traversal_time,
-                "adj": dists_edges,
+                "service_times": torch.cat([z1, s_req]),
+                "traversal_times": torch.cat([z1, d_req]),
+                "adj": adj,
                 "num_vehicle": num_vehicle
             },
         )
     td = td.unsqueeze(0)
-    td.batch_size=torch.Size([1]) 
+    td.batch_size=torch.Size([1])
     return td
 
 def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
@@ -99,10 +151,10 @@ def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.p
 
         def __getitem__(self, idx):
             return generate(self.num_loc, self.num_arc, self.num_vehicle)
-        
+
         @staticmethod
         def collate_fn(batch):
-            return torch.cat(batch, dim=0) 
+            return torch.cat(batch, dim=0)
 
     dataloader = DataLoader(
         WrapDataset(num_sample, num_loc, num_arc, num_vehicle),
@@ -114,9 +166,12 @@ def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.p
     tds = []
     for td in tqdm(dataloader):
         tds.append(td)
-    
+
     tds = torch.cat(tds, dim=0)
-    
+
+    parent_dir = os.path.dirname(path_data)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     torch.save(tds, path_data)
     print(f"Saved dataset to {path_data}...")
 
@@ -138,4 +193,4 @@ class CARPGenerator(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        return torch.cat(batch, dim=0) 
+        return torch.cat(batch, dim=0)
