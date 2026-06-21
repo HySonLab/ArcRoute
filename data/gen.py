@@ -105,6 +105,78 @@ def build_instance(edges, coords, M, rng=np.random):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4 — synthetic topologies for OOD testing (OSMnx-free, unit-tested).
+# build_instance is topology-agnostic, so OOD = feeding edges+coords from a
+# different source while applying the SAME F2-F5 physics.
+# --------------------------------------------------------------------------- #
+def build_strongly_connected(coords, num_arc, rng=np.random):
+    """Sparse strongly-connected directed graph on len(coords) nodes (depot=0)
+    with `num_arc` distinct arcs: a random Hamiltonian cycle (guarantees strong
+    connectivity) plus extra distinct, non-self-loop arcs. Mirrors the training
+    generator's sample_arcs so train and OOD test share graph structure."""
+    n = len(coords)
+    if num_arc < n:
+        raise ValueError(f"num_arc({num_arc}) < n({n}): a Hamiltonian cycle needs n arcs")
+    order = rng.permutation(n)
+    edges = [(int(order[i]), int(order[(i + 1) % n])) for i in range(n)]
+    seen = set(edges)
+    while len(edges) < num_arc:
+        u, v = int(rng.randint(n)), int(rng.randint(n))
+        if u != v and (u, v) not in seen:
+            seen.add((u, v))
+            edges.append((u, v))
+    return np.array(edges, dtype=int)
+
+
+def make_unit_square(n, d, rng=np.random):
+    """Paper F1 in-distribution topology: uniform coords in a square."""
+    coords = rng.rand(n, 2) * 100.0
+    num_arc = max(n, int(round(n * d)))
+    return build_strongly_connected(coords, num_arc, rng), coords
+
+
+def make_cluster(n, d, rng=np.random, k=4):
+    """OOD topology: K Gaussian clusters (different spatial distribution)."""
+    centers = rng.rand(k, 2) * 100.0
+    labels = rng.randint(0, k, size=n)
+    coords = centers[labels] + rng.randn(n, 2) * 4.0
+    num_arc = max(n, int(round(n * d)))
+    return build_strongly_connected(coords, num_arc, rng), coords
+
+
+_TOPOLOGIES = {"unit_square": make_unit_square, "cluster": make_cluster}
+
+
+def _save_instance(fpath, req, nonreq, M, C, topology, rng=np.random):
+    """Write an .npz with the schema common.ops.import_instance reads, plus
+    metadata (d, topology) for per-axis reporting (Phase 2/4/5)."""
+    num_arc = len(req) + len(nonreq)
+    num_nodes = int(np.concatenate([req[:, :2], nonreq[:, :2]]).max()) + 1
+    d = num_arc / num_nodes
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C, d=d, topology=topology)
+    return fpath + ".npz"
+
+
+def gen_synth(topology, n, d, M, save_dir, rng=np.random):
+    """Build one synthetic-topology instance (unit_square / cluster) end to end."""
+    make = _TOPOLOGIES[topology]
+    while True:
+        edges, coords = make(n, d, rng)
+        g = nx.DiGraph()
+        g.add_edges_from(edges.tolist())
+        if not nx.is_strongly_connected(g):
+            continue
+        try:
+            req, nonreq, C = build_instance(edges, coords, M, rng=rng)
+        except ValueError:
+            continue
+        break
+    num_arc = len(req) + len(nonreq)
+    fpath = f"{save_dir}/{topology}_{num_arc}_{len(coords)}_{rng.randint(0, 1000):03d}"
+    return _save_instance(fpath, req, nonreq, M, C, topology, rng), num_arc
+
+
+# --------------------------------------------------------------------------- #
 # OSMnx graph extraction
 # --------------------------------------------------------------------------- #
 def get_subgraph(G, num_nodes):
@@ -161,12 +233,9 @@ def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
         break
 
     num_arc = len(req) + len(nonreq)
-    # Phase 2: record the emergent density d = |A|/|V| so results can be reported
-    # per-d (paper F1 sweeps d in {1.5,2,2.5,3}; OSM topology gives an emergent d).
-    d = num_arc / len(coords)
     fpath = f"{save_dir}/{num_arc}_{len(coords)}_{rng.randint(0, 1000):03d}"
-    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C, d=d)
-    return fpath + ".npz", num_arc
+    # Phase 2/4: _save_instance records d=|A|/|V| and topology in the metadata.
+    return _save_instance(fpath, req, nonreq, M, C, "osm", rng), num_arc
 
 
 def main():
@@ -181,6 +250,12 @@ def main():
                    help="accepted deviation of |A| from the bucket centre")
     p.add_argument("--max_req", type=int, default=100,
                    help="hard cap on |A_r| (Phase 1: fits one 4090). |A_r|=3*floor(|A|/4).")
+    p.add_argument("--topology", type=str, default="osm",
+                   choices=["osm", "unit_square", "cluster"],
+                   help="graph source. osm=real roads (needs osmnx); unit_square/"
+                        "cluster=synthetic OOD test sets (Phase 4, OSMnx-free).")
+    p.add_argument("--density", type=float, nargs="+", default=[2.0],
+                   help="density d=|A|/|V| for synthetic topologies (paper {1.5,2,2.5,3}).")
     p.add_argument("--seed", type=int, default=6868)
     p.add_argument("--bbox", type=float, nargs=4, metavar=("N", "S", "E", "W"),
                    default=[16.0741, 16.0591, 108.2187, 108.1972],
@@ -190,9 +265,23 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    base = args.out or "data"
-    N, S, E, W = args.bbox
-    G_proj = load_osm_graph(N, S, E, W)
+    # In-distribution OSM -> data/<M>m; OOD synthetic -> data/ood/<topology>/<M>m.
+    if args.topology == "osm":
+        base = args.out or "data"
+        G_proj = load_osm_graph(*args.bbox)
+    else:
+        base = args.out or os.path.join("data", "ood", args.topology)
+        G_proj = None
+
+    def gen_one(B, M, save_dir):
+        """One instance targeting |A| ~ B; returns (path, n_arc)."""
+        if args.topology == "osm":
+            target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
+            target_nodes = min(target_nodes, G_proj.number_of_nodes())
+            return gen_graph(G_proj, target_nodes, M, save_dir)
+        d = float(np.random.choice(args.density))
+        n = max(5, int(round(B / d)))
+        return gen_synth(args.topology, n, d, M, save_dir, rng=np.random)
 
     tmp = "temp"
     os.makedirs(tmp, exist_ok=True)
@@ -208,7 +297,7 @@ def main():
             if not buckets:
                 print(f"[M={M}] no |A| bucket satisfies |A_r| <= {args.max_req}; skip")
                 continue
-            print(f"[M={M}] buckets (|A_r|<={args.max_req}): {buckets}")
+            print(f"[M={M}|{args.topology}] buckets (|A_r|<={args.max_req}): {buckets}")
 
             out = os.path.join(base, f"{M}m")
             os.makedirs(out, exist_ok=True)
@@ -217,9 +306,7 @@ def main():
                 os.makedirs(pdir, exist_ok=True)
                 count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
                 while count < args.per_bucket:
-                    target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
-                    target_nodes = min(target_nodes, G_proj.number_of_nodes())
-                    fpath, n_arc = gen_graph(G_proj, target_nodes, M, tmp)
+                    fpath, n_arc = gen_one(B, M, tmp)
                     if abs(n_arc - B) > args.tol or os.path.isfile(
                         os.path.join(pdir, os.path.basename(fpath))
                     ):
@@ -227,8 +314,8 @@ def main():
                         continue
                     shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
                     count += 1
-                    print(f"[M={M}] |A|~{B}: {count}/{args.per_bucket}  "
-                          f"(arcs={n_arc}, nodes={target_nodes})")
+                    print(f"[M={M}|{args.topology}] |A|~{B}: {count}/{args.per_bucket} "
+                          f"(arcs={n_arc})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

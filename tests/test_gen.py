@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import networkx as nx
 
 # data/gen.py is a script under a non-package dir; load it by path.
 _GEN_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "gen.py")
@@ -161,6 +162,51 @@ class TestFleetSweep(unittest.TestCase):
         p.add_argument("--vehicles", type=int, nargs="+", default=[1, 2, 3, 5, 7, 10])
         self.assertEqual(p.parse_args(["--vehicles", "1", "3", "7"]).vehicles, [1, 3, 7])
         self.assertEqual(p.parse_args([]).vehicles, [1, 2, 3, 5, 7, 10])
+
+
+class TestSyntheticTopology(unittest.TestCase):
+    """Phase 4: OOD topologies (unit_square, cluster) share F2-F5 with OSM and
+    load cleanly. All OSMnx-free."""
+
+    def test_strongly_connected_and_quarter_split(self):
+        for topo in ("unit_square", "cluster"):
+            rng = np.random.RandomState(0)
+            edges, coords = gen._TOPOLOGIES[topo](40, 2.0, rng)
+            g = nx.DiGraph()
+            g.add_edges_from(edges.tolist())
+            self.assertTrue(nx.is_strongly_connected(g), topo)
+            req, nonreq, C = gen.build_instance(edges, coords, M=5, rng=rng)
+            num_arc = len(req) + len(nonreq)
+            self.assertEqual(len(req), 3 * (num_arc // 4))           # ¼-split
+            counts = [int((req[:, 3] == c).sum()) for c in (1, 2, 3)]
+            self.assertLessEqual(max(counts) - min(counts), 1)        # balanced
+            self.assertFalse(np.isnan(req).any())
+
+    def test_physics_identical_across_topologies(self):
+        sources = {
+            "cycle": make_strongly_connected_cycle(50, np.random.RandomState(1)),
+            "unit_square": gen.make_unit_square(50, 2.0, np.random.RandomState(1)),
+            "cluster": gen.make_cluster(50, 2.0, np.random.RandomState(1)),
+        }
+        for name, (edges, coords) in sources.items():
+            req, _, C = gen.build_instance(edges, coords, M=5, rng=np.random.RandomState(2))
+            self.assertTrue(np.allclose(req[:, 4], 2 * req[:, 5]), name)        # service=2d
+            self.assertTrue(np.allclose(req[:, 2], 0.5 * req[:, 5] + 0.5), name)  # demand
+            self.assertAlmostEqual(C, req[:, 2].sum() / 3 + 0.5, places=6)        # F5
+
+    def test_gen_synth_roundtrip_and_topology_metadata(self):
+        with tempfile.TemporaryDirectory() as t:
+            path, n_arc = gen.gen_synth("cluster", 40, 2.0, 5, t,
+                                        rng=np.random.RandomState(3))
+            loaded = np.load(path)
+            self.assertEqual(str(loaded["topology"]), "cluster")
+            self.assertIn("d", loaded.files)
+            dms = import_instance(path)[0]                            # loads cleanly
+            self.assertFalse(np.isnan(dms).any())
+
+    @unittest.skipUnless(importlib.util.find_spec("osmnx"), "osmnx not installed")
+    def test_osm_branch_importable(self):
+        self.assertTrue(callable(gen.load_osm_graph))
 
 
 class TestRoundTripWithImportInstance(unittest.TestCase):
