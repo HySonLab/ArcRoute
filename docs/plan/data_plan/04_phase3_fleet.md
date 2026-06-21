@@ -1,50 +1,71 @@
-# Phase 3 — Quét số xe `M ∈ {1, 2, 3, 5, 7, 10}`
+# Phase 3 — Số xe `M`: tham số lúc GIẢI, KHÔNG phải trục sinh data
 
-> Mục tiêu: coi số xe `M` là **tham số input hợp lệ** (vì mục tiêu là **makespan** — thêm xe → makespan
-> giảm), quét dải rộng, train/test nhất quán. **Giữ nguyên F5** (`Q = Σ q/3 + 0.5`; chỉ số xe khả dụng
-> đổi). `M=1` nối lý thuyết HCPP. Phụ thuộc Phase 1. Tham chiếu `docs/data.md §3.1, §5 P3, §8.C`.
+> ⚠️ **BẢN SỬA (supersedes lần implement đầu).** Lần đầu Phase 3 sinh **riêng từng M** vào `data/<M>m/`.
+> Đó là **dư thừa và sai về khoa học**: instance (arcs, demand, **C**) **độc lập với M**, nên phải **sinh
+> arcs MỘT LẦN** rồi **chỉ định M lúc giải/eval**. Tham chiếu `docs/data.md §3.1, §8.C`.
+>
+> 🔒 **Ngoài phạm vi (bạn xử lý sau):** đưa `M` thành **input của policy** (M-conditioning) + enforce M
+> trong masking. Hiện policy KHÔNG condition trên M (features chỉ `[demand,clss,service,traversal]`). Phase
+> này chỉ chỉnh **data + eval**; training giữ `M` là một scalar cố định.
 
-## 3.1 — Điểm mấu chốt: M KHÔNG đổi capacity
+## 3.1 — Vì sao M không phải thuộc tính của instance
 
-`Q` = `(Σ_{a∈A_r} q_a)/3 + 0.5` — **hằng `/3` không đổi theo M** (đổi nó = out-of-scope, đổi F5).
-M chỉ là số route khả dụng. Kiểm tra:
-- `env/generator.py:sample_vehicle_capacity` — KHÔNG phụ thuộc `num_vehicle` (đúng). **Lưu ý:** công thức
-  này đã được **Phase 0 §0.5 sửa** từ `Σ(q/3+0.5)` → `Σq/3+0.5`; Phase 3 dùng bản đã sửa, không đụng lại.
-- `data/gen.py:build_instance` — `C` không nhận `M` vào công thức (đúng; `M` chỉ ghi vào `.npz`).
+`C = Σ_{a∈A_r} q_a / 3 + 0.5` — số **`3` là HẰNG trong công thức paper** ("3 homogeneous vehicles"),
+**KHÔNG phải fleet thật**. Khi quét M ta **giữ `C` cố định** (docs §3.1), chỉ số route khả dụng đổi.
+⇒ Toàn bộ `.npz` (arcs, demand, class, service, traversal, **C**) **không đổi theo M**.
 
-> ⚠️ Đừng "sửa nhầm" capacity theo M, và đừng vô tình quay lại công thức `Σ(q/3+0.5)` cũ. Test 3 chốt điều này.
+- Đã chứng minh: `tests/test_gen.py::test_capacity_invariant_to_M` (cùng instance, M=1 vs M=10 → `C` y hệt).
+- Thứ duy nhất phụ thuộc M: `tau = Σq/(M·C)` — **suy ra được** từ `req`+`C`+`M`, tính lúc report.
 
-## 3.2 — Thay đổi code
+**Hệ quả:** sinh per-M = nhân bản cùng loại instance; tệ hơn, mỗi M là **bộ ngẫu nhiên KHÁC nhau** →
+không làm được fleet study đúng (vốn cần **cùng instance, đổi M** để so sánh ghép cặp/Wilcoxon).
 
-**File:** `env/generator.py`
-- `num_vehicle` đã hỗ trợ dải sau Phase 1 (mục 1.2). Bổ sung: nhận **danh sách rời rạc**
-  `M ∈ {1,2,3,5,7,10}` (không phải khoảng liên tục) — random.choice từ list.
+## 3.2 — Thiết kế đúng
+
+```
+Sinh arcs MỘT LẦN cho mỗi (topology, size)   →  data/ood/<topology>/<|A|>/*.npz   (KHÔNG có tầng <M>m)
+Chỉ định M lúc GIẢI/EVAL                       →  import_instance(..., M=<override>) + baseline --M
+Fleet study (Bảng C)                           =  giải CÙNG bộ instance dưới M ∈ {1,2,3,5,7,10}
+tau                                            =  tính lúc report theo M đã chọn
+```
+
+## 3.3 — Thay đổi code
 
 **File:** `data/gen.py`
-- `--vehicles`: bỏ `choices=[2,5]`, cho nhận **nhiều giá trị** (`nargs='+'`, default `[1,2,3,5,7,10]`).
-- Vòng sinh: với mỗi `M` trong list, ghi vào thư mục `data/<M>m/...` như cũ (cấu trúc thư mục theo M
-  đã có sẵn — chỉ mở rộng tập M).
-- `refine_routes` trong `common/ops.py` có `max_vehicles=3` default — kiểm tra nơi gọi để không hard-code 3.
+- **Bỏ vòng lặp per-M** khi sinh. Mỗi cell sinh 1 lần; **bỏ tầng thư mục `<M>m/`** →
+  `data/ood/<topology>/<|A|>/*.npz` (và `data/<topology>/<|A|>/` cho OSM in-dist).
+- `--vehicles` đổi nghĩa: chỉ là **M nominal** ghi vào `.npz` (mặc định 3) để loader cũ chạy được; KHÔNG
+  còn nhân thư mục theo M. (Hoặc bỏ hẳn, lưu `M` rỗng và bắt eval truyền `--M`.)
+- `_save_instance`: vẫn lưu `tau` cho **M nominal** + ghi rõ "reference"; report tự tính lại theo M eval.
 
-## 3.3 — Sub-study fleet (test)
+**File:** `common/ops.py`
+- `import_instance(es, M=None)`: nếu `M` được truyền → dùng nó thay cho `es['M']` (override lúc eval).
+  Không truyền → giữ `es['M']` (backward-compatible).
 
-Chuẩn bị cell F1–F6 (`docs/data.md §8.C`): fix `|A|=80, |A_r|=60`, biến `M ∈ {1,2,3,5,7,10}`,
-mỗi cell ≥20 seed, cả variant P & U. F1 (M=1) = HCPP single-vehicle, F3 (M=3) = gốc Hà.
+**File:** `baseline/*.py` (aco, ea, ils, lp, rl_hyb)
+- Thêm `--M` (nargs hoặc đơn) để **quét/đặt fleet lúc eval**; loop qua M cho fleet study. `--path` trỏ
+  `data/ood/<topology>` rồi glob `/*/*.npz` (giờ tầng dưới là `<|A|>`, hợp lệ).
+
+**File:** `env/generator.py`
+- Giữ nguyên: `num_vehicle` vẫn nhận scalar/list (cho training on-the-fly). KHÔNG đổi (M-conditioning để sau).
+
+## 3.4 — Ảnh hưởng layout (cập nhật Phase 4/5)
+
+- `data/ood/<topology>/<|A|>/*.npz` (bỏ `<M>m`). Số instance giảm mạnh (unit_square ×6 → ×1).
+- Phase 4 (OOD) & Phase 5 (tau) tham chiếu layout mới — xem các file tương ứng.
 
 ---
 
-## ✅ Cổng test Phase 3
+## ✅ Cổng test Phase 3 (bản sửa)
 
-### Test cần THÊM
-1. **Dải M rời rạc:** `generate(..., num_vehicle=[1,2,3,5,7,10])` nhiều lần → `td['num_vehicle']` luôn
-   thuộc tập đó.
-2. **M=1 hợp lệ:** sinh được instance với `M=1` (không chia 0, không lỗi).
-3. **Capacity bất biến theo M (QUAN TRỌNG):** cùng seed/instance, đổi `M` từ 1→10, `C` (và `Q`) **không đổi**.
-   ```python
-   # build_instance với cùng edges/coords/rng-seed nhưng M khác → C bằng nhau
-   assert C_M1 == C_M10
-   ```
-4. **`data/gen.py --vehicles 1 2 3 5 7 10`:** parse OK, tạo đúng các thư mục `1m,2m,3m,5m,7m,10m`.
+### Test cần THÊM/SỬA
+1. **Capacity bất biến theo M (giữ):** `test_capacity_invariant_to_M` — cùng instance, M khác → `C` bằng.
+2. **`import_instance` override M:** load 1 `.npz`, gọi `import_instance(f, M=7)` → `M==[0..6]`; không
+   truyền → dùng `es['M']`. arcs/C/demands **không đổi** giữa hai lần (chỉ list M khác).
+3. **Sinh 1 lần, không tầng `<M>m`:** `gen_synth`/`gen_graph` ghi vào `data/ood/<topology>/<|A|>/`; không
+   tạo thư mục theo M.
+4. **tau theo M (report-time):** với cùng instance, `tau(M)=Σq/(M·C)` đơn điệu giảm theo M (tính từ `req`+`C`).
+5. **Baseline `--M`:** parse OK; eval cùng bộ file dưới nhiều M.
 
 ### Lệnh chạy
 ```bash
@@ -52,9 +73,12 @@ uv run python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ### Checklist
-- [ ] `num_vehicle` nhận danh sách rời rạc {1,2,3,5,7,10}.
-- [ ] `data/gen.py --vehicles nargs='+'`, bỏ `choices=[2,5]`.
-- [ ] Kiểm tra `refine_routes`/nơi gọi không hard-code `max_vehicles=3`.
-- [ ] Test: dải M, M=1, **capacity bất biến theo M**, parse CLI — xanh.
-- [ ] `unittest discover` xanh.
-- [ ] Commit "Phase 3: sweep fleet M (keep F5 capacity)".
+- [ ] `data/gen.py`: bỏ per-M loop + tầng `<M>m`; sinh 1 lần/cell.
+- [ ] `import_instance(es, M=None)` override M; backward-compatible.
+- [ ] `baseline/*`: thêm `--M` (fleet là trục **eval**, không phải sinh).
+- [ ] `tau` = report-time theo M; lưu reference cho M nominal.
+- [ ] Test: capacity-invariant, import override M, sinh-không-`<M>m`, tau theo M, baseline `--M` — xanh.
+- [ ] Regenerate grid theo layout mới (`data/ood/<topology>/<|A|>/`).
+- [ ] Commit "Phase 3 (revised): M là tham số eval, sinh arcs 1 lần".
+
+> Lưu ý: policy M-conditioning (đưa M vào input mạng) **KHÔNG thuộc phase này** — bạn xử lý sau.

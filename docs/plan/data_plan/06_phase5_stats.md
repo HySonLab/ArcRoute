@@ -17,11 +17,12 @@ Thêm/đảm bảo các khóa trong mọi `.npz`: `d` (mật độ), `M` (fleet)
 ```
 τ = Σ_{a∈A_r} q_a / (M · Q)     # tightness — độ chặt capacity (Smith-Miles 2023)
 ```
-> `τ` mô tả phân bố độ khó; tính sẵn lúc sinh và lưu để eval/report khỏi tính lại.
-> ⚠️ **Phụ thuộc `Q` đã sửa đúng ở Phase 0 §0.5** (`Σq/3+0.5`). Nếu còn dùng `Q` cũ `Σ(q/3+0.5)` (quá lớn)
-> thì `τ` sẽ nhỏ giả tạo → báo cáo độ khó sai lệch. Kiểm tra `Q` đúng trước khi tính `τ`.
+> `τ` **phụ thuộc M** → vì M là tham số eval (Phase 3 revised), **`τ` đúng là đại lượng REPORT-TIME**:
+> tính `τ = Σq/(M·C)` từ `req`+`C` theo **M đang eval**. `.npz` chỉ lưu `τ` cho **M nominal** như tham chiếu.
+> ⚠️ **Phụ thuộc `Q=C` đã sửa đúng ở Phase 0 §0.5** (`Σq/3+0.5`). Nếu còn `Q` cũ `Σ(q/3+0.5)` thì `τ` sai.
 
-**File:** `data/gen.py:gen_graph` → `np.savez(fpath, req=..., nonreq=..., P=3, M=M, C=C, d=d, tau=tau, topology=topo, n_req=len(req))`.
+**File:** `data/gen.py:_save_instance` → lưu `req, nonreq, P=3, M=M(nominal), C, d, topology, tau(nominal), n_req`.
+**File:** `eval/stats.py` → hàm tính `τ(req, C, M)` cho **bất kỳ M** lúc report (không dựa vào `tau` đã lưu).
 
 ## 5.3 — Script đánh giá thống kê (mới)
 

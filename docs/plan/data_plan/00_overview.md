@@ -42,9 +42,10 @@ khỏi length, đổi dải demand, đổi hằng `/3` của capacity. Xem `docs
 | `data/gen.py` | `required_count` | 60–70 / 75% | ¼-split (F2) |
 | `data/gen.py` | `build_instance` clss | `rng.randint(1,4)` random | 3 lớp cân bằng |
 | `data/gen.py` | `build_instance` C | **`Σ(q/3+0.5)` (SAI)** | **`Σq/3 + 0.5`** (Phase 0 §0.5) |
-| `data/gen.py` | `main --vehicles` | choices `[2,5]` | dải `M ∈ {1,2,3,5,7,10}` |
-| `data/gen.py` | `np.savez` | thiếu metadata | thêm `d, M, τ, \|A_r\|` |
-| `train.sh` | const | `num_arc=20, num_vehicle=3` | nhất quán F1–F5 |
+| `data/gen.py` | `main` per-M loop | sinh riêng `data/<M>m/` mỗi M | **M là tham số EVAL** — sinh arcs 1 lần, bỏ tầng `<M>m` (Phase 3 revised) |
+| `common/ops.py` | `import_instance` | ép đọc `es['M']` | thêm **override `M`** lúc eval (Phase 3 revised) |
+| `data/gen.py` | `np.savez` | thiếu metadata | thêm `d, M(nominal), τ, \|A_r\|, topology` |
+| `train.sh` | const | `num_arc=20, num_vehicle=3` | nhất quán F1–F5; **size ladder** (Phase 6) |
 
 ## Ràng buộc compute (quyết định trần)
 
@@ -61,11 +62,15 @@ khỏi length, đổi dải demand, đổi hằng `/3` của capacity. Xem `docs
 | **0** | [`01_phase0_restore_formula.md`](01_phase0_restore_formula.md) | Khôi phục ¼-split + lớp cân bằng + capacity + metric thưa | Pre (nền tảng) |
 | **1** | [`02_phase1_size_cap.md`](02_phase1_size_cap.md) | Trần `\|A_r\|≤100`, dải size, bucket | P0 |
 | **2** | [`03_phase2_density.md`](03_phase2_density.md) | Quét 4 mức `d`, report theo `d` | P1 |
-| **3** | [`04_phase3_fleet.md`](04_phase3_fleet.md) | Quét `M ∈ {1,2,3,5,7,10}` | P1 |
+| **3** | [`04_phase3_fleet.md`](04_phase3_fleet.md) | **M là tham số EVAL** (sinh arcs 1 lần, không per-M) | P1 |
 | **4** | [`05_phase4_ood.md`](05_phase4_ood.md) | Test OOD (OSM nhiều city + cluster) | P0–P3 |
 | **5** | [`06_phase5_stats.md`](06_phase5_stats.md) | Seeds ≥20–30, Wilcoxon/Friedman, τ, gap-BKS | P0–P4 |
+| **6** | [`08_phase6_multisize.md`](08_phase6_multisize.md) | Train đa size (bucketed) cho size-generalization | P1 |
 
 Bảng cổng test gộp: [`07_test_matrix.md`](07_test_matrix.md).
+
+> 🔒 **Để sau (bạn xử lý):** đưa `M` vào **input của policy** (M-conditioning) — hiện policy không thấy M.
+> Phase 3 chỉ làm M ở mức data/eval; training giữ M cố định.
 
 ## Quy tắc "qua phase" (BẮT BUỘC)
 

@@ -27,9 +27,10 @@
 | **0** Restore | F2 ¼-split, lớp cân bằng, **F5 capacity `Σq/3+0.5`**, **đồ thị thưa+SC, metric dùng chung test** | (1) `\|A_r\|=3·⌊\|A\|/4⌋`; (2) 3 lớp cân bằng ±1; (3) ratio≈0.75 mọi size (chống scaling defect); (4) depot lớp 0; (5) **capacity `Q==Σq/3+0.5` và KHÁC `Σ(q/3+0.5)` cũ** (sửa 2 test đang khóa sai); (6) **⭐ train≈test metric: `adj_train≈import_instance(adj)` cùng tập arc**; (7) đồ thị train strongly-connected, `adj` finite; (8) round-trip integer finite |
 | **1** Size cap | `\|A_r\| ≤ 100`, 1 size/batch | (1) trần `3·(num_arc//4)≤100`; (2) dải size random hợp lệ; (3) `torch.cat` khác `n` → raise (bucket); (4) ladder ra {20,40,60,80,100} |
 | **2** Density | F1, trần | (1) `\|A\|≈n·d`; (2) trần giữ với mọi (n,d); (3) 4 mức d sinh được; (4) metadata `d` |
-| **3** Fleet | **F5 capacity bất biến theo M** | (1) M ∈ {1,2,3,5,7,10}; (2) M=1 hợp lệ; (3) **C không đổi khi đổi M**; (4) CLI `--vehicles nargs+` |
-| **4** OOD | F2–F5 đồng nhất mọi topology | (1) cluster strongly-connected + hợp lệ; (2) F2–F5 giống nhau qua cycle/cluster/grid; (3) round-trip OOD npz; (4) metadata `topology`; (5) OSM skip-unless |
-| **5** Stats | không đụng data | (1) `τ = Σq/(M·C)` đơn điệu giảm theo M; (2) metadata đủ `d,M,topology,tau,n_req`; (3) seed độc lập; (4) stats script p-value∈[0,1], gap=0 khi obj=BKS |
+| **3** Fleet (revised) | **C bất biến theo M; M là tham số eval** | (1) **C không đổi khi đổi M**; (2) `import_instance(f, M=k)` override M, arcs/C không đổi; (3) sinh **không** tầng `<M>m`; (4) `τ(M)=Σq/(M·C)` report-time giảm theo M; (5) baseline `--M` parse |
+| **4** OOD | F2–F5 đồng nhất mọi topology; layout `<topology>/<\|A\|>` | (1) cluster strongly-connected + hợp lệ; (2) F2–F5 giống nhau qua cycle/cluster/grid; (3) round-trip OOD npz; (4) metadata `topology`; (5) OSM skip-unless |
+| **5** Stats | không đụng data | (1) `τ = Σq/(M·C)` report-time đơn điệu giảm theo M; (2) metadata đủ `d,M,topology,tau,n_req`; (3) seed độc lập; (4) stats script p-value∈[0,1], gap=0 khi obj=BKS |
+| **6** Multi-size | 1 batch 1 size, các size luân phiên | (1) mỗi batch single-size; (2) đủ size ladder; (3) không batch vượt bucket; (4) train-step thật chạy (encoder+reward+backward) |
 
 ## Smoke test thủ công (ngoài unittest)
 
@@ -43,11 +44,13 @@ uv run python -m unittest tests.test_gen -v
 
 ## Checklist tổng (toàn bộ kế hoạch)
 
-- [ ] Pre-Phase: tag archive + xóa data/checkpoint cũ, test xanh → commit
-- [ ] Phase 0 xanh → commit
-- [ ] Phase 1 xanh → commit
-- [ ] Phase 2 xanh → commit
-- [ ] Phase 3 xanh → commit
-- [ ] Phase 4 xanh → commit
-- [ ] Phase 5 xanh → commit
+- [x] Pre-Phase: tag archive + xóa data/checkpoint cũ, test xanh → commit
+- [x] Phase 0 xanh → commit
+- [x] Phase 1 xanh → commit
+- [x] Phase 2 xanh → commit
+- [x] Phase 3 (bản đầu, per-M) → commit. **Cần làm lại (revised): M là tham số eval, sinh 1 lần.**
+- [x] Phase 4 xanh → commit
+- [x] Phase 5 xanh → commit
+- [x] Phase 6 (multi-size training) xanh → commit
+- [ ] **Phase 3 revised**: bỏ per-M, `import_instance(M=...)`, baseline `--M`, regenerate layout mới → commit
 - [ ] Cập nhật `docs/data.md` nếu có quyết định khác so với plan (giữ data.md là nguồn sự thật về thiết kế).
