@@ -13,6 +13,7 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--M', type=int, default=None, help='override fleet size at eval (Phase 3: M is a solve-time param)')
     parser.add_argument('--num_sample', type=int, default=1, help='num_sample')
     parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
     
@@ -25,6 +26,6 @@ if __name__ == "__main__":
 
     al = InsertCheapestHCARP() # ILS
     for f in files:
-        al.import_instance(f)
+        al.import_instance(f, M=args.M)
         t1 = time()
         print(f,':::', al(variant=args.variant, num_sample=args.num_sample),':::', time() - t1)

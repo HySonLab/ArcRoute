@@ -15,14 +15,19 @@ The per-instance physics live in `build_instance`, which is pure (no OSMnx) and
 unit-tested in tests/test_gen.py. OSMnx is only needed to run this script
 end to end; install it first, e.g. `uv add osmnx`.
 
+Phase 3 (revised): M (fleet) is a SOLVE-time parameter, not a generation axis.
+Arcs are generated ONCE per (topology, |A|); the fleet sweep happens at eval by
+overriding M (import_instance(M=...) / baseline --M). No per-M folders.
+
 Usage:
-    uv run python data/gen.py --vehicles 5            # writes data/5m/<|A|>/*.npz
-    uv run python data/gen.py --vehicles 2            # writes data/2m/<|A|>/*.npz
+    uv run python data/gen.py --topology unit_square --min_arc 40   # data/ood/unit_square/<|A|>/*.npz
+    uv run python data/gen.py --topology cluster                    # data/ood/cluster/<|A|>/*.npz
+    uv run python data/gen.py --topology osm --bbox N S E W         # data/osm/<|A|>/*.npz (needs osmnx)
 
 .npz schema (consumed by common/ops.import_instance):
     req:    (|A_r|, 6)   columns [tail, head, demand, clss, service, traversal]
     nonreq: (|A_nr|, 6)  columns [tail, head, 0, 0, 0, traversal]
-    P=3, M=<vehicles>, C=<capacity>
+    P=3, M=<nominal, override at eval>, C=<capacity>, d, topology, tau, n_req
 """
 import os
 import random
@@ -244,10 +249,13 @@ def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
 
 def main():
     p = argparse.ArgumentParser(description="Generate paper-faithful HDCARP instances.")
-    p.add_argument("--vehicles", type=int, nargs="+", default=[1, 2, 3, 5, 7, 10],
-                   help="fleet sizes |M| to sweep (Phase 3). Writes one data/<M>m dir each.")
+    p.add_argument("--m_nominal", type=int, default=3,
+                   help="nominal fleet M written into the .npz. M is a SOLVE-time "
+                        "parameter (Phase 3 revised): generate arcs ONCE and override "
+                        "M at eval (import_instance(M=...) / baseline --M). NOT a "
+                        "generation axis, so no per-M folders.")
     p.add_argument("--out", type=str, default=None,
-                   help="base output dir (default: data); instances go to <out>/<M>m")
+                   help="base output dir; instances go to <out>/<|A|> (no <M>m level)")
     p.add_argument("--per_bucket", type=int, default=20,
                    help="instances per |A| bucket (paper: 20)")
     p.add_argument("--tol", type=int, default=2,
@@ -272,15 +280,17 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # In-distribution OSM -> data/<M>m; OOD synthetic -> data/ood/<topology>/<M>m.
+    # Phase 3 revised: M is NOT a generation axis -> arcs generated ONCE per
+    # (topology, |A|). Layout: <base>/<|A|>/*.npz (no <M>m level).
+    M = args.m_nominal
     if args.topology == "osm":
-        base = args.out or "data"
+        base = args.out or os.path.join("data", "osm")
         G_proj = load_osm_graph(*args.bbox)
     else:
         base = args.out or os.path.join("data", "ood", args.topology)
         G_proj = None
 
-    def gen_one(B, M, save_dir):
+    def gen_one(B, save_dir):
         """One instance targeting |A| ~ B; returns (path, n_arc)."""
         if args.topology == "osm":
             target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
@@ -290,40 +300,33 @@ def main():
         n = max(5, int(round(B / d)))
         return gen_synth(args.topology, n, d, M, save_dir, rng=np.random)
 
+    # Paper step 2: default |A| from 30 (M-agnostic now). --min_arc overrides.
+    first = args.min_arc if args.min_arc is not None else 30
+    # Phase 1 hard cap: keep buckets with |A_r|=3*floor(|A|/4) <= max_req.
+    buckets = [b for b in range(first, 200 + 1, 10)
+               if required_count(b) <= args.max_req]
+    if not buckets:
+        raise SystemExit(f"no |A| bucket satisfies |A_r| <= {args.max_req}")
+    print(f"[{args.topology}] buckets (|A_r|<={args.max_req}): {buckets}")
+    os.makedirs(base, exist_ok=True)
+
     tmp = "temp"
     os.makedirs(tmp, exist_ok=True)
     try:
-        # Phase 3: sweep the fleet M. Capacity Q is INDEPENDENT of M (paper F5),
-        # so M only changes the number of available routes and the output dir.
-        for M in args.vehicles:
-            # Paper step 2: |A| in {30,...} for M=2, {70,...} otherwise. Override
-            # with --min_arc to get the full size ladder at every M (docs §8 A).
-            first = args.min_arc if args.min_arc is not None else (30 if M == 2 else 70)
-            # Phase 1 hard cap: keep buckets with |A_r|=3*floor(|A|/4) <= max_req.
-            buckets = [b for b in range(first, 200 + 1, 10)
-                       if required_count(b) <= args.max_req]
-            if not buckets:
-                print(f"[M={M}] no |A| bucket satisfies |A_r| <= {args.max_req}; skip")
-                continue
-            print(f"[M={M}|{args.topology}] buckets (|A_r|<={args.max_req}): {buckets}")
-
-            out = os.path.join(base, f"{M}m")
-            os.makedirs(out, exist_ok=True)
-            for B in buckets:
-                pdir = os.path.join(out, str(B))
-                os.makedirs(pdir, exist_ok=True)
-                count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
-                while count < args.per_bucket:
-                    fpath, n_arc = gen_one(B, M, tmp)
-                    if abs(n_arc - B) > args.tol or os.path.isfile(
-                        os.path.join(pdir, os.path.basename(fpath))
-                    ):
-                        os.remove(fpath)
-                        continue
-                    shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
-                    count += 1
-                    print(f"[M={M}|{args.topology}] |A|~{B}: {count}/{args.per_bucket} "
-                          f"(arcs={n_arc})")
+        for B in buckets:
+            pdir = os.path.join(base, str(B))
+            os.makedirs(pdir, exist_ok=True)
+            count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
+            while count < args.per_bucket:
+                fpath, n_arc = gen_one(B, tmp)
+                if abs(n_arc - B) > args.tol or os.path.isfile(
+                    os.path.join(pdir, os.path.basename(fpath))
+                ):
+                    os.remove(fpath)
+                    continue
+                shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
+                count += 1
+                print(f"[{args.topology}] |A|~{B}: {count}/{args.per_bucket} (arcs={n_arc})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

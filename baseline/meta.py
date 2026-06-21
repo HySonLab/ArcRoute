@@ -13,8 +13,8 @@ class BaseHCARP:
     def __init__(self):
         self.has_instance = False
 
-    def import_instance(self, f):
-        dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f)
+    def import_instance(self, f, M=None):
+        dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f, M=M)
         self.dms, self.P, self.M = dms, P, M
         self.demands, self.clss, self.s, self.d = demands, clss, s, d
         self.edge_indxs = edge_indxs

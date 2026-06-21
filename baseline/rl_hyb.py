@@ -18,8 +18,8 @@ class RLHCARP:
         self.env.variant = variant
         
     
-    def import_instance(self, f):
-        dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f)
+    def import_instance(self, f, M=None):
+        dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f, M=M)
         td = self.env.reset(batch_size=1)
         td['clss'] = torch.tensor(clss[None, :], dtype=torch.int64)
         td['demand'] = torch.tensor(demands[None, :], dtype=torch.float32)
@@ -49,6 +49,7 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--variant', type=str, default='P', help='Environment variant')
+    parser.add_argument('--M', type=int, default=None, help='override fleet size at eval (Phase 3: M is a solve-time param)')
     parser.add_argument('--num_sample', type=int, default=1, help='num_sample')
     parser.add_argument('--cpkt', type=str, default='/usr/local/rsa/cpkts/bestP_20_2.ckpt', help='cpkt')
     parser.add_argument('--path', type=str, default='/usr/local/rsa/ArcRoute/data/instances', help='path to instances')
@@ -65,6 +66,6 @@ if __name__ == "__main__":
     # exit()
     al = RLHCARP(args.cpkt, args.variant)
     for f in files:
-        al.import_instance(f)
+        al.import_instance(f, M=args.M)
         t1 = time()
         print(f,':::', al(num_sample=args.num_sample),':::', time() - t1)

@@ -246,12 +246,17 @@ def dist_edges_from_file(es):
     dms = dist_edges(dms, es['req'][:, 0], es['req'][:, 1])
     return dms
 
-def import_instance(es):
+def import_instance(es, M=None):
+    # M (fleet size) is a SOLVE-time parameter, not an instance property: the
+    # instance (arcs, demands, C) is identical for any M because C = sum(q)/3 +
+    # 0.5 has a fixed /3 (paper F5). Pass M to override the nominal value stored
+    # in the .npz; leave it None to use the stored default.
     if isinstance(es, str):
         es = np.load(es)
     C = es['C']
     P = [i for i in range(1, es['P']+1)]
-    M = [i for i in range(es['M'])]
+    n_vehicle = int(es['M']) if M is None else int(M)
+    M = [i for i in range(n_vehicle)]
     dms = dist_edges_from_file(es)
     
     es_req = es['req']

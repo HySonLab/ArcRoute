@@ -14,6 +14,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=100, help='num epoch')
     parser.add_argument('--variant', type=str, default='U', help='Environment variant')
+    parser.add_argument('--M', type=int, default=None, help='override fleet size at eval (Phase 3: M is a solve-time param)')
     parser.add_argument('--n_population', type=int, default=200, help='num epoch')
     parser.add_argument('--path', type=str, default='data/5m', help='path to instances')
     
@@ -26,6 +27,6 @@ if __name__ == "__main__":
 
     al = EAHCARP(n_population=args.n_population) # EA
     for f in files:
-        al.import_instance(f)
+        al.import_instance(f, M=args.M)
         t1 = time()
         print(f,':::' , al(n_epoch=args.max_epoch, variant=args.variant),':::' , time() - t1)

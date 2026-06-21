@@ -145,23 +145,41 @@ class TestDensityMetadata(unittest.TestCase):
             self.assertFalse(np.isnan(dms).any())
 
 
-class TestFleetSweep(unittest.TestCase):
-    """Phase 3: fleet M sweep. Capacity Q must be INDEPENDENT of M (paper F5)."""
+class TestFleetIsEvalParameter(unittest.TestCase):
+    """Phase 3 (revised): M is a SOLVE-time parameter. The instance (arcs, C) is
+    M-independent; M is overridden at load via import_instance(M=...)."""
 
     def test_capacity_invariant_to_M(self):
-        # Same graph + same rng stream, different M -> identical C.
+        # Same graph + same rng stream, different M -> identical C (paper F5).
         edges, coords = make_strongly_connected_cycle(120, np.random.RandomState(0))
         _, _, c1 = gen.build_instance(edges, coords, M=1, rng=np.random.RandomState(7))
         _, _, c10 = gen.build_instance(edges, coords, M=10, rng=np.random.RandomState(7))
         self.assertAlmostEqual(c1, c10, places=9)
 
-    def test_vehicles_cli_accepts_multiple(self):
-        # --vehicles is nargs='+' with a default sweep; no more choices=[2,5].
-        import argparse
-        p = argparse.ArgumentParser()
-        p.add_argument("--vehicles", type=int, nargs="+", default=[1, 2, 3, 5, 7, 10])
-        self.assertEqual(p.parse_args(["--vehicles", "1", "3", "7"]).vehicles, [1, 3, 7])
-        self.assertEqual(p.parse_args([]).vehicles, [1, 2, 3, 5, 7, 10])
+    def test_import_instance_M_override(self):
+        # The SAME .npz loaded under different M: only the fleet list changes;
+        # arcs / capacity / demands stay identical.
+        rng = np.random.RandomState(2)
+        edges, coords = make_strongly_connected_cycle(120, rng)
+        req, nonreq, C = gen.build_instance(edges, coords, M=5, rng=rng)
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "i.npz")
+            np.savez(path, req=req, nonreq=nonreq, P=3, M=3, C=C)   # nominal M=3
+            dms3, _, M3, dem3, *_ = import_instance(path)            # stored nominal
+            dmsK, _, M7, demK, *_ = import_instance(path, M=7)       # override
+        self.assertEqual(M3, [0, 1, 2])
+        self.assertEqual(M7, [0, 1, 2, 3, 4, 5, 6])
+        self.assertTrue(np.allclose(dms3, dmsK))                     # adj unchanged
+        self.assertTrue(np.allclose(dem3, demK))                     # demands unchanged
+
+    def test_tau_is_report_time(self):
+        # tau = sum(q)/(M*C) is computed from req+C for ANY M -> decreasing in M.
+        rng = np.random.RandomState(3)
+        edges, coords = make_strongly_connected_cycle(120, rng)
+        req, _, C = gen.build_instance(edges, coords, M=5, rng=rng)
+        tau = lambda M: float(req[:, 2].sum() / (M * C))
+        self.assertGreater(tau(1), tau(5))
+        self.assertGreater(tau(5), tau(10))
 
 
 class TestSyntheticTopology(unittest.TestCase):
