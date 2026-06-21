@@ -20,10 +20,15 @@ def required_arcs(num_arc):
 
 
 def _pick(v):
-    """Resolve a hyperparameter that may be a scalar or an inclusive (lo, hi)
-    range into a concrete int (uniform random within the range)."""
-    if isinstance(v, (tuple, list)):
+    """Resolve a hyperparameter into a concrete int. Convention:
+      - scalar        -> itself
+      - tuple (lo,hi) -> uniform int in the INCLUSIVE range [lo, hi]
+      - list [...]    -> uniform DISCRETE choice (e.g. fleet M in {1,2,3,5,7,10})
+    """
+    if isinstance(v, tuple):
         return int(torch.randint(int(v[0]), int(v[1]) + 1, (1,)))
+    if isinstance(v, list):
+        return int(v[int(torch.randint(len(v), (1,)))])
     return int(v)
 
 

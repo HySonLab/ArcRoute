@@ -171,10 +171,10 @@ def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
 
 def main():
     p = argparse.ArgumentParser(description="Generate paper-faithful HDCARP instances.")
-    p.add_argument("--vehicles", type=int, default=5, choices=[2, 5],
-                   help="fleet size |M| (paper uses {2, 5})")
+    p.add_argument("--vehicles", type=int, nargs="+", default=[1, 2, 3, 5, 7, 10],
+                   help="fleet sizes |M| to sweep (Phase 3). Writes one data/<M>m dir each.")
     p.add_argument("--out", type=str, default=None,
-                   help="output dir (default: data/<M>m)")
+                   help="base output dir (default: data); instances go to <out>/<M>m")
     p.add_argument("--per_bucket", type=int, default=20,
                    help="instances per |A| bucket (paper: 20)")
     p.add_argument("--tol", type=int, default=2,
@@ -190,42 +190,45 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    M = args.vehicles
-    # Paper step 2: |A| in {30,...,200} for M=2, {70,...,200} for M=5.
-    first = 30 if M == 2 else 70
-    # Phase 1 hard cap: keep only buckets whose |A_r| = 3*floor(|A|/4) <= max_req.
-    buckets = [b for b in range(first, 200 + 1, 10)
-               if required_count(b) <= args.max_req]
-    if not buckets:
-        raise SystemExit(f"no |A| bucket satisfies |A_r| <= {args.max_req}")
-    print(f"[M={M}] buckets (|A_r|<={args.max_req}): {buckets}")
-
-    out = args.out or f"data/{M}m"
-    os.makedirs(out, exist_ok=True)
-
+    base = args.out or "data"
     N, S, E, W = args.bbox
     G_proj = load_osm_graph(N, S, E, W)
 
     tmp = "temp"
     os.makedirs(tmp, exist_ok=True)
     try:
-        for B in buckets:
-            pdir = os.path.join(out, str(B))
-            os.makedirs(pdir, exist_ok=True)
-            count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
-            while count < args.per_bucket:
-                target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
-                target_nodes = min(target_nodes, G_proj.number_of_nodes())
-                fpath, n_arc = gen_graph(G_proj, target_nodes, M, tmp)
-                if abs(n_arc - B) > args.tol or os.path.isfile(
-                    os.path.join(pdir, os.path.basename(fpath))
-                ):
-                    os.remove(fpath)
-                    continue
-                shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
-                count += 1
-                print(f"[M={M}] |A|~{B}: {count}/{args.per_bucket}  "
-                      f"(arcs={n_arc}, nodes={target_nodes})")
+        # Phase 3: sweep the fleet M. Capacity Q is INDEPENDENT of M (paper F5),
+        # so M only changes the number of available routes and the output dir.
+        for M in args.vehicles:
+            # Paper step 2: |A| in {30,...} for M=2, {70,...} otherwise.
+            first = 30 if M == 2 else 70
+            # Phase 1 hard cap: keep buckets with |A_r|=3*floor(|A|/4) <= max_req.
+            buckets = [b for b in range(first, 200 + 1, 10)
+                       if required_count(b) <= args.max_req]
+            if not buckets:
+                print(f"[M={M}] no |A| bucket satisfies |A_r| <= {args.max_req}; skip")
+                continue
+            print(f"[M={M}] buckets (|A_r|<={args.max_req}): {buckets}")
+
+            out = os.path.join(base, f"{M}m")
+            os.makedirs(out, exist_ok=True)
+            for B in buckets:
+                pdir = os.path.join(out, str(B))
+                os.makedirs(pdir, exist_ok=True)
+                count = len([f for f in os.listdir(pdir) if f.endswith(".npz")])
+                while count < args.per_bucket:
+                    target_nodes = max(5, int(np.random.randint(B // 3, B // 2 + 2)))
+                    target_nodes = min(target_nodes, G_proj.number_of_nodes())
+                    fpath, n_arc = gen_graph(G_proj, target_nodes, M, tmp)
+                    if abs(n_arc - B) > args.tol or os.path.isfile(
+                        os.path.join(pdir, os.path.basename(fpath))
+                    ):
+                        os.remove(fpath)
+                        continue
+                    shutil.move(fpath, os.path.join(pdir, os.path.basename(fpath)))
+                    count += 1
+                    print(f"[M={M}] |A|~{B}: {count}/{args.per_bucket}  "
+                          f"(arcs={n_arc}, nodes={target_nodes})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

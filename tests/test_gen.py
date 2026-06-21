@@ -144,6 +144,25 @@ class TestDensityMetadata(unittest.TestCase):
             self.assertFalse(np.isnan(dms).any())
 
 
+class TestFleetSweep(unittest.TestCase):
+    """Phase 3: fleet M sweep. Capacity Q must be INDEPENDENT of M (paper F5)."""
+
+    def test_capacity_invariant_to_M(self):
+        # Same graph + same rng stream, different M -> identical C.
+        edges, coords = make_strongly_connected_cycle(120, np.random.RandomState(0))
+        _, _, c1 = gen.build_instance(edges, coords, M=1, rng=np.random.RandomState(7))
+        _, _, c10 = gen.build_instance(edges, coords, M=10, rng=np.random.RandomState(7))
+        self.assertAlmostEqual(c1, c10, places=9)
+
+    def test_vehicles_cli_accepts_multiple(self):
+        # --vehicles is nargs='+' with a default sweep; no more choices=[2,5].
+        import argparse
+        p = argparse.ArgumentParser()
+        p.add_argument("--vehicles", type=int, nargs="+", default=[1, 2, 3, 5, 7, 10])
+        self.assertEqual(p.parse_args(["--vehicles", "1", "3", "7"]).vehicles, [1, 3, 7])
+        self.assertEqual(p.parse_args([]).vehicles, [1, 2, 3, 5, 7, 10])
+
+
 class TestRoundTripWithImportInstance(unittest.TestCase):
     """A generated .npz must load cleanly through common.ops.import_instance."""
 

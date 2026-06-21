@@ -215,6 +215,26 @@ class TestPhase2Density(unittest.TestCase):
             self.assertLessEqual(td["adj"].shape[1], 101)
 
 
+class TestPhase3Fleet(unittest.TestCase):
+    """Plan Phase 3: sweep fleet M in {1,2,3,5,7,10} (a discrete list -> choice)."""
+
+    def test_discrete_fleet_choice(self):
+        fleet = [1, 2, 3, 5, 7, 10]
+        seen = set()
+        for i in range(60):
+            torch.manual_seed(i)
+            td = generate(20, 40, num_vehicle=fleet)
+            seen.add(int(td["num_vehicle"].flatten()[0]))
+        self.assertTrue(seen.issubset(set(fleet)))
+        self.assertGreater(len(seen), 2)              # actually varies
+
+    def test_single_vehicle_valid(self):
+        torch.manual_seed(0)
+        td = generate(20, 40, num_vehicle=1)          # M=1 = HCPP, must not break
+        self.assertEqual(int(td["num_vehicle"].flatten()[0]), 1)
+        self.assertTrue(torch.isfinite(td["adj"]).all())
+
+
 class TestPhase1SizeCap(unittest.TestCase):
     """Plan Phase 1: hard cap |A_r| <= 100, range support, single-size batches."""
 
