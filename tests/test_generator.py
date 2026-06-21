@@ -189,6 +189,32 @@ class TestGenerateEndToEnd(unittest.TestCase):
         self.assertGreater(float(td["demands"][0].sum()), 2.0)
 
 
+class TestPhase2Density(unittest.TestCase):
+    """Plan Phase 2: density sweep d in {1.5,2,2.5,3} (paper F1, |A| = round(n*d))."""
+
+    def test_arc_count_matches_density(self):
+        torch.manual_seed(0)
+        td = generate(num_loc=40, num_vehicle=5, density=2.5)   # |A|=100 -> |A_r|=75
+        self.assertEqual(tuple(td["adj"].shape), (1, 75 + 1, 75 + 1))
+
+    def test_all_density_levels_valid(self):
+        for d in (1.5, 2.0, 2.5, 3.0):
+            torch.manual_seed(int(d * 10))
+            td = generate(num_loc=40, num_vehicle=5, density=d)
+            num_arc = round(40 * d)
+            n = 3 * (num_arc // 4) + 1
+            self.assertEqual(tuple(td["adj"].shape), (1, n, n))
+            self.assertTrue(torch.isfinite(td["adj"]).all())
+
+    def test_cap_respected_when_sweeping(self):
+        # n=50 with the full d list: d=3 -> |A|=150 -> |A_r|=111 > cap, so the
+        # picker must avoid it; every drawn config stays within the cap.
+        for _ in range(40):
+            torch.manual_seed(_)
+            td = generate(num_loc=50, num_vehicle=5, density=[1.5, 2.0, 2.5, 3.0])
+            self.assertLessEqual(td["adj"].shape[1], 101)
+
+
 class TestPhase1SizeCap(unittest.TestCase):
     """Plan Phase 1: hard cap |A_r| <= 100, range support, single-size batches."""
 

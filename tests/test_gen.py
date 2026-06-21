@@ -123,6 +123,27 @@ class TestRequiredCount(unittest.TestCase):
         self.assertIn(130, keep)                      # 3*32 = 96 <= 100
 
 
+class TestDensityMetadata(unittest.TestCase):
+    """Phase 2: .npz records density d = |A|/|V|, and import_instance still loads
+    cleanly despite the extra key."""
+
+    def test_d_in_npz_and_loader_ignores_it(self):
+        rng = np.random.RandomState(2)
+        edges, coords = make_strongly_connected_cycle(120, rng)
+        req, nonreq, C = gen.build_instance(edges, coords, M=5, rng=rng)
+        num_arc = len(req) + len(nonreq)
+        d = num_arc / len(coords)
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "inst.npz")
+            np.savez(path, req=req, nonreq=nonreq, P=3, M=5, C=C, d=d)
+            loaded = np.load(path)
+            self.assertIn("d", loaded.files)
+            self.assertAlmostEqual(float(loaded["d"]), d, places=6)
+            # extra metadata must not break the loader.
+            dms = import_instance(path)[0]
+            self.assertFalse(np.isnan(dms).any())
+
+
 class TestRoundTripWithImportInstance(unittest.TestCase):
     """A generated .npz must load cleanly through common.ops.import_instance."""
 

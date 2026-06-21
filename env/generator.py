@@ -117,13 +117,30 @@ def build_sparse_adj(edges, d, req_mask):
     dms = dist_edges_from_file({"req": _cols(m), "nonreq": _cols(~m)})
     return torch.from_numpy(dms).float()
 
-def generate(num_loc, num_arc, num_vehicle):
+def _pick_density(density, num_loc):
+    """Pick a density d (paper F1: d in {1.5,2,2.5,3}) from a scalar or list.
+    From a list, prefer values whose |A|=round(n*d) stays within the cap."""
+    if isinstance(density, (tuple, list)):
+        valid = [d for d in density
+                 if required_arcs(round(num_loc * d)) <= MAX_REQUIRED]
+        choices = valid if valid else list(density)
+        return float(choices[int(torch.randint(len(choices), (1,)))])
+    return float(density)
+
+
+def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
     # Phase 1: each arg may be a scalar or an inclusive (lo, hi) range. A single
     # generate() call resolves to ONE concrete size (the dataloader must keep a
     # batch single-size; see save_cache + the encoder's `assert mask is None`).
     num_loc = _pick(num_loc)
-    num_arc = _pick(num_arc)
     num_vehicle = _pick(num_vehicle)
+    # Phase 2: if a density d is given, |A| = round(n*d) (paper F1). d overrides
+    # num_arc; report/sweep d in {1.5,2,2.5,3}.
+    if density is not None:
+        num_arc = round(num_loc * _pick_density(density, num_loc))
+    else:
+        num_arc = _pick(num_arc)
+    assert num_arc is not None, "pass either num_arc or density"
     assert required_arcs(num_arc) <= MAX_REQUIRED, (
         f"|A_r|={required_arcs(num_arc)} (|A|={num_arc}) exceeds the hard cap "
         f"{MAX_REQUIRED}; pick a smaller num_arc (|A| <= 135)."

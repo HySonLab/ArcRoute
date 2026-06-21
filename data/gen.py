@@ -161,8 +161,11 @@ def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
         break
 
     num_arc = len(req) + len(nonreq)
+    # Phase 2: record the emergent density d = |A|/|V| so results can be reported
+    # per-d (paper F1 sweeps d in {1.5,2,2.5,3}; OSM topology gives an emergent d).
+    d = num_arc / len(coords)
     fpath = f"{save_dir}/{num_arc}_{len(coords)}_{rng.randint(0, 1000):03d}"
-    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C)
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C, d=d)
     return fpath + ".npz", num_arc
 
 

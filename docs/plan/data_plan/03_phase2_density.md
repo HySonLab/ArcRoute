@@ -20,9 +20,10 @@
 - Lọc: nếu `3*(num_arc//4) > 100`, resample `d`/`n` (hoặc skip).
 
 **File:** `data/gen.py`
-- Thêm `--density` nhận nhiều giá trị (mặc định `[1.5,2.0,2.5,3.0]`). Khi sinh, chọn target `|A|`
-  theo `d` và bucket riêng theo `(d, |A|)`.
-- Lưu `d` vào metadata `.npz` (chuẩn bị cho Phase 5): `np.savez(..., d=d_level)`.
+- OSM là đồ thị đường thật → `d = |A|/|V|` là **emergent**, KHÔNG ép được target d như unit-square.
+  Vì vậy: **ghi `d` thật vào metadata** `np.savez(..., d=num_arc/len(coords))` để report theo d.
+- Sweep d **có kiểm soát** nằm ở: (a) generator train `env/generator.py` (đã thêm `density`), và
+  (b) topology synthetic unit-square/cluster ở Phase 4 (ở đó mới đặt được `|A|=round(n·d)`).
 
 ## 2.3 — Report theo `d`
 
