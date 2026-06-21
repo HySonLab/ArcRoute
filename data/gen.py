@@ -254,6 +254,9 @@ def main():
                    help="accepted deviation of |A| from the bucket centre")
     p.add_argument("--max_req", type=int, default=100,
                    help="hard cap on |A_r| (Phase 1: fits one 4090). |A_r|=3*floor(|A|/4).")
+    p.add_argument("--min_arc", type=int, default=None,
+                   help="smallest |A| bucket (default: paper's 30 for M=2 else 70). "
+                        "Set e.g. 40 for the full size ladder at EVERY M (docs §8 Table A).")
     p.add_argument("--topology", type=str, default="osm",
                    choices=["osm", "unit_square", "cluster"],
                    help="graph source. osm=real roads (needs osmnx); unit_square/"
@@ -293,8 +296,9 @@ def main():
         # Phase 3: sweep the fleet M. Capacity Q is INDEPENDENT of M (paper F5),
         # so M only changes the number of available routes and the output dir.
         for M in args.vehicles:
-            # Paper step 2: |A| in {30,...} for M=2, {70,...} otherwise.
-            first = 30 if M == 2 else 70
+            # Paper step 2: |A| in {30,...} for M=2, {70,...} otherwise. Override
+            # with --min_arc to get the full size ladder at every M (docs §8 A).
+            first = args.min_arc if args.min_arc is not None else (30 if M == 2 else 70)
             # Phase 1 hard cap: keep buckets with |A_r|=3*floor(|A|/4) <= max_req.
             buckets = [b for b in range(first, 200 + 1, 10)
                        if required_count(b) <= args.max_req]
