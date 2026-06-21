@@ -209,6 +209,35 @@ class TestSyntheticTopology(unittest.TestCase):
         self.assertTrue(callable(gen.load_osm_graph))
 
 
+class TestTightnessMetadata(unittest.TestCase):
+    """Phase 5: .npz carries full metadata (d, M, topology, tau, n_req); tau =
+    sum(q)/(M*Q) decreases as M grows (more vehicles -> looser capacity)."""
+
+    def _save(self, M, t):
+        edges, coords = gen.make_unit_square(50, 2.0, np.random.RandomState(1))
+        req, nonreq, C = gen.build_instance(edges, coords, M=M, rng=np.random.RandomState(2))
+        path = gen._save_instance(os.path.join(t, f"m{M}"), req, nonreq, M, C,
+                                  "unit_square", rng=np.random.RandomState(0))
+        return path, req, C
+
+    def test_metadata_complete_and_loader_ok(self):
+        with tempfile.TemporaryDirectory() as t:
+            path, req, C = self._save(5, t)
+            meta = np.load(path)
+            for key in ("d", "M", "topology", "tau", "n_req"):
+                self.assertIn(key, meta.files)
+            self.assertEqual(int(meta["n_req"]), len(req))
+            self.assertAlmostEqual(float(meta["tau"]), req[:, 2].sum() / (5 * C), places=6)
+            # extra metadata must not break the loader.
+            self.assertFalse(np.isnan(import_instance(path)[0]).any())
+
+    def test_tau_decreases_with_fleet(self):
+        with tempfile.TemporaryDirectory() as t:
+            tau1 = float(np.load(self._save(1, t)[0])["tau"])
+            tau10 = float(np.load(self._save(10, t)[0])["tau"])
+            self.assertGreater(tau1, tau10)
+
+
 class TestRoundTripWithImportInstance(unittest.TestCase):
     """A generated .npz must load cleanly through common.ops.import_instance."""
 

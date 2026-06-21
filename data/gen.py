@@ -149,11 +149,15 @@ _TOPOLOGIES = {"unit_square": make_unit_square, "cluster": make_cluster}
 
 def _save_instance(fpath, req, nonreq, M, C, topology, rng=np.random):
     """Write an .npz with the schema common.ops.import_instance reads, plus
-    metadata (d, topology) for per-axis reporting (Phase 2/4/5)."""
+    metadata for per-axis reporting (Phase 2/4/5): d, topology, tightness tau,
+    and n_req. tau = (sum of required demands) / (M * Q) describes how binding
+    the capacity is (Smith-Miles 2023)."""
     num_arc = len(req) + len(nonreq)
     num_nodes = int(np.concatenate([req[:, :2], nonreq[:, :2]]).max()) + 1
     d = num_arc / num_nodes
-    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C, d=d, topology=topology)
+    tau = float(req[:, 2].sum() / (M * C))
+    np.savez(fpath, req=req, nonreq=nonreq, P=3, M=M, C=C,
+             d=d, topology=topology, tau=tau, n_req=len(req))
     return fpath + ".npz"
 
 

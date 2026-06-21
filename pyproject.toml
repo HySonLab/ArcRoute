@@ -1,0 +1,22 @@
+[project]
+name = "hdcarp"
+version = "0.1.0"
+description = "Hybridising Reinforcement Learning and Heuristics for Hierarchical Directed Arc Routing Problems (HDCARP)"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+    "torch==2.6.0",
+    "tensordict==0.6.2",
+    "lightning==2.5.0",
+    "einops",
+    "gurobipy",
+    "scipy>=1.15.3",
+]
+
+[tool.uv]
+# The code is run from the project root (e.g. `python train.py`,
+# `python baseline/ils.py`) with imports like `from env.env import ...`,
+# so we manage the environment without building this repo as a package.
+package = false
