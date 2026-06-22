@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torch.distributions import Uniform, Normal
 from tensordict.tensordict import TensorDict
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 import os
 
@@ -193,7 +193,11 @@ def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
                      progress=False):
     """Generate `num_samples` instances of ONE size in parallel; returns a single
     batched TensorDict (all the same size, so torch.cat is valid)."""
-    num_loc, num_arc, num_vehicle = _pick(num_loc), _pick(num_arc), _pick(num_vehicle)
+    # Size is fixed ONCE per dataset (a batch must stay single-size for torch.cat),
+    # but num_vehicle is left as-is (scalar OR fleet list) and resolved PER-INSTANCE
+    # inside generate() -> so a fleet like [3,5,7,10] mixes M across instances
+    # (dynamic_plan Phase 3). M is a scalar field, it does not change tensor shapes.
+    num_loc, num_arc = _pick(num_loc), _pick(num_arc)
 
     class WrapDataset(Dataset):
         def __len__(self):
@@ -238,6 +242,11 @@ class SizeBucketBatchSampler:
         self.shuffle = shuffle
         self._len = sum((en - st + batch_size - 1) // batch_size
                         for st, en in self.bucket_ranges)
+        # Lightning introspects `batch_sampler.sampler` to detect shuffling; expose
+        # one matching `shuffle` so the multi-size (--sizes) path works under the
+        # installed Lightning. The real batching is done in __iter__.
+        n = max((en for _, en in self.bucket_ranges), default=0)
+        self.sampler = RandomSampler(range(n)) if shuffle else SequentialSampler(range(n))
 
     def __iter__(self):
         batches = []

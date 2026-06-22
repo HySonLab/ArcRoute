@@ -69,5 +69,40 @@ class TestSizeBucketSampler(unittest.TestCase):
             self.assertEqual(len(owner), 1, f"batch {batch} crosses buckets")
 
 
+class TestFleetPerInstance(unittest.TestCase):
+    """Phase 3: a fleet LIST sweeps M per-instance (M is a scalar -> mixes freely
+    in one batch, unlike size). Reward is computed per-instance under each M."""
+
+    def test_fleet_list_mixes_M_per_instance(self):
+        from env.generator import generate_dataset
+        ds = generate_dataset(64, 30, 30, [2, 3, 5, 7, 10], num_workers=0)
+        nv = ds["num_vehicle"]
+        self.assertEqual(tuple(nv.shape), (64,))               # scalar per instance
+        self.assertGreaterEqual(len(set(nv.tolist())), 2)      # genuinely mixed
+
+    def test_single_fleet_backward_compatible(self):
+        from env.generator import generate_dataset
+        ds = generate_dataset(8, 30, 30, 3, num_workers=0)
+        self.assertEqual(sorted(set(ds["num_vehicle"].tolist())), [3])
+
+    def test_reset_carries_per_instance_M_and_reward_runs(self):
+        import numpy as np
+        from env.env import CARPEnv
+        from env.generator import generate_dataset
+        from common.cal_reward import calc_reward
+
+        env = CARPEnv(num_loc=30, num_arc=30, num_vehicle=[2, 3, 7], variant="P")
+        ds = generate_dataset(12, 30, 30, [2, 3, 7], num_workers=0)
+        td = env.reset(ds)
+        self.assertEqual(tuple(td["num_vehicle"].shape), (12, 1))
+        # per-instance reward uses that instance's M (run_parallel slices td[i]).
+        n = int((td[0]["demand"] > 0).sum())
+        action = np.arange(1, n + 1)
+        for i in range(12):
+            r = calc_reward(action, td[i], return_numpy=True)
+            self.assertEqual(r.shape, (3,))
+            self.assertTrue(np.all(np.isfinite(r)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -175,6 +175,26 @@ class TestRolloutSmoke(unittest.TestCase):
                 with self.subTest(M=M, variant=variant):
                     self._run(M, variant)
 
+    def test_rollout_smoke_mixed_fleet(self):
+        """Phase 3: a single batch with MIXED M per instance flows through
+        rollout -> per-instance Scheduler reward -> backward (M is scalar, so no
+        torch.cat breakage; each instance is rewarded under its own M)."""
+        from env.env import CARPEnv
+        from env.generator import generate_dataset
+        from policy.policy import AttentionModelPolicy
+
+        torch.manual_seed(0)
+        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=[2, 3, 7], variant="P")
+        batch = generate_dataset(12, 15, 15, [2, 3, 7], num_workers=0)
+        self.assertGreaterEqual(len(set(batch["num_vehicle"].tolist())), 2)
+        td = env.reset(batch)
+        policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
+        out = policy(td.clone(), env, phase="train")
+        self.assertTrue(torch.isfinite(out["reward"]).all())
+        (-out["log_likelihood"].sum()).backward()
+        grads = [p.grad for p in policy.parameters() if p.grad is not None]
+        self.assertTrue(grads and all(torch.isfinite(g).all() for g in grads))
+
 
 if __name__ == "__main__":
     unittest.main()

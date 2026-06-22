@@ -23,7 +23,10 @@ def parse_args():
     parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--num_loc', type=int, default=20, help='Number of nodes')
     parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
-    parser.add_argument('--num_vehicle', type=int, default=3, help='Number of arcs')
+    parser.add_argument('--num_vehicle', type=str, default='3',
+                        help='Fleet size(s): an int "3" OR a comma list "2,3,5,7,10". '
+                             'A list mixes M PER-INSTANCE (M is swept in the reward/'
+                             'Scheduler; the policy stays M-agnostic). dynamic_plan Phase 3.')
     parser.add_argument('--sizes', type=str, default=None,
                         help='Phase 6 multi-size training: "nloc:narc,..." e.g. '
                              '"20:40,30:60,40:80,50:100,40:120". Overrides num_loc/num_arc.')
@@ -51,8 +54,13 @@ if __name__ == "__main__":
         sizes = [tuple(int(x) for x in pair.split(":")) for pair in args.sizes.split(",")]
         print(f"Multi-size training over (num_loc, num_arc) buckets: {sizes}")
 
+    # Phase 3: parse fleet "2,3,5,7,10" -> list (mixed per-instance) or single int.
+    fleet = [int(x) for x in str(args.num_vehicle).split(",")]
+    fleet = fleet[0] if len(fleet) == 1 else fleet
+    print(f"Fleet M (swept in reward, policy M-agnostic): {fleet}")
+
     # Initialize environment
-    env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=args.num_vehicle,
+    env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=fleet,
                   variant=args.variant, sizes=sizes)
     
     # Initialize policy

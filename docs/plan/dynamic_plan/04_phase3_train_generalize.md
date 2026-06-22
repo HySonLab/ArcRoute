@@ -79,12 +79,15 @@ uv run python -m unittest discover -s tests -p "test_*.py" -v
 #   sửa train.sh MAX_EPOCH nhỏ, FLEET="3,5,7,10", rồi ./train.sh ; theo dõi logs/
 ```
 
-### Checklist
-- [ ] `train.py --num_vehicle` nhận list; `train.sh` thêm `FLEET` + truyền vào.
-- [ ] **`env/generator.py`: pick `num_vehicle` per-instance** (bỏ `_pick` ở `generate_dataset`, để `generate`
-      tự pick); `num_vehicle` lưu tensor `(B,1)`; reward/context đọc M từ `td` per-instance.
-- [ ] `train.py`/`train.sh` đặt **`variant='P'`**; **policy M-agnostic** (không nối M vào input).
-- [ ] Test: parse list, M per-instance, batch trộn M, **train-step M-agnostic×size**, reward hữu hạn — xanh.
-- [ ] (tùy chọn) chạy smoke train ngắn, log vào `logs/`.
-- [ ] `unittest discover` xanh.
+### Checklist — ✅ ĐÃ XONG
+- [x] `train.py --num_vehicle` nhận list (`"2,3,5,7,10"` → list, `"3"` → int); `train.sh` thêm `FLEET` + truyền.
+- [x] **`env/generator.py`: pick `num_vehicle` per-instance** (bỏ `_pick(num_vehicle)` ở `generate_dataset`,
+      để `generate` tự pick); `num_vehicle` (B,) → `reset` reshape `(B,1)`; Scheduler đọc M per-instance.
+- [x] `train.py`/`train.sh` để **`variant='P'`**; **policy M-agnostic** (không nối M vào input).
+- [x] Test (`test_multisize.py` +3, `test_scheduler.py` +1): parse, M per-instance ≥2 distinct, mixed-M reward,
+      **mixed-fleet rollout-smoke** (reset→policy→Scheduler-reward→backward) — xanh. **80/80**.
+- [x] **Smoke train thật (GPU, 1 epoch)** cả single-size lẫn `--sizes`, fleet `[2,3,5,7,10]` → EXIT=0,
+      train/val reward hữu hạn.
+- [x] **Fix kèm (pre-existing, data_plan Phase 6):** `SizeBucketBatchSampler` thiếu `.sampler` → Lightning
+      hiện tại vỡ ở `--sizes`; thêm shim `RandomSampler/SequentialSampler` → train đa-size chạy lại.
 - [ ] Commit "Dynamic Phase 3: train M-agnostic (train once, any M)".

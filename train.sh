@@ -19,11 +19,15 @@ NUM_HEADS=8
 # Pairs are "nloc:narc"; ¼-split gives |A_r| = 3*floor(narc/4):
 #   20:40->30  30:60->45  40:80->60  50:100->75  40:120->90   (all <= cap 100)
 # This is what gives size-generalization. NUM_LOC/NUM_ARC are the single-size
-# fallback (used only when SIZES is empty). Fleet M is fixed (policy isn't
-# M-conditioned, so sweeping M would be noise) and topology stays unit_square.
+# fallback (used only when SIZES is empty). Topology stays unit_square.
 SIZES="20:40,30:60,40:80,50:100,40:120"
 NUM_LOC=40
 NUM_ARC=80
+# Phase 3: FLEET sweeps M PER-INSTANCE in the reward (Scheduler). The policy is
+# M-agnostic, so one model serves any M ("train once"); the sweep just makes the
+# learned arc-order robust across fleet sizes. M is a scalar -> mixes freely in a
+# batch (no bucketing needed, unlike size).
+FLEET="2,3,5,7,10"
 VARIANT=P
 CHECKPOINT_DIR=checkpoints/clP_ladder
 ACCELERATOR=gpu
@@ -46,6 +50,7 @@ nohup uv run python train.py \
     --num_heads "$NUM_HEADS" \
     --num_loc "$NUM_LOC" \
     --num_arc "$NUM_ARC" \
+    --num_vehicle "$FLEET" \
     --sizes "$SIZES" \
     --variant "$VARIANT" \
     --checkpoint_dir "$CHECKPOINT_DIR" \

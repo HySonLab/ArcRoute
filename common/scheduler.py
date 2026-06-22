@@ -54,6 +54,7 @@ class Scheduler:
 
         trips = self._segment(action, td, M)
         n_veh = len(trips) if M is None else int(M)
+        n_veh = max(n_veh, 1) if trips else 0          # guard: need >=1 vehicle
         vehicles = self._assign(trips, td, n_veh)
         T_vec = self._completion_times(vehicles, td)
         return vehicles, T_vec
@@ -69,8 +70,16 @@ class Scheduler:
         """Per-route capacity in the normalized space (demands are divided by Q in
         the data, so capacity = vehicle_capacity = 1.0)."""
         if "vehicle_capacity" in td:
-            return float(np.asarray(td["vehicle_capacity"]).reshape(-1)[0])
+            return float(self._np(td["vehicle_capacity"]).reshape(-1)[0])
         return 1.0
+
+    @staticmethod
+    def _np(x):
+        """Detach-safe conversion to a numpy array (demand/capacity never carry
+        grad, but be defensive)."""
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
 
     def _segment(self, action, td, M):
         """Re-partition the policy's ORDER into `K = max(M, k_min)` capacity-
@@ -88,7 +97,7 @@ class Scheduler:
         if len(order) == 0:
             return []
 
-        demand = np.asarray(td["demand"]).astype(np.float64).reshape(-1)
+        demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
         cap = self._capacity(td)
         loads = demand[order]
         total = float(loads.sum())
