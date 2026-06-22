@@ -15,6 +15,7 @@ class CARPEnv:
         num_vehicle=3,
         variant= 'P',
         sizes=None,
+        obj_weights=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -26,6 +27,14 @@ class CARPEnv:
         # Phase 6: if `sizes` (list of (num_loc, num_arc)) is given, train over a
         # size LADDER (bucketed so each batch stays single-size). Else single-size.
         self.sizes = sizes
+        # Hierarchical objective weights (T_1, T_2, T_3). The RL reward is -(T . w),
+        # giving T_1 priority (w_1 >> w_2 >> w_3) with T_2/T_3 breaking ties.
+        # Default is PROPORTIONAL to baseline/meta.py:calc_obj's [1e3,1e1,1e-1]
+        # (same 100x ratios -> identical solution ranking) but scaled to ~O(T_1)
+        # magnitude so PPO's critic stays well-conditioned (the absolute scale is
+        # irrelevant: advantages are normalised, and eval reports T_1/T_2/T_3
+        # separately). Previously the reward was -T_1 only (T_2/T_3 got no signal).
+        self.obj_weights = obj_weights if obj_weights is not None else [1.0, 1e-2, 1e-4]
 
     def step(self, td: TensorDict):
         current_node = td["action"][:, None]  # Add dimension for step
@@ -132,6 +141,8 @@ class CARPEnv:
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
         rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10, local_search=False, return_torch=True)
-        rs = -rs[:, :1].to(td.device)
-        # print(actions.shape, td.shape, rs.shape)
+        # Hierarchical scalar reward = -(T . w): optimise T_1 first (w_1 >> w_2 >>
+        # w_3), with T_2/T_3 breaking ties. Full T vector stays in get_objective.
+        w = torch.tensor(self.obj_weights, dtype=rs.dtype, device=rs.device)
+        rs = -(rs * w).sum(-1, keepdim=True).to(td.device)
         return rs

@@ -43,6 +43,16 @@
 > Lưu ý bucketing: size vẫn bucket (1 size/batch). M **không** cần bucket (M là scalar, không đổi shape) →
 > trộn M tự do trong 1 batch. ✓
 
+## 3.1b — Reward phân cấp (đã chốt)
+
+`env.get_reward` = **`−(T · w)`** với `w = [1.0, 1e-2, 1e-4]` (mặc định `CARPEnv.obj_weights`):
+- Ưu tiên `T_1` (w₁ ≫ w₂ ≫ w₃), `T_2`/`T_3` phá hoà → đúng mục tiêu **lexicographic** HDCARP. Trước đây
+  reward = `−T_1` (T₂/T₃ không có tín hiệu).
+- **Tỉ lệ 100× giống baseline** `meta.py:calc_obj` `[1e3,1e1,1e-1]` → **xếp hạng nghiệm y hệt** (so sánh
+  fair), nhưng **scale ~O(T_1)** để critic PPO ổn định (smoke: reward ~−29, value_loss ~27; bản `[1e3,…]`
+  cho ~−2.9e4 → critic phải hồi quy offset khổng lồ). Advantage đã normalize nên scale tuyệt đối vô hại;
+  eval vẫn báo cáo `T_1/T_2/T_3` riêng.
+
 ## 3.2 — Cân nhắc huấn luyện
 
 - **Curriculum (tùy chọn):** M nhỏ nhất (nhiều chuyến nối tiếp nhất → makespan cao nhất, khó cân nhất) là

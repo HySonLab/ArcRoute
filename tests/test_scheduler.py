@@ -202,6 +202,25 @@ class TestRolloutSmoke(unittest.TestCase):
                 with self.subTest(M=M, variant=variant):
                     self._run(M, variant)
 
+    def test_reward_equals_weighted_objective(self):
+        """RL reward = -(T . obj_weights) (hierarchical), not just -T_1, so the
+        policy optimises the same lexicographic objective as the baselines and
+        T_2/T_3 get a (tie-breaking) signal."""
+        from env.env import CARPEnv
+        from env.generator import generate_dataset
+        from policy.policy import AttentionModelPolicy
+
+        torch.manual_seed(0)
+        w = [1.0, 1e-2, 1e-4]                                # default (scaled) weights
+        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P", obj_weights=w)
+        td = env.reset(generate_dataset(12, 15, 15, 3, num_workers=0))
+        policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
+        out = policy(td.clone(), env, decode_type="greedy")
+        T = np.asarray(env.get_objective(td, out["actions"]))           # (B,3)
+        expected = -(T * np.array(w)).sum(-1)
+        got = out["reward"].detach().cpu().numpy().reshape(-1)
+        np.testing.assert_allclose(got, expected, rtol=1e-4)
+
     def test_rollout_smoke_mixed_fleet(self):
         """Phase 3: a single batch with MIXED M per instance flows through
         rollout -> per-instance Scheduler reward -> backward (M is scalar, so no
