@@ -13,6 +13,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training script for PPO on CARPEnv")
     
     # Add arguments
+    parser.add_argument('--algo', type=str, default='ppo', choices=['ppo', 'grpo'],
+                        help='RL algorithm: ppo (weighted-sum + critic, default) or '
+                             'grpo (group lexicographic rank, critic-free).')
+    parser.add_argument('--group_size', type=int, default=8,
+                        help='K samples/instance for GRPO (group size).')
+    parser.add_argument('--reward_mode', type=str, default=None,
+                        help='scalar|vector. Auto = vector if algo==grpo else scalar.')
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=1000, help='Maximum number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
@@ -60,18 +67,33 @@ if __name__ == "__main__":
     fleet = fleet[0] if len(fleet) == 1 else fleet
     print(f"Fleet M (swept in reward, policy M-agnostic): {fleet}")
 
+    # D2 Phase 4: reward_mode auto-selects vector for GRPO (it ranks the T-vector),
+    # scalar for PPO (the old -(T.w) reward). Explicit --reward_mode overrides.
+    reward_mode = args.reward_mode or ('vector' if args.algo == 'grpo' else 'scalar')
+    print(f"Algo={args.algo}  reward_mode={reward_mode}"
+          + (f"  group_size={args.group_size}" if args.algo == 'grpo' else ''))
+
     # Initialize environment
     env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=fleet,
-                  variant=args.variant, sizes=sizes)
-    
+                  variant=args.variant, sizes=sizes, reward_mode=reward_mode)
+
     # Initialize policy
     policy = AttentionModelPolicy(
                     embed_dim=args.embed_dim,
                     num_encoder_layers=args.num_encoder_layers,
                     num_heads=args.num_heads)
 
-    # Initialize PPO model
-    model = PPO(env, 
+    # D2 Phase 4: select the CLASS by --algo (no flag inside ppo.py). GRPO logs
+    # per-objective T1/T2/T3 means so the learning curve shows T2/T3 descending.
+    Model = GRPO if args.algo == 'grpo' else PPO
+    extra = {'group_size': args.group_size} if args.algo == 'grpo' else {}
+    metrics = ({"train": ["reward", "loss", "surrogate_loss", "entropy",
+                          "T1_mean", "T2_mean", "T3_mean"]}
+               if args.algo == 'grpo' else
+               {"train": ["reward", "loss", "surrogate_loss", "value_loss", "entropy"]})
+
+    # Initialize RL model
+    model = Model(env,
                 policy,
                 path_train_data=args.path_train_data,
                 path_val_data=args.path_val_data,
@@ -81,7 +103,9 @@ if __name__ == "__main__":
                 train_data_size=args.train_data_size,
                 val_data_size=args.val_data_size,
                 dataloader_num_workers=args.num_workers,
-                reload_train_dataloader=4)
+                metrics=metrics,
+                reload_train_dataloader=4,
+                **extra)
     
     # Setup checkpoint callback
     checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_dir,

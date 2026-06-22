@@ -15,6 +15,11 @@ MODE="${MODE:-validate}"
 # --- shared across modes ---
 SEED=6868
 NUM_HEADS=8
+# D2 Phase 4: ALGO selects the learning signal — "grpo" (group lexicographic rank,
+# critic-free; reward_mode auto=vector) or "ppo" (old weighted-sum + critic) for
+# A/B. GROUP_SIZE = K samples/instance for GRPO. Override:  ALGO=ppo ./train.sh
+ALGO="${ALGO:-grpo}"
+GROUP_SIZE="${GROUP_SIZE:-8}"
 # Phase 6: train over a SIZE LADDER (bucketed; each batch stays single-size).
 #   "nloc:narc"; ¼-split gives |A_r| = 3*floor(narc/4): 30,45,60,75,90 (<=100).
 SIZES="20:40,30:60,40:80,50:100,40:120"
@@ -30,7 +35,8 @@ DEVICES=1
 # --- per-mode hyperparameters ---
 if [ "$MODE" = "validate" ]; then
     MAX_EPOCH=40
-    BATCH_SIZE=512
+    # GRPO's effective batch is BATCH_SIZE * GROUP_SIZE; keep it modest at validate.
+    BATCH_SIZE=128
     MINI_BATCH_SIZE=128
     TRAIN_DATA_SIZE=10000
     VAL_DATA_SIZE=1000
@@ -48,8 +54,8 @@ else
     CHECKPOINT_DIR=checkpoints/clP_ladder
 fi
 
-echo "MODE=$MODE | max_epoch=$MAX_EPOCH | train_data=$TRAIN_DATA_SIZE | "\
-"layers=$NUM_ENCODER_LAYERS | fleet=$FLEET | variant=$VARIANT"
+echo "MODE=$MODE | algo=$ALGO | group_size=$GROUP_SIZE | max_epoch=$MAX_EPOCH | "\
+"train_data=$TRAIN_DATA_SIZE | layers=$NUM_ENCODER_LAYERS | fleet=$FLEET | variant=$VARIANT"
 
 mkdir -p logs
 TS=$(date +%Y%m%d_%H%M%S)
@@ -71,6 +77,8 @@ nohup uv run python train.py \
     --num_vehicle "$FLEET" \
     --sizes "$SIZES" \
     --variant "$VARIANT" \
+    --algo "$ALGO" \
+    --group_size "$GROUP_SIZE" \
     --checkpoint_dir "$CHECKPOINT_DIR" \
     --accelerator "$ACCELERATOR" \
     --devices "$DEVICES" \
