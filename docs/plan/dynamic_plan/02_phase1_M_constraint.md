@@ -25,20 +25,27 @@ class Scheduler:
 - **Đầu ra** `T_vec` đúng định nghĩa paper: `T_k` = thời điểm mọi xe phục vụ xong arc lớp `k`.
 - **Tôn trọng P/U:** P enforce precedence; U dùng **hierarchy-level** (paper §problem) khi tính `T_k`.
 
-## 1.2 — Thuật toán `Φ`: multi-trip (tự suy biến single-trip khi K≤M)
+## 1.2 — Thuật toán `Φ` (RẼ NHÁNH theo variant — "B+")
 
-`Q = Σq/3` khít (Phase 0) ⇒ Scheduler **một mode duy nhất: multi-trip**, nhưng đường nhanh single-trip khi đủ xe.
+Hai variant cho **route khác nhau** (precedence khác), `T_k` chung công thức (max completion/lớp).
 
-1. **Chia order** (chuỗi α của policy, bỏ qua các `0` policy tự chèn) thành **`K = max(M, ⌈Σdemand/Q⌉≈3)`
-   segment capacity-feasible** (mỗi segment ≤ Q). Vì Q khít, tối thiểu ~3 segment; với M≥3 chia đúng M segment.
-2. **Gán K segment → M xe:**
-   - **K ≤ M** (M≥3): mỗi segment 1 xe, **single-trip** (xe dư idle). ← đường nhanh "evaluator".
-   - **K > M** (vd M=2, K=3): **multi-trip** — gán bằng LPT + ưu tiên lớp, xe ≥2 segment chạy nối tiếp.
-3. **`T_k`** tính trên lịch (single-trip: song song; multi-trip: cộng nối tiếp), tôn trọng P (precedence) /
-   U (hierarchy-level) theo paper.
+### Variant **P** (mặc định) — global-class mask + per-class spread
+- **Mask (env):** `get_action_mask` cho P ép **GLOBAL precedence** — chỉ phục vụ lớp **nhỏ nhất chưa xong**,
+  KHÔNG reset ở depot → policy phát **một tour mạch lạc cho mỗi lớp**.
+- **`_build_P`:** chia **mỗi lớp** thành **M chunk cân-demand kề nhau** (quantile) → **xoay offset chunk→xe
+  per-lớp** (cân tải) → nối theo lớp tăng dần mỗi xe (precedence) → chèn **capacity reload** (multi-trip khi
+  `total/M > cap`, vd M=2). ⇒ **mỗi lớp trải khắp M xe → T₁ giảm theo M** (thắng phương án "class-cut" vốn
+  kẹt lớp-1 ở ~k_min xe).
+- Thực đo (1 instance): precedence ✓, cap ✓, lớp-1 trải **2/2,3/3,5/5,7/7**, `T₁: 33.6→23.2→11.2→11.0`.
 
-> **Continuity:** K≤M → công thức = makespan song song cũ (≤1e-6). M=2 → 1 xe ôm 2 trip → makespan cao hơn,
-> không infeasible. **Không có vách deadlock.**
+### Variant **U** — capacity re-split (không precedence)
+- `_segment` chia order thành `max(M, k_min)` segment capacity-feasible → `_assign` LPT multi-trip khi
+  `k_min>M`. `_order_trips` đẩy trip ưu tiên cao trước.
+
+> Vì sao B+ (không phải "class-cut" đơn giản): order policy chỉ monotone **trong từng depot-segment**; re-split
+> capacity vắt ngang ranh giới → P-infeasible. Global-class mask + per-class spread vừa **đúng precedence** vừa
+> **trải lớp-1 ra M xe** (T₁ tốt) vừa **học khớp** (policy lo routing trong-lớp, Scheduler lo M-spread).
+> `variant` được wire qua `get_reward/get_objective → calc_reward → Scheduler` (trước đây mặc định 'P').
 
 ## 1.3 — `calc_reward` mỏng lại + env/generator KHÔNG đổi
 
