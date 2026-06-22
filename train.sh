@@ -1,41 +1,59 @@
 #!/usr/bin/env bash
-# Launch HDCARP RL training via uv.
-# Edit the hyperparameters below directly.
+# Launch HDCARP RL training via uv (nohup -> logs/). Edit hyperparameters below.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# --- Hyperparameters ---
+# === MODE ===================================================================
+#   "validate" : short sanity run (~1-2h) to confirm the learning curve drops
+#                before committing to a full run. WATCH logs/, stop early once
+#                train/val reward is clearly improving (save_last keeps a ckpt).
+#   "full"     : the real training run.
+# Override on the CLI:   MODE=full ./train.sh
+MODE="${MODE:-validate}"
+
+# --- shared across modes ---
 SEED=6868
-MAX_EPOCH=1000
-BATCH_SIZE=4096
-MINI_BATCH_SIZE=512
-TRAIN_DATA_SIZE=100000
-VAL_DATA_SIZE=10000
-EMBED_DIM=128
-NUM_ENCODER_LAYERS=12
 NUM_HEADS=8
 # Phase 6: train over a SIZE LADDER (bucketed; each batch stays single-size).
-# Pairs are "nloc:narc"; ¼-split gives |A_r| = 3*floor(narc/4):
-#   20:40->30  30:60->45  40:80->60  50:100->75  40:120->90   (all <= cap 100)
-# This is what gives size-generalization. NUM_LOC/NUM_ARC are the single-size
-# fallback (used only when SIZES is empty). Topology stays unit_square.
+#   "nloc:narc"; ¼-split gives |A_r| = 3*floor(narc/4): 30,45,60,75,90 (<=100).
 SIZES="20:40,30:60,40:80,50:100,40:120"
-NUM_LOC=40
-NUM_ARC=80
 # Phase 3: FLEET sweeps M PER-INSTANCE in the reward (Scheduler). The policy is
-# M-agnostic, so one model serves any M ("train once"); the sweep just makes the
-# learned arc-order robust across fleet sizes. M is a scalar -> mixes freely in a
-# batch (no bucketing needed, unlike size).
+# M-agnostic, so one model serves any M; M mixes freely in a batch (scalar).
 FLEET="2,3,5,7,10"
-VARIANT=P
-CHECKPOINT_DIR=checkpoints/clP_ladder
+VARIANT=P                 # Phase 0: hierarchical/HDCARP-P is the default
+NUM_LOC=40                # single-size fallback (only used if SIZES is empty)
+NUM_ARC=80
 ACCELERATOR=gpu
 DEVICES=1
 
+# --- per-mode hyperparameters ---
+if [ "$MODE" = "validate" ]; then
+    MAX_EPOCH=40
+    BATCH_SIZE=512
+    MINI_BATCH_SIZE=128
+    TRAIN_DATA_SIZE=10000
+    VAL_DATA_SIZE=1000
+    EMBED_DIM=128
+    NUM_ENCODER_LAYERS=6      # lighter than full (12) so epochs are fast
+    CHECKPOINT_DIR=checkpoints/validate_clP
+else
+    MAX_EPOCH=1000
+    BATCH_SIZE=4096
+    MINI_BATCH_SIZE=512
+    TRAIN_DATA_SIZE=100000
+    VAL_DATA_SIZE=10000
+    EMBED_DIM=128
+    NUM_ENCODER_LAYERS=12
+    CHECKPOINT_DIR=checkpoints/clP_ladder
+fi
+
+echo "MODE=$MODE | max_epoch=$MAX_EPOCH | train_data=$TRAIN_DATA_SIZE | "\
+"layers=$NUM_ENCODER_LAYERS | fleet=$FLEET | variant=$VARIANT"
+
 mkdir -p logs
 TS=$(date +%Y%m%d_%H%M%S)
-LOG="logs/train_${TS}.out"
+LOG="logs/train_${MODE}_${TS}.out"
 
 # Run in the background via nohup so training survives a terminal close.
 nohup uv run python train.py \
@@ -58,6 +76,6 @@ nohup uv run python train.py \
     --devices "$DEVICES" \
     > "$LOG" 2>&1 &
 
-echo "Training started (PID $!)"
+echo "Training ($MODE) started (PID $!)"
 echo "Log: $LOG"
 echo "Theo doi: tail -f $LOG"
