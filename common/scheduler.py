@@ -14,21 +14,21 @@ Design (dynamic_plan Phase 1):
 Because Q is fixed (not M-dependent), one policy rollout serves ANY M — only this
 Scheduler is re-run per M ("train once, M is an eval-time parameter").
 
-Core pieces: `_segment` re-partitions the order into max(M, k_min) capacity-
-feasible segments (so M genuinely controls the split); `_assign` maps segments to
-M vehicles (LPT multi-trip when k_min > M); `_completion_times` does the
-hierarchical T_k accounting (sequential offsets for multi-trip).
+The two variants produce DIFFERENT routes (though the T_k *formula* is shared per
+Ha 2024 = max completion over class-k arcs):
+- 'P' (precedence): each route must be non-decreasing in class. The env mask makes
+  the order globally class-sorted; `_build_P` splits EACH class across the M
+  vehicles (chunks rotated for load balance) so class-1 is spread (low T_1), then
+  inserts capacity reloads -> routes are precedence-feasible by construction and
+  T_1 drops as M grows.
+- 'U' (upgrading): no precedence -> `_segment` re-partitions into max(M, k_min)
+  capacity-feasible segments and `_assign` maps them to M vehicles (LPT multi-trip
+  when k_min > M); `_order_trips` puts higher-priority trips first.
+`_completion_times` (sequential offsets for multi-trip) is shared by both.
+=> P generally costs more than U; they are NOT interchangeable.
 
-T_k is variant-INDEPENDENT: by the paper's definition (Ha 2024) T_k is "the minimum
-time by which all vehicles have finished servicing all required arcs of class k" =
-max completion time over class-k arcs — the SAME formula for HDCARP-P and HDCARP-U
-(the worked example has U's T_3 < T_2). The hierarchy-level concept is descriptive;
-the P/U difference lives entirely in the rollout mask (precedence), not here.
-
-Within a vehicle, multi-trip trips are ordered so higher-priority (lower class)
-arcs finish first (lexicographic objective); see `_order_trips`.
-
-TODO[assign]: trip->vehicle assignment is greedy LPT, not provably optimal.
+TODO[assign]: U trip->vehicle assignment is greedy LPT; P chunking is a balanced
+heuristic — neither is provably optimal.
 """
 
 import numpy as np
@@ -56,12 +56,18 @@ class Scheduler:
         """
         if M is None and "num_vehicle" in td:
             M = int(td["num_vehicle"])
-        # M may still be None -> parallel: one vehicle per capacity-min segment.
 
-        trips = self._segment(action, td, M)
-        n_veh = len(trips) if M is None else int(M)
-        n_veh = max(n_veh, 1) if trips else 0          # guard: need >=1 vehicle
-        vehicles = self._assign(trips, td, n_veh)
+        if self.variant == "P":
+            # HDCARP-P: the env mask makes the order globally class-sorted; split
+            # EACH class across the M vehicles (spread) and order each route class 1
+            # -> p (precedence). Capacity reloads split a route into trips.
+            vehicles = self._build_P(action, td, M)
+        else:
+            # HDCARP-U: no precedence -> capacity re-split + LPT multi-trip.
+            trips = self._segment(action, td, M)
+            n_veh = len(trips) if M is None else int(M)
+            n_veh = max(n_veh, 1) if trips else 0
+            vehicles = self._assign(trips, td, n_veh)
         T_vec = self._completion_times(vehicles, td)
         return vehicles, T_vec
 
@@ -124,6 +130,70 @@ class Scheduler:
         if cur:
             segs.append(np.array(cur, dtype=np.int64))
         return segs
+
+    # --- HDCARP-P: per-class spread across M vehicles -------------------------
+    def _build_P(self, action, td, M):
+        """Build M vehicle schedules for variant P. The env mask makes `action`
+        globally class-sorted, so each class is a coherent contiguous block. Split
+        EACH class's block into M demand-balanced contiguous chunks; vehicle m's
+        route = chunk_1m · chunk_2m · … · chunk_pm (non-decreasing class). Capacity
+        reloads then split each route into trips. => every class is spread across
+        all M vehicles (low T_1), and every route respects precedence."""
+        a = np.asarray(action).astype(np.int64).ravel()
+        order = a[a != 0]
+        M = max(int(M), 1)
+        vehicles = [[] for _ in range(M)]
+        if len(order) == 0:
+            return vehicles
+        clss = self._np(td["clss"]).reshape(-1)
+        demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
+        cap = self._capacity(td)
+
+        routes = [[] for _ in range(M)]                     # per-vehicle arc lists
+        ocls = clss[order]
+        for ki, k in enumerate(np.unique(ocls)):            # classes ascending
+            block = order[ocls == k]                        # coherent class-k tour
+            # Rotate which vehicle gets the heavier chunk per class so no single
+            # vehicle is heavy in every class (balances loads -> avoids needless
+            # capacity reloads). Order within a route stays class-ascending.
+            for i, chunk in enumerate(self._balanced_chunks(block, demand, M)):
+                routes[(i + ki) % M].extend(chunk.tolist())
+        for m in range(M):
+            vehicles[m] = self._split_by_capacity(np.array(routes[m], dtype=np.int64),
+                                                  demand, cap)
+        return vehicles
+
+    @staticmethod
+    def _balanced_chunks(block, demand, n):
+        """Split a 1D arc array into `n` demand-balanced CONTIGUOUS chunks by
+        cumulative-demand quantile (arc -> chunk ⌊cum_before / (total/n)⌋). Spreads
+        evenly; some chunks may be empty if len(block) < n."""
+        chunks = [[] for _ in range(n)]
+        if len(block) == 0:
+            return [np.array([], dtype=np.int64) for _ in range(n)]
+        d = demand[block]
+        target = float(d.sum()) / n
+        cum = 0.0
+        for arc, dd in zip(block.tolist(), d.tolist()):
+            c = min(n - 1, int(cum / target)) if target > 1e-12 else 0
+            chunks[c].append(arc)
+            cum += dd
+        return [np.array(c, dtype=np.int64) for c in chunks]
+
+    @staticmethod
+    def _split_by_capacity(route, demand, cap):
+        """Split a class-ordered route into capacity-feasible trips (insert a depot
+        reload whenever the next arc would exceed cap). Each trip stays a contiguous
+        slice -> still non-decreasing in class."""
+        trips, cur, load = [], [], 0.0
+        for arc in route.tolist():
+            d = float(demand[arc])
+            if cur and load + d > cap + 1e-9:
+                trips.append(np.array(cur, dtype=np.int64)); cur, load = [], 0.0
+            cur.append(arc); load += d
+        if cur:
+            trips.append(np.array(cur, dtype=np.int64))
+        return trips
 
     def _assign(self, trips, td, M):
         """Assign trips to M vehicles. ≤M trips → one per vehicle (single-trip,

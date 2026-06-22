@@ -80,8 +80,17 @@ class CARPEnv:
         # print(mask_loc.shape, mask_depot.shape)
         # exit()
         if self.variant == 'P':
-            clss_min = gather_by_index(td['clss'], td["current_node"])
-            mask_loc = mask_loc | ((td['clss'][..., 1:] - clss_min[..., None] < 0).unsqueeze(1))
+            # GLOBAL precedence (B+): serve ALL of the lowest unserved class before
+            # any higher class -> the policy emits one coherent tour per class, and
+            # the Scheduler spreads each class across the M vehicles. (The previous
+            # floor was the CURRENT node's class, which reset to 0 at every depot
+            # return -> only per-route ordering, which the capacity re-split then
+            # broke; see common/scheduler.py.)
+            clss_cust = td['clss'][..., 1:]                              # (B, n)
+            unserved = td['visited'][..., 1:].squeeze(1) == 0           # (B, n) bool
+            masked = clss_cust.masked_fill(~unserved, 1 << 30)
+            c_min = masked.min(dim=-1, keepdim=True).values            # (B,1) lowest unserved class
+            mask_loc = mask_loc | ((clss_cust > c_min).unsqueeze(1))
         return ~torch.cat((mask_depot[..., None], mask_loc), -1).squeeze(-2)
 
     def reset(self, td):
@@ -135,12 +144,14 @@ class CARPEnv:
     def get_objective(self, td, actions, local_search=True):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
-        return run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10, local_search=local_search)
+        return run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10,
+                            local_search=local_search, variant=self.variant)
 
     def get_reward(self, td, actions):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
-        rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10, local_search=False, return_torch=True)
+        rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10,
+                          local_search=False, return_torch=True, variant=self.variant)
         # Hierarchical scalar reward = -(T . w): optimise T_1 first (w_1 >> w_2 >>
         # w_3), with T_2/T_3 breaking ties. Full T vector stays in get_objective.
         w = torch.tensor(self.obj_weights, dtype=rs.dtype, device=rs.device)

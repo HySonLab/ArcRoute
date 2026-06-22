@@ -66,17 +66,17 @@ class TestScheduler(unittest.TestCase):
         self.td = toy_instance()
         self.action = order_action()
 
-    # accounting reduces to the classic parallel formula when 1 trip / vehicle.
+    # U-path accounting reduces to the classic parallel formula (1 trip / vehicle).
     def test_accounting_matches_parallel_reference(self):
-        sched = Scheduler()
+        sched = Scheduler(variant="U")
         for M in (3, 6, 12):                       # M >= k_min -> all parallel
             segs = sched._segment(self.action, self.td, M)
             _, T = sched(self.action, self.td, M=M)
             np.testing.assert_allclose(T, parallel_ref(segs, self.td), atol=1e-9)
 
-    # re-split ignores the policy's 0s and respects the hard capacity cap.
+    # U re-split ignores the policy's 0s and respects the hard capacity cap.
     def test_resplit_feasible_and_ignores_depot(self):
-        sched = Scheduler()
+        sched = Scheduler(variant="U")
         segs = sched._segment(self.action, self.td, M=5)
         dem = self.td["demand"]
         for seg in segs:
@@ -92,16 +92,15 @@ class TestScheduler(unittest.TestCase):
         self.assertGreater(n_trips(v6), n_trips(v3))      # uses more vehicles
         self.assertGreaterEqual(T3[0] + 1e-9, T6[0])      # makespan не increases
 
-    # ⭐ M=2 < k_min=3: multi-trip (3 segments on 2 vehicles), feasible & finite.
+    # ⭐ M=2 < k_min: total/M > cap -> each vehicle needs reloads (multi-trip).
     def test_m2_multitrip(self):
-        sched = Scheduler()
+        sched = Scheduler()                                # default P
         vehicles, T = sched(self.action, self.td, M=2)
         self.assertEqual(len(vehicles), 2)
-        self.assertEqual(n_trips(vehicles), 3)            # k_min segments kept
-        self.assertTrue(any(len(v) >= 2 for v in vehicles))  # one vehicle reloads
+        self.assertTrue(any(len(v) >= 2 for v in vehicles))  # some vehicle reloads
         self.assertTrue(np.all(np.isfinite(T)))
-        _, Tpar = sched(self.action, self.td, M=3)        # 3 parallel
-        self.assertGreaterEqual(T[0] + 1e-9, Tpar[0])     # stacking >= parallel
+        _, Tm3 = sched(self.action, self.td, M=3)
+        self.assertGreaterEqual(T[0] + 1e-9, Tm3[0])      # fewer vehicles >= more
 
     def test_monotonic_in_M(self):
         sched = Scheduler()
@@ -121,13 +120,46 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(T.shape, (3,))
             self.assertTrue(np.all(np.isfinite(T)))
 
-    # T_k is variant-INDEPENDENT (paper def = max over class-k arcs, same for P/U;
-    # the P/U difference is the rollout mask, not the Scheduler).
-    def test_Tk_variant_independent(self):
+    # ⭐ P routes respect precedence: each route is non-decreasing in class.
+    def test_P_routes_precedence(self):
+        clss = self.td["clss"].numpy()
+        for M in (2, 3, 5, 6):
+            veh, _ = Scheduler(variant="P")(self.action, self.td, M=M)
+            for v in veh:
+                for trip in v:
+                    self.assertTrue(bool(np.all(np.diff(clss[trip]) >= 0)),
+                                    f"non-monotone route {clss[trip].tolist()} M={M}")
+
+    # bug repro: an order that within depot-segments is 1,2,3 but concatenates to
+    # ...3 | 1,2... must NOT yield a non-monotone P route.
+    def test_P_bug_repro(self):
+        td = toy_instance(n=6, demand_each=0.4)
+        td["clss"] = torch.tensor([0, 1, 2, 3, 1, 2, 3], dtype=torch.int64)
+        action = np.array([1, 2, 3, 0, 4, 5, 6])          # 1,2,3 | 1,2,3
+        clss = td["clss"].numpy()
+        veh, _ = Scheduler(variant="P")(action, td, M=2)
+        for v in veh:
+            for trip in v:
+                self.assertTrue(bool(np.all(np.diff(clss[trip]) >= 0)))
+
+    # ⭐ P spreads class-1 across the vehicles (=> low T_1) and T_1 drops with M.
+    def test_P_class1_spread_and_T1_decreases(self):
+        clss = self.td["clss"].numpy()
+        n_c1 = int((clss == 1).sum())
+        t1_prev = None
         for M in (2, 3, 6):
-            tp = Scheduler(variant="P")(self.action, self.td, M=M)[1]
-            tu = Scheduler(variant="U")(self.action, self.td, M=M)[1]
-            np.testing.assert_array_equal(tp, tu)
+            veh, T = Scheduler(variant="P")(self.action, self.td, M=M)
+            c1_vehicles = sum(1 for v in veh if any(1 in clss[t] for t in v))
+            self.assertGreaterEqual(c1_vehicles, min(M, n_c1) - 1)   # ~ spread to M
+            if t1_prev is not None:
+                self.assertLessEqual(T[0], t1_prev + 1e-9)          # T_1 non-increasing
+            t1_prev = T[0]
+
+    # P and U now genuinely DIFFER (P pays for precedence); both stay feasible.
+    def test_P_and_U_differ(self):
+        tp = Scheduler(variant="P")(self.action, self.td, M=3)[1]
+        tu = Scheduler(variant="U")(self.action, self.td, M=3)[1]
+        self.assertFalse(np.allclose(tp, tu))
 
     # [assign] priority-first within a vehicle: lower class runs earlier.
     def test_order_trips_priority_first(self):
