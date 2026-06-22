@@ -16,10 +16,10 @@ M-agnostic của policy.
 |---|---|---|
 | **K (group size)** | **mặc định 8**, dải 8–16; cờ `--group_size` | dùng `batchify` (`common/ops.py:76`) nhân td K lần (POMO). ⚠️ ràng buộc `run_parallel` (xem 0.4) |
 | **Công thức rank** | xếp K bằng `np.lexsort((T_3,T_2,T_1))` → rank `r∈{0..K-1}` → **center+scale**: `adv = (r - (K-1)/2) / ((K-1)/2)` ∈ [-1,1], mean≈0 | scale-free, zero-mean (group mean = baseline), unit-scale; **rank tốt nhất → adv âm nhất hay dương nhất? xem 0.3** |
-| **Critic** | **bỏ value term** (`vf_lambda→0`), critic không tham gia loss; **giữ object critic** trong code (khỏi vỡ `configure_optimizers`) nhưng **không backward qua nó** ở path GRPO | `rl/critic.py` giữ nguyên; `rl/ppo.py:226-233` value_loss = 0 khi `--algo grpo` |
+| **Critic** | GRPO **không có value term**; `GRPO.configure_optimizers` chỉ trả `policy.parameters()` (critic ngoài loss & optimizer) | **`rl/grpo.py` (mới)**; `rl/critic.py` giữ nguyên (PPO vẫn dùng) |
 | **Biểu diễn vector reward** | `get_reward` trả **(B,3) T-vector** khi cờ `reward_mode='vector'`; mặc định/`'scalar'` giữ `-(rs*w).sum` cũ | `env/env.py:150-159`; `common/cal_reward.py` đã trả full vector (`return torch.tensor(rs)`) |
 | **Đóng băng** | Scheduler `Φ`, P mask, encoder/decoder, M-agnostic, calib `Q=Σq/3`, p=3 | — |
-| **A/B** | cờ `--algo {ppo,grpo}` chọn path; `--reward_mode {scalar,vector}`; default = path cũ (ppo+scalar) | `train.py`, `rl/ppo.py` |
+| **A/B** | `--algo {ppo,grpo}` → `train.py` chọn **LỚP** (`PPO` vs `GRPO`); `--reward_mode {scalar,vector}`; default = cũ (ppo+scalar) | `train.py` (chọn lớp); **`rl/ppo.py` KHÔNG đổi** |
 | **Rollback** | mỗi đổi sau 1 cờ; tắt cờ ⇒ về hành vi cũ **byte-identical**; mỗi phase 1 commit | — |
 
 ## 0.3 — ⚠️ Quy ước dấu reward/rank (chốt rõ để khỏi sai dấu)

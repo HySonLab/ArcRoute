@@ -34,26 +34,28 @@ trọng số. **GRPO** làm đúng việc đó.
 |---|---|---|
 | **Selector best-of-K** | chọn theo **T_1 đơn** (`obj[:,0].argmin()`, `eval/run_grid.py:111`, `baseline/rl_hyb.py:37`) | **lexicographic** `np.lexsort((obj[:,2],obj[:,1],obj[:,0]))[0]` — **FREE WIN, không retrain** (Phase 1) |
 | **Reward env** | scalar `-(rs*w).sum` (`env/env.py:157-158`) | **lộ T-vector** ra train path (cờ A/B); scalar cũ giữ sau cờ (Phase 2) |
-| **PPO advantage** | bandit `prev_reward - value_pred` + critic (`rl/ppo.py:207-208`) | **GRPO**: K sample/instance → reward = **centered lexicographic rank** trong nhóm K → `adv = rank`, **bỏ critic** (`vf_lambda→0`); sau cờ `--algo grpo` (Phase 3) |
+| **PPO advantage** | bandit `prev_reward - value_pred` + critic (`rl/ppo.py:207-208`) | **GRPO trong FILE MỚI `rl/grpo.py`** (`class GRPO(PPO)`): K sample/instance → reward = **centered lexicographic rank** → `adv = rank`, **bỏ critic**. **`rl/ppo.py` KHÔNG sửa** (A/B = chọn lớp ở `train.py`) (Phase 3) |
+| **Dead/deprecated code** | `intra.py`/`inter.py` comment 100%, import hỏng `baseline/meta.py`, debug comment | **Dọn** (Phase 7): 7A dead-code (sớm, độc lập) + 7B weighted/critic deprecated (sau Phase 6) |
 | **Train config** | 1 path PPO | thêm `--group_size K`, `--algo {ppo,grpo}`; log **T_1,T_2,T_3 riêng** (Phase 4) |
 | **Local search** | chỉ `lsRL` intra 2-opt (`common/local_search.py:58`); `ls` inter bị comment | mạnh hoá within-class LS, chỉ chạy trên **winner best-of-K** ở eval (Phase 5, **tùy chọn**) |
 | **Scheduler `Φ`** | `common/scheduler.py` | **GIỮ NGUYÊN** |
 | **Global-class P mask** | `env/env.py:82-93` | **GIỮ NGUYÊN** |
 | **Policy M-agnostic** | encoder/decoder không thấy M | **GIỮ NGUYÊN** |
 
-## Các phase (critical path: `0 → 1 → 2 → 3 → 4 → 6`; Phase 5 tùy chọn)
+## Các phase (critical path: `0 → 1 → 2 → 3 → 4 → 6`; Phase 5 tùy chọn; 7 dọn dẹp)
 
 | Phase | File | Nội dung | Bắt buộc? |
 |---|---|---|---|
-| **0** | [`01_phase0_scope.md`](01_phase0_scope.md) | Chốt: K, công thức rank, bỏ-critic-vs-cờ, biểu diễn vector reward, A/B + rollback | ✅ quyết định |
+| **0** | [`01_phase0_scope.md`](01_phase0_scope.md) | Chốt: K, công thức rank, file `rl/grpo.py` riêng, biểu diễn vector reward, A/B + rollback | ✅ quyết định |
 | **1** | [`02_phase1_lex_selector.md`](02_phase1_lex_selector.md) | **Lexicographic best-of-K** ở selector (free win, không retrain) + test | ✅ |
 | **2** | [`03_phase2_vector_reward.md`](03_phase2_vector_reward.md) | `get_reward` lộ T-vector (sau cờ); test shape/giá trị + suite xanh + rollout smoke | ✅ |
-| **3** | [`04_phase3_grpo_core.md`](04_phase3_grpo_core.md) | GRPO core: nhóm K + centered lex rank + `adv=rank` + bỏ critic, sau cờ `--algo grpo` | ✅ nền tảng |
-| **4** | [`05_phase4_train_config.md`](05_phase4_train_config.md) | `train.py/sh` (`group_size`,`algo`) + MODE; smoke train + đường cong per-objective | ✅ |
+| **3** | [`04_phase3_grpo_core.md`](04_phase3_grpo_core.md) | GRPO core trong **`rl/grpo.py` MỚI** (`GRPO(PPO)`); `ppo.py` không đổi | ✅ nền tảng |
+| **4** | [`05_phase4_train_config.md`](05_phase4_train_config.md) | `train.py/sh` chọn lớp `--algo` + `group_size` + MODE; smoke train + đường cong per-objective | ✅ |
 | **5** | [`06_phase5_localsearch.md`](06_phase5_localsearch.md) | *(tùy chọn)* mạnh hoá within-class LS trên winner best-of-K | ⏹ tùy chọn |
 | **6** | [`07_phase6_eval_measure.md`](07_phase6_eval_measure.md) | đường cong per-objective; win-rate lexicographic vs weighted; gap-to-LP; best-of-K yield | ✅ |
+| **7** | [`08_phase7_cleanup.md`](08_phase7_cleanup.md) | dọn **dead code** (7A, sớm) + **deprecated weighted/critic** (7B, sau Phase 6) | ✅ |
 
-Bảng cổng test gộp: [`08_test_matrix.md`](08_test_matrix.md).
+Bảng cổng test gộp: [`09_test_matrix.md`](09_test_matrix.md).
 
 ## Bất biến phải bake vào plan (xem cả `08_test_matrix.md`)
 

@@ -28,10 +28,11 @@
 | **0** Scope | — (quyết định) | Chốt **K=8**, công thức **centered lex rank** + dấu, bỏ-critic-sau-cờ, `reward_mode`, A/B/rollback, ràng buộc `B×K≥10` + layout batchify |
 | **1** Lex selector | Scheduler/mask/policy nguyên; **no T_1 regress** | (1) ⭐ lex argmin đúng (ví dụ tay); (2) ⭐ **T_1 chọn == min** (no-regress); (3) tie-break thật (lex ≤ argmin-cũ theo T_2,T_3); (4) smoke selector (skippable) |
 | **2** Vector reward | `calc_reward`/Scheduler nguyên; default scalar=cũ | (1) ⭐ shape (scalar→(B,1), vector→(B,3)); (2) ⭐ **scalar == -(vector·w)**; (3) ⭐ vector finite/≥0; (4) default=scalar; (5) ⭐ rollout smoke PPO cũ {P,U}; (6) suite cũ xanh |
-| **3** GRPO core | path PPO cũ byte-identical; critic giữ trong optim, không vào loss GRPO | (1) ⭐ **rank tay** (best→adv max, dấu đúng, mean≈0); (2) ⭐ **layout batchify/unbatchify** (B,K); (3) ⭐ adv finite + zero-mean/group; (4) ⭐ **backward: policy có grad, critic không**; (5) ⭐ **PPO cũ vẫn chạy** (critic có grad); (6) ⭐ rollout smoke GRPO {P,U}, `B×K≥10`; (7) suite cũ xanh |
-| **4** Train config | default ppo/scalar; `nohup→logs/` | (1) ⭐ parse `--algo/--group_size`; (2) ⭐ **auto reward_mode** (grpo→vector); (3) ⭐ build+`shared_step` grpo finite; (4) ⭐ per-obj metrics `T1/T2/T3_mean`; (5) ⭐ ppo build chạy (A/B); (6) smoke {ppo,grpo}×{P,U}; smoke train: T_2/T_3↓, T_1 phẳng |
+| **3** GRPO core | **`rl/ppo.py` BẤT BIẾN** (`git diff` rỗng); GRPO ở file riêng `rl/grpo.py` | (1) ⭐ **rank tay** (best→adv max, dấu đúng, mean≈0); (2) ⭐ **layout batchify/unbatchify** (B,K); (3) ⭐ adv finite + zero-mean/group; (4) ⭐ **backward: policy có grad, critic không**; (5) ⭐ **`git diff rl/ppo.py` rỗng** + PPO cũ chạy (critic có grad); (6) ⭐ rollout smoke GRPO {P,U}, `B×K≥10`; (7) suite cũ xanh |
+| **4** Train config | default ppo/scalar; `nohup→logs/` | (1) ⭐ parse `--algo/--group_size`; (2) ⭐ **auto reward_mode** (grpo→vector); (3) ⭐ build `GRPO`+`shared_step` finite; (4) ⭐ per-obj metrics `T1/T2/T3_mean`; (5) ⭐ build `PPO` chạy (A/B); (6) smoke {ppo,grpo}×{P,U}; smoke train: T_2/T_3↓, T_1 phẳng |
 | **5** Local search *(tùy chọn)* | within-class ⇒ P-precedence giữ; **no T_1 regress**; KHÔNG ở train | (1) ⭐ precedence giữ; (2) ⭐ no-regress lexicographic (T_1 không tăng); (3) ⭐ idempotent/hội tụ; (4) cờ off=no-op; (5) smoke winner (skippable) |
 | **6** Eval & measure | cùng selector lex cho cả 2 nhánh A/B; **T_1 regress=0** | (1) ⭐ **win-rate lexicographic** đúng + regression count; (2) ⭐ zero-T_1-regress synthetic; (3) grid rows + monotone-M (schema không vỡ); (4) best-of-K yield shape (đơn điệu mềm); (5) stats p∈[0,1], gap dấu đúng; (6) suite cũ xanh |
+| **7** Cleanup | **7A** trước/độc lập; **7B** chỉ sau Phase 6 | 7A: (1) xoá `intra.py`/`inter.py` + import thừa + debug comment; (2) ⭐ suite xanh; (3) import sạch; **GIỮ** `gather_by_index`. 7B: (sau Phase 6) bỏ nhánh weighted+critic, suite xanh + smoke grpo EXIT=0 |
 
 ## Quan hệ với dynamic_plan (TRỰC GIAO)
 
@@ -47,8 +48,9 @@
 - [ ] Phase 0: chốt K/rank/dấu/cờ/rollback + ràng buộc B×K≥10 & layout batchify.
 - [ ] Phase 1: lex best-of-K selector (`run_grid.py`+`rl_hyb.py`) → commit.
 - [ ] Phase 2: vector reward mode (`env.py`, sau cờ) → commit.
-- [ ] Phase 3: GRPO core (`ppo.py`, sau `--algo grpo`, bỏ critic term) → commit.
-- [ ] Phase 4: train config (`train.py/sh`) + per-obj log + smoke train → commit.
+- [ ] Phase 3: GRPO core trong **`rl/grpo.py` MỚI** (`GRPO(PPO)`); `rl/ppo.py` không đổi → commit.
+- [ ] Phase 4: train config (`train.py/sh` chọn lớp `--algo`) + per-obj log + smoke train → commit.
 - [ ] Phase 5 *(tùy chọn)*: within-class LS trên winner → commit.
 - [ ] Phase 6: per-obj curve + lex win-rate + gap-to-LP + best-of-K yield → commit.
+- [ ] Phase 7A: dọn dead code (intra/inter.py, import thừa, debug) → commit. **7B** sau Phase 6.
 - [ ] Giữ **90 test cũ xanh** xuyên suốt; mọi cờ default = path cũ.

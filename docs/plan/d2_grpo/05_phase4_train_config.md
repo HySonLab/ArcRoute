@@ -2,7 +2,7 @@
 
 > Mục tiêu: wire GRPO ra CLI/`train.sh`, mở rộng MODE, và chạy **smoke train ngắn** chứng minh đường cong
 > **per-objective** (T_1,T_2,T_3 log riêng) — T_2/T_3 **giảm** trong khi T_1 đứng ở sàn. Phụ thuộc Phase 3.
-> Code: `train.py`, `train.sh`, `rl/ppo.py` (metrics log).
+> Code: `train.py` (chọn lớp), `train.sh`, `rl/grpo.py` (metrics log). **`rl/ppo.py` không đổi.**
 
 ## 4.1 — `train.py`: thêm args + wire
 
@@ -16,9 +16,12 @@
   ```
 - Wire (quanh `train.py:62-83`):
   ```python
+  from rl.grpo import GRPO
   reward_mode = args.reward_mode or ('vector' if args.algo == 'grpo' else 'scalar')
   env = CARPEnv(..., variant=args.variant, sizes=sizes, reward_mode=reward_mode)
-  model = PPO(env, policy, ..., algo=args.algo, group_size=args.group_size)
+  Model = GRPO if args.algo == 'grpo' else PPO       # chọn LỚP, không cờ trong ppo.py
+  extra = {'group_size': args.group_size} if args.algo == 'grpo' else {}
+  model = Model(env, policy, ..., **extra)
   ```
 - ⚠️ **`val/reward` monitor** (`train.py:90`): GRPO `td["reward"]` là (B,3); metric log phải scalarize cho
   monitor (dùng `-T_1` hoặc `-(T.w)` chỉ để **log/checkpoint chọn**, KHÔNG cho gradient). Ghi rõ ở 4.3.
@@ -35,9 +38,8 @@
 
 ## 4.3 — Log per-objective (sanity đường cong)
 
-**File:** `rl/ppo.py` (`shared_step`, vùng metrics `:249-258`; `log_metrics` `:88-113`)
-- Ở path GRPO, sau khi có (B,K,3) T, log thêm **`T1_mean,T2_mean,T3_mean`** (trung bình batch) vào `out`
-  + thêm vào `metrics["train"]` (`rl/ppo.py:31-33`).
+**File:** `rl/grpo.py` (trong `GRPO.shared_step`; tái dùng `log_metrics` của PPO `rl/ppo.py:88-113`)
+- Sau khi có (B,K,3) T, log thêm **`T1_mean,T2_mean,T3_mean`** (trung bình batch) vào `out` + `metrics["train"]`.
 - Mục tiêu sanity: **T_1 phẳng ở sàn, T_2/T_3 GIẢM** (dưới weighted reward chúng phẳng — đây là bằng chứng
   GRPO hoạt động). Đây là **đo**, không assert cứng trong unittest (chạy thật ở Phase 6).
 
@@ -75,9 +77,9 @@ ALGO=grpo MODE=validate ./train.sh && tail -n 50 logs/train_validate_*.out
 ```
 
 ### Checklist
-- [ ] `train.py`: `--algo`,`--group_size`,`--reward_mode`(auto); wire env+PPO.
+- [ ] `train.py`: `--algo`,`--group_size`,`--reward_mode`(auto); **chọn lớp `GRPO`/`PPO`**; wire env.
 - [ ] `train.sh`: `ALGO`/`GROUP_SIZE` biến + MODE; giữ `nohup → logs/`; A/B `ALGO=ppo`.
-- [ ] `rl/ppo.py`: log `T1_mean/T2_mean/T3_mean` ở GRPO; metric monitor scalarize chỉ để chọn ckpt.
+- [ ] `rl/grpo.py`: log `T1_mean/T2_mean/T3_mean`; metric monitor scalarize chỉ để chọn ckpt. **`rl/ppo.py` không đổi.**
 - [ ] `tests/test_train_config.py`: ⭐ parse, ⭐ auto-mode, ⭐ build+step grpo, ⭐ per-obj metrics, ⭐ ppo build, smoke {P,U}.
 - [ ] Smoke train: T_2/T_3 giảm, T_1 phẳng, không NaN.
 - [ ] `unittest discover` xanh — 90 cũ + mới.
