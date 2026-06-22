@@ -34,7 +34,9 @@ class RLHCARP:
         with torch.inference_mode():
             out = self.policy(td, env=self.env, phase='infer')
             obj = self.env.get_objective(td, out['actions'])
-            idx = obj[:, 0].argmin()
+            # lexicographic best over (T_1,T_2,T_3), not T_1 alone
+            o = np.asarray(obj)
+            idx = int(np.lexsort((o[:, 2], o[:, 1], o[:, 0]))[0])
             obj = obj[idx]
         print(out['actions'][idx])
         tours = gen_tours(out['actions'][idx].cpu().numpy().astype(np.int32))
