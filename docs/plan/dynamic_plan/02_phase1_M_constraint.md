@@ -79,5 +79,10 @@ uv run python -m unittest discover -s tests -p "test_*.py" -v
 - [x] `unittest discover` xanh — **76/76** (65 cũ không vỡ + 11 mới).
 - [ ] Commit "Dynamic Phase 1: Scheduler module (M-agnostic policy + Φ)".
 
-> Còn TODO (đánh dấu trong `scheduler.py`): `[hierarchy]` HDCARP-U dùng hierarchy-level cho `T_k`; `[assign]`
-> xếp thứ tự trip trong xe theo ưu tiên. Policy vẫn M-agnostic — cho thấy M = Phase 2 (hoãn).
+> **Cập nhật sau review:**
+> - `[hierarchy]` — **KHÔNG phải lỗ hổng.** Theo định nghĩa chính thức (Ha 2024): `T_k` = *"min time mọi xe
+>   phục vụ xong mọi arc lớp k"* = **max-over-class-k-arcs**, **giống nhau cho P và U** (ví dụ paper: U có
+>   `T_3=4 < T_2=5`). Khác biệt P/U nằm ở **mask** (env). Đã khoá bằng test `Tk_variant_independent`.
+> - `[assign]` — **ĐÃ LÀM:** `_order_trips` xếp trip trong xe **ưu tiên lớp cao trước** (multi-trip M<k_min);
+>   đo thực tế M=2 `T_1` giảm ~10%. Còn lại: assignment trip→xe vẫn là greedy LPT (heuristic).
+> - Policy vẫn M-agnostic — cho thấy M = Phase 2 (hoãn).

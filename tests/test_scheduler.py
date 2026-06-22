@@ -121,6 +121,33 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(T.shape, (3,))
             self.assertTrue(np.all(np.isfinite(T)))
 
+    # T_k is variant-INDEPENDENT (paper def = max over class-k arcs, same for P/U;
+    # the P/U difference is the rollout mask, not the Scheduler).
+    def test_Tk_variant_independent(self):
+        for M in (2, 3, 6):
+            tp = Scheduler(variant="P")(self.action, self.td, M=M)[1]
+            tu = Scheduler(variant="U")(self.action, self.td, M=M)[1]
+            np.testing.assert_array_equal(tp, tu)
+
+    # [assign] priority-first within a vehicle: lower class runs earlier.
+    def test_order_trips_priority_first(self):
+        sched = Scheduler()
+        c3 = np.array([1])      # arc 1 is class 2 in the toy; build explicit td below
+        td = toy_instance()
+        td["clss"] = torch.tensor([0, 3, 3, 1, 1] + [2] * 8, dtype=torch.int64)
+        ordered = sched._order_trips([np.array([1]), np.array([3])], td)  # class3, class1
+        self.assertEqual(int(td["clss"][ordered[0][0]]), 1)   # class-1 trip first
+
+    # multi-trip (M=1): the class-1 trip is LAST in the order but, ordered
+    # priority-first on the vehicle, it runs first => T_1 < T_3.
+    def test_multitrip_priority_reduces_T1(self):
+        td = toy_instance()
+        # arcs 1..8 = class 3 (first trips), arcs 9..12 = class 1 (last trip)
+        td["clss"] = torch.tensor([0] + [3] * 8 + [1] * 4, dtype=torch.int64)
+        action = np.arange(1, 13)
+        _, T = Scheduler()(action, td, M=1)            # all 3 trips on one vehicle
+        self.assertLess(T[0], T[2])                    # class 1 (late) finishes first
+
     def test_empty_class_is_zero(self):
         td = toy_instance()
         td["clss"] = torch.tensor([0] + [1] * 12, dtype=torch.int64)  # only class 1

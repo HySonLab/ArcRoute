@@ -19,11 +19,16 @@ feasible segments (so M genuinely controls the split); `_assign` maps segments t
 M vehicles (LPT multi-trip when k_min > M); `_completion_times` does the
 hierarchical T_k accounting (sequential offsets for multi-trip).
 
-TODOs (enhancements):
-  - [hierarchy] HDCARP-U: compute T_k via hierarchy-levels (Ha 2024 §problem)
-    instead of raw per-class max (currently identical for P and U).
-  - [assign] Replace greedy LPT with hierarchical-aware / optimal assignment
-    (order trips within a vehicle so high-priority arcs finish first).
+T_k is variant-INDEPENDENT: by the paper's definition (Ha 2024) T_k is "the minimum
+time by which all vehicles have finished servicing all required arcs of class k" =
+max completion time over class-k arcs — the SAME formula for HDCARP-P and HDCARP-U
+(the worked example has U's T_3 < T_2). The hierarchy-level concept is descriptive;
+the P/U difference lives entirely in the rollout mask (precedence), not here.
+
+Within a vehicle, multi-trip trips are ordered so higher-priority (lower class)
+arcs finish first (lexicographic objective); see `_order_trips`.
+
+TODO[assign]: trip->vehicle assignment is greedy LPT, not provably optimal.
 """
 
 import numpy as np
@@ -32,8 +37,9 @@ import torch
 
 class Scheduler:
     def __init__(self, variant: str = "P", pos_val=(1, 2, 3)):
-        # variant: 'P' (precedence) or 'U' (upgrading). Currently only affects the
-        # (TODO) hierarchy-level computation; T_k formula below is shared.
+        # variant: 'P' (precedence) or 'U' (upgrading). Informational only — T_k is
+        # variant-independent (max over class-k arcs); the P/U difference is in the
+        # rollout mask, not here. Kept for API clarity.
         self.variant = variant
         self.pos_val = list(pos_val)
 
@@ -139,9 +145,21 @@ class Scheduler:
             v = int(np.argmin(loads))
             vehicles[v].append(trips[idx])
             loads[v] += durations[idx]
-        # TODO[assign]: within each vehicle, order trips so high-priority arcs
-        # finish early (hierarchical objective). Skeleton keeps assignment order.
         return vehicles
+
+    def _order_trips(self, veh_trips, td):
+        """Order a vehicle's trips so higher-priority (lower class) arcs finish
+        first -> lower T_1 then T_2 (lexicographic objective). No-op for ≤1 trip.
+        Key: (min class present, duration) ascending."""
+        if len(veh_trips) <= 1:
+            return veh_trips
+        clss = td["clss"]
+
+        def key(trip):
+            cs = clss[np.asarray(trip, dtype=np.int64)]
+            return (int(cs.min()), float(self._trip_profile(trip, td)[2]))
+
+        return sorted(veh_trips, key=key)
 
     def _trip_profile(self, trip, td):
         """For one trip (1D arc indices, no depot) return:
@@ -170,7 +188,8 @@ class Scheduler:
         per_class = {p: [0.0] for p in self.pos_val}     # empty class -> T_k = 0
         for veh_trips in vehicles:
             offset = 0.0
-            for trip in veh_trips:
+            for trip in self._order_trips(veh_trips, td):   # priority-first
+
                 arc_class, arc_comp, duration = self._trip_profile(trip, td)
                 for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
                     if c in per_class:
