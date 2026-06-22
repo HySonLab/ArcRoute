@@ -27,11 +27,21 @@
 - **Ablation Scheduler** (nếu muốn): greedy vs LPT vs optimal-assignment `Φ` → tách đóng góp của Scheduler.
 - **τ theo M** (report-time, data_plan Phase 5) để mô tả độ khó từng cấu hình.
 
-## 5.3 — Script
+## 5.3 — Script — ✅ ĐÃ SCAFFOLD (`eval/run_grid.py`)
 
-**File:** `eval/run_grid.py` (mới, tùy chọn) hoặc dùng baselines + `eval/stats.py`:
-- Loop `(file, M)` → chạy RL/baseline → thu makespan per class.
-- Đẩy vào `eval/stats.py`: `gap_to_bks`, `pairwise_wilcoxon`, `friedman`, break-down.
+**File:** `eval/run_grid.py` (đã dựng, đã validate):
+- `load_instance_td(file, M)`: dựng td từ `.npz` (qua `import_instance(M=)`) đúng key của env hiện tại
+  (rl_hyb.py cũ **stale** — dùng `service_time`/`env.reset(batch_size=)` sai; KHÔNG dùng).
+- `RLSolver(ckpt)`: load PPO ckpt → sample `num_sample` rollout (decode `sampling`) → `env.get_objective`
+  → giữ best theo `T_1` (kiểu HRDA). ⚠️ `get_objective` dùng `run_parallel(num_epochs=10)` → `num_sample ≥ 10`.
+- `run_grid` loop `(file × M × variant)` → thu `(T_1,T_2,T_3)` + metadata; `write_csv`.
+- `summarize`: dùng `eval/stats.py:describe` — break-down `T_1` theo **M / topology / n_req / density** +
+  sanity **monotone theo M**.
+- `--dry-run` (không cần model) để kiểm scaffold; đã chạy thật trên ckpt throwaway (M=3→7 giảm đúng).
+- **Test:** `tests/test_eval_grid.py` (metadata, grid rows + monotone, CSV) — xanh (skip nếu thiếu `data/ood`).
+
+**Còn lại (cần checkpoint train đầy đủ):** chạy thật trên toàn `data/ood`; thêm **baseline (EA/ACO/ILS/LP)**
+cùng `(M, variant)` rồi đẩy vào `gap_summary`/`pairwise_wilcoxon`/`friedman` (TODO đánh dấu trong script).
 
 ---
 
