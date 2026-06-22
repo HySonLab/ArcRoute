@@ -4,6 +4,7 @@ import argparse
 from env.env import CARPEnv
 from policy.policy import AttentionModelPolicy
 from rl.ppo import PPO
+from rl.grpo import GRPO
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
