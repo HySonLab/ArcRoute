@@ -16,6 +16,7 @@ class CARPEnv:
         variant= 'P',
         sizes=None,
         obj_weights=None,
+        reward_mode='scalar',
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -24,6 +25,10 @@ class CARPEnv:
         self.num_arc = num_arc
         self.num_vehicle = num_vehicle
         self.variant = variant
+        # D2 Phase 2: 'scalar' (default) keeps the old -(T . w) reward byte-identical;
+        # 'vector' returns the raw (B,3) T-vector so the GRPO path (Phase 3) can rank
+        # the K samples lexicographically instead of scalarizing.
+        self.reward_mode = reward_mode
         # Phase 6: if `sizes` (list of (num_loc, num_arc)) is given, train over a
         # size LADDER (bucketed so each batch stays single-size). Else single-size.
         self.sizes = sizes
@@ -151,7 +156,11 @@ class CARPEnv:
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
         rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10,
-                          local_search=False, return_torch=True, variant=self.variant)
+                          local_search=False, return_torch=True, variant=self.variant)  # (B,3) T-vector
+        if self.reward_mode == 'vector':
+            # GRPO path: hand the raw (B,3) T-vector (T positive, lower=better) to
+            # the caller, which ranks the K samples lexicographically (Phase 3).
+            return rs.to(td.device)
         # Hierarchical scalar reward = -(T . w): optimise T_1 first (w_1 >> w_2 >>
         # w_3), with T_2/T_3 breaking ties. Full T vector stays in get_objective.
         w = torch.tensor(self.obj_weights, dtype=rs.dtype, device=rs.device)
