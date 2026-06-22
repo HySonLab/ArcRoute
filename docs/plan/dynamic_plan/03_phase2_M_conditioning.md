@@ -1,68 +1,61 @@
-# Phase 2 — Policy "thấy" `M` (M-conditioning)
+# Phase 2 — ⏸ *(HOÃN)* M-conditioning (policy "thấy" `M`) — enhancement
 
-> Mục tiêu: đưa `M` (và số route còn lại) thành **input của policy** để model **chủ động** lập lịch theo số
-> xe, thay vì chỉ bị env chặn thụ động (Phase 1). Phụ thuộc Phase 1. Code: `env/env.py`, `policy/context.py`.
+> **TRẠNG THÁI: HOÃN — không nằm trên critical path.** Headline dùng **policy M-agnostic** (Scheduler lo M,
+> Phase 1). Phase này là **enhancement làm SAU**: cho policy *thấy* M để **tỉa chuỗi arc theo M** (thay vì
+> để Scheduler tự xoay), kỳ vọng chất lượng mỗi-M tốt hơn. **Giữ trong plan để implement về sau**, kèm
+> **ablation** chứng minh giá trị gia tăng so với M-agnostic. Phụ thuộc Phase 1 + 3. Code: `policy/context.py`,
+> critic.
 
-## 2.1 — Truyền `M` vào `td_reset` (mắt xích còn thiếu)
+## Vì sao hoãn (không bỏ)
 
-**File:** `env/env.py:reset`
+- M-agnostic đã cho **1 model chạy mọi M** ("train once") — đủ cho headline.
+- M-conditioning **có thể** tốt hơn vì policy tỉa thứ tự/độ-lớn chuyến theo M, nhưng:
+  - thêm chi phí: train phải **quét M trong input**, critic cũng phải M-aware;
+  - giá trị **chưa chắc lớn** nếu Scheduler đã tốt → cần **đo bằng ablation** mới biết đáng làm.
+- ⇒ Làm sau khi có baseline M-agnostic (Phase 3) để **so sánh sòng phẳng**.
 
-⚠️ Hiện `reset` **KHÔNG đưa `num_vehicle` vào `td_reset`** (chỉ giữ demand/clss/service/traversal/adj/
-visited/used_capacity/...). `generate()` có tạo `num_vehicle` nhưng `reset` bỏ. ⇒ Policy không có đường
-nào thấy M.
+## 2.1 — Khi implement: truyền M vào policy
 
-Cần: thêm vào `td_reset`:
-- `"num_vehicle"`: M (broadcast theo batch).
-- `"routes_left"`: `M - routes_used` (cập nhật mỗi step trong `step`) — tín hiệu **động** hữu ích hơn M tĩnh.
+**File:** `env/env.py:reset` — `num_vehicle` đã có trong `td` (Phase 1). Tùy chọn thêm `trips_opened` (số
+chuyến đã mở) làm soft-signal động.
 
-## 2.2 — Thêm M vào context của policy
+## 2.2 — Context của policy
 
-**File:** `policy/context.py:ARPContext`
-
-Hiện `project_context = Linear(embed_dim + 1, embed_dim)`, với `+1` = `state_embedding`
-(`vehicle_capacity − used_capacity`). Mở rộng:
-- Nối thêm **`routes_left`** (và/hoặc `M` chuẩn hóa) vào context → `Linear(embed_dim + 2, embed_dim)`
-  (hoặc +3 nếu thêm M).
-- Chuẩn hóa M (vd `M/10`) để scale ổn định.
+**File:** `policy/context.py:ARPContext` — hiện `Linear(embed_dim + 1, embed_dim)` (`+1` = `cap − used_cap`).
+Nối thêm **`M` chuẩn hóa** (vd `M/10`) → `Linear(embed_dim + 2, embed_dim)`:
 
 ```python
-# phác (đọc lại code quanh đó):
-state = td["vehicle_capacity"] - td["used_capacity"]          # (B,1)
-routes_left = td["routes_left"] / td["num_vehicle"]           # (B,1) tỉ lệ còn lại
-context = torch.cat([cur_node_embedding, state, routes_left], -1)
-return self.project_context(context)   # Linear(embed_dim + 2, embed_dim)
+state  = td["vehicle_capacity"] - td["used_capacity"]   # (B,1)
+m_feat = td["num_vehicle"] / 10.0                        # (B,1)
+context = torch.cat([cur_node_embedding, state, m_feat], -1)
+return self.project_context(context)                     # Linear(embed_dim + 2 → embed_dim)
 ```
 
-> Lựa chọn thiết kế: đưa M ở **context (động, mỗi bước)** tốt hơn ở init-embedding (tĩnh), vì quyết định
-> "có nên mở route mới không" phụ thuộc **số route còn lại tại thời điểm decode**.
+## 2.3 — ⚠️ Critic cũng phải thấy M
 
-## 2.3 — (Không bắt buộc) M ở init-embedding
+Reward phụ thuộc M (qua Scheduler) ⇒ value baseline `V_φ` phải **M-conditioned**, nếu không advantage
+`reward − value` bị nhiễu (baseline trung bình hóa qua M). **Nối M vào critic** y như context.
 
-Có thể thêm M như global feature ở `policy/init.py` (broadcast vào mọi node) nếu muốn encoder cũng biết M.
-Thường **không cần** — context đã đủ. Để lại như nice-to-have.
+## 2.4 — (Không bắt buộc) M ở init-embedding
+
+Thêm M như global feature ở `policy/init.py` nếu muốn encoder cũng biết M. Thường không cần.
 
 ---
 
-## ✅ Cổng test Phase 2
+## ✅ Cổng test Phase 2 (khi implement)
 
-1. **`td_reset` có M:** sau `env.reset`, `td["num_vehicle"]` và `td["routes_left"]` tồn tại, đúng giá trị.
-2. **`routes_left` giảm dần:** qua các step, `routes_left` giảm khi mở route mới, ≥ 0.
-3. **Context ăn M (shape):** `ARPContext.forward` chạy với chiều mới; output `(B, embed_dim)` đúng.
-4. **⭐ Output ĐỔI theo M:** cùng instance + cùng seed, chạy policy với M=3 vs M=7 → phân phối action
-   (logits) **khác nhau** (chứng minh M thực sự ảnh hưởng, không bị bỏ qua).
-5. **Gradient chảy tới context-M:** `loss.backward` → tham số `project_context` có grad.
-6. **⭐ Rollout smoke:** reset→policy→reward→backward ở M=3 và M=7, reward finite.
+1. **`td_reset` có M** (đã từ Phase 1); (nếu làm) `trips_opened` tăng ≥0.
+2. **Context + critic ăn M (shape):** forward chạy với chiều mới, output đúng.
+3. **⭐ Output ĐỔI theo M:** cùng instance/seed, M=3 vs M=7 → logits khác (ở variant P).
+4. **Gradient tới context-M + critic-M.**
+5. **⭐ Rollout smoke** ở `M∈{2,3,7}` × `{P,U}`, reward finite.
+6. **⭐ Ablation:** model M-conditioned vs M-agnostic trên cùng test grid → báo cáo chênh lệch (giá trị của
+   enhancement). Nếu không thắng đáng kể → ghi nhận M-agnostic là đủ.
 
-### Lệnh
-```bash
-uv run python -m unittest discover -s tests -p "test_*.py" -v
-```
+### Checklist (khi implement)
+- [ ] `ARPContext` + **critic** nối `M` chuẩn hóa; `Linear` đổi in-dim.
+- [ ] Train quét M trong input; test output-đổi-theo-M, gradient, rollout smoke `{P,U}`.
+- [ ] **Ablation M-cond vs M-agnostic** → bảng so sánh.
+- [ ] `unittest discover` xanh; commit "Dynamic Phase 2 (enhancement): M-conditioning + ablation".
 
-### Checklist
-- [ ] `env.reset` truyền `num_vehicle` + `routes_left` vào `td_reset`; `step` cập nhật `routes_left`.
-- [ ] `ARPContext` nối M/`routes_left`; `Linear` đổi in-dim tương ứng.
-- [ ] Test: M trong td, routes_left giảm, context shape, **output đổi theo M**, gradient, rollout smoke — xanh.
-- [ ] `unittest discover` xanh (không vỡ test cũ).
-- [ ] Commit "Dynamic Phase 2: policy M-conditioning (reset truyền M + context feature)".
-
-> Sau phase này M đã là input thật. Phase 3 train để model **dùng tốt** M tùy ý.
+> Ghi chú: đây là **TODO hoãn lại** — critical path headline là `0 → 1 → 3 → 5` (M-agnostic).

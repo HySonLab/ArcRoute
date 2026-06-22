@@ -1,0 +1,180 @@
+"""Phase 1 gate tests for common.scheduler.Scheduler (M-agnostic policy + Φ)
+and the calc_reward -> Scheduler rewire, incl. an integration rollout smoke.
+
+Run: uv run python -m unittest tests.test_scheduler -v
+"""
+import unittest
+
+import numpy as np
+import torch
+
+from common.scheduler import Scheduler
+
+
+# ----------------------------------------------------------------- fixtures
+def toy_instance(n=12, demand_each=0.24):
+    """Single-instance td: depot 0 + n small required arcs (Σdemand≈2.88 -> k_min=3).
+    Small arcs so the capacity-balanced re-split lands ~K segments smoothly."""
+    clss = torch.tensor([0] + [1, 2, 3] * (n // 3), dtype=torch.int64)
+    service_times = torch.tensor([0.0] + [1.0] * n)
+    idx = torch.arange(n + 1, dtype=torch.float64)
+    adj = (idx[:, None] - idx[None, :]).abs() * 0.3            # (n+1, n+1)
+    demand = torch.tensor([0.0] + [demand_each] * n)
+    return {
+        "clss": clss,
+        "service_times": service_times,
+        "adj": adj,
+        "demand": demand,
+        "vehicle_capacity": torch.tensor([1.0]),
+    }
+
+
+# arc order 1..n, with depot 0s interleaved (must be IGNORED by the Scheduler).
+def order_action(n=12):
+    seq = []
+    for i in range(1, n + 1):
+        seq.append(i)
+        if i % 3 == 0:
+            seq.append(0)
+    return np.array(seq, dtype=np.int64)
+
+
+def parallel_ref(segments, td, pos_val=(1, 2, 3)):
+    """Independent reference: classic single-trip parallel makespan per class
+    (each segment its own vehicle, starting at t=0)."""
+    per = {p: [0.0] for p in pos_val}
+    for seg in segments:
+        path = np.concatenate(([0], np.asarray(seg, dtype=np.int64), [0]))
+        service = td["service_times"][path].to(torch.float64)
+        travel = td["adj"][path[:-1], path[1:]].to(torch.float64)
+        t = service.clone()
+        t[1:] = t[1:] + travel
+        cum = torch.cumsum(t, dim=0)
+        for i, arc in enumerate(seg.tolist()):
+            c = int(td["clss"][arc])
+            if c in per:
+                per[c].append(float(cum[i + 1]))
+    return np.array([max(per[p]) for p in pos_val], dtype=np.float64)
+
+
+def n_trips(vehicles):
+    return sum(len(v) for v in vehicles)
+
+
+class TestScheduler(unittest.TestCase):
+    def setUp(self):
+        self.td = toy_instance()
+        self.action = order_action()
+
+    # accounting reduces to the classic parallel formula when 1 trip / vehicle.
+    def test_accounting_matches_parallel_reference(self):
+        sched = Scheduler()
+        for M in (3, 6, 12):                       # M >= k_min -> all parallel
+            segs = sched._segment(self.action, self.td, M)
+            _, T = sched(self.action, self.td, M=M)
+            np.testing.assert_allclose(T, parallel_ref(segs, self.td), atol=1e-9)
+
+    # re-split ignores the policy's 0s and respects the hard capacity cap.
+    def test_resplit_feasible_and_ignores_depot(self):
+        sched = Scheduler()
+        segs = sched._segment(self.action, self.td, M=5)
+        dem = self.td["demand"]
+        for seg in segs:
+            self.assertLessEqual(float(dem[seg].sum()), 1.0 + 1e-9)
+        # all 12 arcs present exactly once (0s dropped)
+        self.assertEqual(sorted(int(a) for s in segs for a in s), list(range(1, 13)))
+
+    # ⭐ M matters: more vehicles -> more (smaller) segments -> lower T_1.
+    def test_M_matters_more_vehicles_lower_makespan(self):
+        sched = Scheduler()
+        v3, T3 = sched(self.action, self.td, M=3)
+        v6, T6 = sched(self.action, self.td, M=6)
+        self.assertGreater(n_trips(v6), n_trips(v3))      # uses more vehicles
+        self.assertGreaterEqual(T3[0] + 1e-9, T6[0])      # makespan не increases
+
+    # ⭐ M=2 < k_min=3: multi-trip (3 segments on 2 vehicles), feasible & finite.
+    def test_m2_multitrip(self):
+        sched = Scheduler()
+        vehicles, T = sched(self.action, self.td, M=2)
+        self.assertEqual(len(vehicles), 2)
+        self.assertEqual(n_trips(vehicles), 3)            # k_min segments kept
+        self.assertTrue(any(len(v) >= 2 for v in vehicles))  # one vehicle reloads
+        self.assertTrue(np.all(np.isfinite(T)))
+        _, Tpar = sched(self.action, self.td, M=3)        # 3 parallel
+        self.assertGreaterEqual(T[0] + 1e-9, Tpar[0])     # stacking >= parallel
+
+    def test_monotonic_in_M(self):
+        sched = Scheduler()
+        ts = [sched(self.action, self.td, M=m)[1][0] for m in (1, 2, 3, 6)]
+        for a, b in zip(ts, ts[1:]):
+            self.assertGreaterEqual(a + 1e-9, b)
+
+    def test_deterministic(self):
+        sched = Scheduler()
+        a = sched(self.action, self.td, M=2)[1]
+        b = sched(self.action, self.td, M=2)[1]
+        np.testing.assert_array_equal(a, b)
+
+    def test_variants_run(self):
+        for variant in ("P", "U"):
+            _, T = Scheduler(variant=variant)(self.action, self.td, M=2)
+            self.assertEqual(T.shape, (3,))
+            self.assertTrue(np.all(np.isfinite(T)))
+
+    def test_empty_class_is_zero(self):
+        td = toy_instance()
+        td["clss"] = torch.tensor([0] + [1] * 12, dtype=torch.int64)  # only class 1
+        _, T = Scheduler()(self.action, td, M=3)
+        self.assertAlmostEqual(T[1], 0.0)
+        self.assertAlmostEqual(T[2], 0.0)
+
+    def test_reads_M_from_td(self):
+        td = toy_instance()
+        td["num_vehicle"] = torch.tensor([2])
+        _, T = Scheduler()(self.action, td)
+        self.assertTrue(np.all(np.isfinite(T)))
+
+    # calc_reward now delegates to the Scheduler (reads td['num_vehicle']).
+    def test_calc_reward_delegates(self):
+        from common.cal_reward import calc_reward
+        td = toy_instance()
+        td["num_vehicle"] = torch.tensor([3])
+        rs = calc_reward(self.action, td, return_numpy=True)
+        _, T = Scheduler()(self.action, td, M=3)
+        np.testing.assert_allclose(rs.astype(np.float64), T, atol=1e-9)
+
+
+class TestRolloutSmoke(unittest.TestCase):
+    """⭐ env.reset -> policy(M-agnostic) -> Scheduler reward -> backward,
+    across M and variants. reward finite, gradients finite."""
+
+    def _run(self, M, variant):
+        from env.env import CARPEnv
+        from env.generator import generate_dataset
+        from policy.policy import AttentionModelPolicy
+
+        torch.manual_seed(0)
+        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=M, variant=variant)
+        # get_reward's run_parallel uses num_epochs=10 -> batch must be >= 10.
+        batch = generate_dataset(12, 15, 15, M, num_workers=0)
+        td = env.reset(batch)
+        self.assertIn("num_vehicle", td.keys())
+        policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
+        out = policy(td.clone(), env, phase="train")
+        reward = out["reward"]
+        self.assertTrue(torch.isfinite(reward).all())
+        loss = -out["log_likelihood"].sum()
+        loss.backward()
+        grads = [p.grad for p in policy.parameters() if p.grad is not None]
+        self.assertTrue(len(grads) > 0)
+        self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+
+    def test_rollout_smoke_grid(self):
+        for M in (2, 3, 7):
+            for variant in ("P", "U"):
+                with self.subTest(M=M, variant=variant):
+                    self._run(M, variant)
+
+
+if __name__ == "__main__":
+    unittest.main()

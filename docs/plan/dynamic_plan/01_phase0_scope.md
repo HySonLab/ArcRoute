@@ -1,49 +1,68 @@
-# Phase 0 — Chốt ngữ nghĩa `M` (quyết định, code sau)
+# Phase 0 — Ngữ nghĩa `M` (CHỐT: policy M-agnostic + Scheduler tách riêng)
 
-> Mục tiêu: trả lời dứt khoát **"M nghĩa là gì"** trước khi sửa env/policy. Sai ở đây thì Phase 1–3 vô nghĩa.
-> Không có code; output là **quyết định ghi vào plan + comment**. Tham chiếu `dynamic.md §2.2`, `00_overview`.
+> Mục tiêu: chốt **"M nghĩa là gì"** và **kiến trúc** trước khi sửa code. Tham chiếu `dynamic.md §2.2`,
+> [`00_overview`](00_overview.md), và paper `../HDCARP_with_ML/main.tex`.
 
-## 0.1 — 3 câu hỏi phải chốt
+## 0.1 — Kiến trúc đã chốt: M-agnostic policy + Scheduler
 
-### Q1. M là ràng buộc cứng hay chỉ report?
-- `cal_reward` hiện **không cap** số route → policy được dùng route tùy ý (chỉ bị capacity chặn dưới ~3).
-- Vì makespan **giảm khi nhiều route song song hơn**, nếu không cap M thì policy luôn muốn tách tối đa →
-  bài toán dễ đi & **không phải HDCARP đúng**.
-- **Khuyến nghị:** M là **ràng buộc cứng** = "tối đa M route song song". ⇒ phải cap (Phase 1).
+**Tách 2 thành phần** (khớp notation paper: policy dựng chuỗi `α`, toán tử `Φ` map ra solution `S`):
 
-### Q2. Dải M khả thi? (vì capacity chặn ≥3 route)
-`Σ(demand) ≈ 3`, cap route = 1 ⇒ cần **≥3 route**. Chọn 1 trong 3:
-- **(A) Dải `M ∈ {3,5,7,10}`** (bỏ 1,2). Đơn giản nhất, đúng capacity hiện tại. **Khuyến nghị.**
-- **(B) Multi-trip:** 1 xe về depot nạp lại → chạy nhiều chuyến. M=1,2 khả thi nhưng **đổi mô hình
-  makespan** (chuyến tuần tự trên 1 xe) + sửa `cal_reward` nặng. Cân nhắc kỹ.
-- **(C) Scale `C` theo M** (`C=Σq/M+0.5`) → **đổi F5 = out-of-scope** (data.md). KHÔNG khuyến nghị.
+1. **Policy `π_θ`** (encoder/decoder): dựng **một chuỗi arc theo ưu tiên**, **KHÔNG thấy M** → 1 model cho
+   mọi M ("train once").
+2. **Scheduler `Φ`** (module riêng): `(α, M) → routes của M xe` + mục tiêu phân cấp `(T_1,…,T_p)`. **M chỉ
+   vào đây.**
 
-> Lưu ý: data đã sinh với M nominal=3, instance **M-independent**. Đổi dải M chỉ là tham số eval/train,
-> KHÔNG sinh lại data — TRỪ KHI chọn (C) (đổi C = đổi instance = phải sinh lại).
+→ Headline đóng góp: **decouple construction (policy, M-agnostic) khỏi assignment/evaluation (Scheduler,
+M-aware)**; đổi M = chạy lại `Φ`, không train lại.
 
-### Q3. "M route" map vào action thế nào?
-- Action là 1 chuỗi, `0` = về depot, đoạn giữa 2 số `0` = 1 route (`cal_reward.action_to_tours`).
-- Cap M = **chặn mở route thứ M+1** (số lần rời depot tới customer ≤ M).
-- Chốt: makespan tính trên **đúng ≤ M tour song song**.
+**M-conditioning** (policy thấy M) = **enhancement HOÃN** → [Phase 2](03_phase2_M_conditioning.md), làm sau,
+có ablation. Giữ trong plan để implement về sau.
 
-## 0.2 — Quyết định mặc định (đề xuất)
+## 0.2 — ✅ ĐÃ CHỐT: `Q = Σq/3 + 0.5` (theo paper gốc Ha 2024) + Scheduler **multi-trip**
 
-| Câu | Chốt mặc định |
+**Nguồn chuẩn — Ha 2024 (`papers/2024_Ha_HDCARP_matheuristic.pdf`, tr.18):**
+> *"There are **three** homogeneous vehicles with capacity `Q = Σ_{a∈A_r} q_a/3 + 0.5`."*
+
+⇒ `Q = (Σq_a)/3 + 0.5` — **+0.5 MỘT lần**; số "3" = **số xe**. Đây là calib **KHÍT** (đo thực tế: Σdemand
+chuẩn hoá = **2.87**, #route tối thiểu = **3**). **Code `generator.py:102` đang ĐÚNG** → **không đổi code**.
+
+> ⚠️ **TYPO trong bản nháp** `HDCARP_with_ML/main.tex:632` viết `Σ_a(q_a/3 + 0.5)` (per-arc → hoá "lỏng").
+> **Phải sửa nháp về `Σq/3 + 0.5`** (một lần) cho khớp paper gốc + code.
+
+**Hệ quả: Q khít → pure-evaluator KHÔNG làm được M=2** (2 route × Q < Σq). ⇒ **Scheduler chạy chế độ
+multi-trip**, **tự suy biến về single-trip-evaluator khi K≤M** (tức M≥3):
+
+| M | #trip tối thiểu (Q khít) | Scheduler | = evaluator? |
+|---|---|---|---|
+| **2** | 3 | gán 3 trip → 2 xe (1 xe 2 trip) | ❌ multi-trip |
+| **3** | 3 | 3 trip → 3 xe (1-1) | ✅ |
+| **5,7,10** | 3 | chia order → M segment → M xe | ✅ |
+
+> **`Q` CỐ ĐỊNH (`/3`, không theo M) ⇒ policy rollout độc lập M ⇒ rollout một lần, Scheduler chia/gán cho
+> mọi M, KHÔNG rollout lại** — *"train once, M là eval-time param"* ở dạng sạch nhất. M=2 = gán 3 trip lên 2 xe.
+
+## 0.3 — Câu hỏi phụ đã chốt
+
+| Câu | Chốt |
 |---|---|
-| Q1 | M là **ràng buộc cứng** (cap ≤ M route song song) |
-| Q2 | **(A)** dải `M ∈ {3,5,7,10}` |
-| Q3 | route = đoạn depot-to-depot; cap = chặn route thứ M+1 |
+| M là ràng buộc cứng hay report? | **Cứng**, thực thi trong **Scheduler** (không cap mask của policy) |
+| Map action → solution | chuỗi α → `Φ` → routes của M xe; `T_k` = max completion time mỗi lớp (paper) |
+| Variant | mặc định **P**; test lặp **U**. P/U ảnh hưởng **Scheduler** (precedence vs hierarchy-level) |
+| `p` (số lớp) | giữ **3** |
 
-> Nếu cần báo cáo `M∈{2,5}` như HRDA cũ: M=2 infeasible với C hiện tại → buộc chọn (B) multi-trip hoặc
-> chấp nhận chỉ báo cáo M≥3. **Ghi rõ trong paper.**
+## 0.4 — Xoá giả định cũ (deprecated)
+
+- ❌ Bỏ ý tưởng cap số route bằng mask + `routes_used` (Hướng A mask-cap — không code).
+- ✅ Giữ "cần ~3 route" (do `Q = Σq/3` khít, **đúng paper gốc**) — đây là lý do Scheduler phải multi-trip cho M=2.
 
 ---
 
-## ✅ Cổng Phase 0 (quyết định, không phải test code)
+## ✅ Cổng Phase 0 (quyết định)
 
-- [ ] Ghi quyết định Q1/Q2/Q3 vào file này + 1 dòng trong `cal_reward.py`/`env.py` (comment).
-- [ ] Xác nhận dải M chốt **không kéo theo sinh lại data** (nếu chọn A/B); nếu (C) → quay lại data_plan.
-- [ ] Cập nhật `eval/stats.py`/báo cáo: chỉ tổng hợp M trong dải khả thi.
-- [ ] (không có unittest cho phase này — nhưng Phase 1 sẽ test feasibility theo quyết định ở đây.)
+- [x] Chốt **M-agnostic policy + Scheduler tách module**; M-conditioning hoãn (Phase 2).
+- [x] **Chốt calib `Q = Σq/3 + 0.5`** (paper gốc Ha 2024 — **không đổi code**); Scheduler **mode multi-trip**.
+- [ ] **Sửa TYPO bản nháp** `HDCARP_with_ML/main.tex:632`: `Σ_a(q_a/3+0.5)` → `Σq/3 + 0.5`.
+- [ ] Ghi 1 dòng comment ở `common/scheduler.py` ("M-agnostic policy + multi-trip Φ; Q=Σq/3 cố định").
+- [ ] Xác nhận **không sinh lại data, không đổi `Q` trong code** (code đã đúng).
 
 > Sau khi chốt → sang [`02_phase1_M_constraint.md`](02_phase1_M_constraint.md).

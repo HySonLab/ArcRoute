@@ -14,13 +14,17 @@
 
 | Trục | Cách | Nguồn |
 |---|---|---|
-| **Fleet M** | mỗi instance giải dưới `M∈{3,5,7,10}` (override) | `--M` / `import_instance(M=)` |
+| **Fleet M** | mỗi instance giải dưới `M∈{3,5,7,10}` (override; **thêm M=2** theo calib đã chốt) | `--M` / `import_instance(M=)` |
 | **Size** | break-down theo `\|A_r\|` (size ladder) | metadata `n_req` |
 | **Density d** | break-down theo `d` | metadata `d` |
 | **Topology** | in-dist (unit_square) vs OOD (cluster/osm) | metadata `topology` |
+| **Variant** | **`P` (mặc định, báo cáo chính)**; `U` để so sánh | `--variant` |
 
-- **RL vs baselines** (EA/ACO/ILS/LP) trên cùng grid + cùng M → Wilcoxon/Friedman.
-- **Model đa-M vs model-mỗi-M** (nếu train ở Phase 3.2) → giá trị của M-conditioning.
+- **RL vs baselines** (EA/ACO/ILS/LP) trên cùng grid + cùng M **+ cùng variant** → Wilcoxon/Friedman.
+  ⚠️ Baseline default lệch (`aco/ea`→`U`, `ils/lp/rl_hyb`→`P`); **ép tất cả về `--variant P`** khi so sánh.
+- **Ablation headline:** 1 model **M-agnostic** (train once) vs **model-mỗi-M** vs **M-conditioned** (Phase 2,
+  nếu đã implement) trên cùng grid → chứng minh M-agnostic + Scheduler là đủ tốt.
+- **Ablation Scheduler** (nếu muốn): greedy vs LPT vs optimal-assignment `Φ` → tách đóng góp của Scheduler.
 - **τ theo M** (report-time, data_plan Phase 5) để mô tả độ khó từng cấu hình.
 
 ## 5.3 — Script
@@ -34,7 +38,8 @@
 ## ✅ Cổng test Phase 5
 
 1. **Eval chạy cùng instance đa M:** 1 file, `M∈{3,5,7,10}` → 4 kết quả; **makespan giảm (hoặc không tăng)
-   khi M tăng** (nhiều xe → song song hơn). Đây là sanity check ngữ nghĩa M.
+   khi M tăng** (nhiều xe → song song/ít chuyến nối tiếp hơn). Scheduler khiến tính đơn điệu này gần như
+   **cấu trúc** (cùng chuỗi α, M lớn hơn chỉ nới phân bổ) — vẫn report, không assert cứng.
 2. **Break-down đúng trục:** group theo `n_req/d/topology` từ metadata khớp số file.
 3. **Stats hợp lệ:** `eval/stats.py` trên kết quả thật → p-value∈[0,1], gap-to-BKS dấu đúng (đã có test ở
    `tests/test_stats.py`).
@@ -49,8 +54,8 @@ uv run python eval/stats.py --tightness data/ood/unit_square
 ```
 
 ### Checklist
-- [ ] Eval loop `(file × M)` dùng `--M` override; thu makespan per class.
-- [ ] Break-down theo size/d/topology; bảng RL vs baselines.
+- [ ] Eval loop `(file × M)` dùng `--M` override; thu makespan per class. **Variant mặc định `P`.**
+- [ ] Break-down theo size/d/topology **(× variant)**; bảng RL vs baselines **ép cùng `--variant P`**.
 - [ ] `eval/stats.py`: Wilcoxon/Friedman/gap-to-BKS theo trục.
 - [ ] Sanity: makespan đơn điệu theo M; report generalization gap in-dist vs OOD.
 - [ ] `unittest discover` xanh.

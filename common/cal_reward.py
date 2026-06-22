@@ -19,20 +19,22 @@ def action_to_tours(action):
     return padded
 
 def calc_reward(action, td, pos_val=[1,2,3], **kwargs):
-    tours = action_to_tours(action)
-    prior = td['clss'][tours]
-    total_time = td['service_times'][tours]
-    shortest_traversal_time = td['adj'][tours[:, :-1], tours[:, 1:]]
-    total_time[:, 1:] += shortest_traversal_time
-    total_time = torch.cumsum(total_time, dim=1)
+    """Hierarchical completion times (T_1,...,T_p) for one instance.
+
+    Delegates to the Scheduler Φ (dynamic_plan Phase 1): the M-agnostic policy
+    provides the arc ORDER `action`, the Scheduler partitions it into the routes
+    of M vehicles (multi-trip when needed) and computes the T_k. M is read from
+    td['num_vehicle']; falls back to k_min (capacity-minimum, parallel) if absent.
+    """
+    from common.scheduler import Scheduler  # local import to avoid cycles
+    sched = Scheduler(variant=kwargs.get("variant", "P"), pos_val=tuple(pos_val))
+    M = kwargs.get("M", None)
+    if M is None and "num_vehicle" in td:
+        M = int(td["num_vehicle"])
+    _, T = sched(action, td, M=M)  # M=None -> Scheduler uses k_min (parallel)
+    rs = [float(x) for x in T]
     # if kwargs.get("local_search", False):
     #     tours = lsRL(td, tours)
-    rs = []
-    for p in pos_val:
-        pos = torch.nonzero(prior == p, as_tuple=True)
-        if len(pos[0]) == 0:
-            pos = [[0], [0]]
-        rs.append(total_time[pos].max())
     if kwargs.get("return_list", False):
         return rs
     if kwargs.get("return_numpy", False):

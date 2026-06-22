@@ -92,6 +92,9 @@ class CARPEnv:
                 'service_times': td["service_times"],
                 'traversal_times': td["traversal_times"],
                 'adj': td["adj"],
+                # M-agnostic policy doesn't read this; the Scheduler (calc_reward)
+                # does. Carry per-instance M as (B,1) so run_parallel slices it right.
+                "num_vehicle": torch.as_tensor(td["num_vehicle"]).reshape(batch_size, 1),
                 "done": torch.zeros(batch_size, td["service_times"].shape[1], dtype=torch.bool),
             },
             batch_size=batch_size,

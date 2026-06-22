@@ -1,69 +1,83 @@
-# Phase 1 — `M` thành ràng buộc THẬT (env + reward)
+# Phase 1 — Tách **`Scheduler`** thành module first-class (M chỉ vào đây)
 
-> Mục tiêu: làm `M` thực sự **giới hạn số route song song** (hiện no-op). Đây là nền tảng — phải xong
-> trước khi cho policy "thấy" M (Phase 2). Phụ thuộc Phase 0 (đã chốt cap ≤ M, dải `{3,5,7,10}`).
-> Tham chiếu `dynamic.md §2.2`; code: `env/env.py`, `common/cal_reward.py`.
+> Mục tiêu: đưa khâu "chuỗi action → routes của M xe → mục tiêu phân cấp `(T_1,…,T_p)`" ra thành **một module
+> độc lập `common/scheduler.py`** (hiện bị nhét trong `calc_reward`). Policy **M-agnostic** — không sửa
+> encoder/decoder/mask. Phụ thuộc Phase 0 (Q=Σq/3 khít, Scheduler multi-trip). Code: `common/scheduler.py`
+> (mới), `common/cal_reward.py` (mỏng lại). **`env/generator.py` KHÔNG đổi `Q`.**
 
-## 1.1 — Đếm & cap số route trong env
+## 1.1 — Hợp đồng (interface) của `Scheduler`
 
-**File:** `env/env.py`
+**File mới:** `common/scheduler.py`
 
-Hiện `step`/`reset` theo dõi `used_capacity`, `visited` nhưng **không đếm route**. `step` reset
-`used_capacity` về 0 khi về depot (`* (current_node != 0)`), nhưng số lần mở route **không bị chặn**.
+```python
+class Scheduler:
+    """Toán tử Φ: (chuỗi action, M) → solution + mục tiêu phân cấp.
+       M chỉ tham gia ở ĐÂY — policy hoàn toàn M-agnostic."""
+    def __init__(self, variant='P'):   # multi-trip; tự thành single-trip khi K≤M
+        ...
+    def __call__(self, action_seq, M, clss, service_times, adj) -> (routes, T_vec):
+        # routes: phân hoạch chuỗi thành các route của M xe
+        # T_vec : (T_1,…,T_p) — max completion time mỗi lớp (paper: §"The problem")
+        ...
+```
 
-Cần:
-1. Thêm state **`routes_used`** vào td (reset = 0). Tăng 1 mỗi khi **rời depot tới customer** (transition
-   `current_node==0 → action!=0`).
-2. Trong `get_action_mask`: khi `routes_used == M` và xe **đang ở depot**, **cấm đi tới customer mới**
-   (chỉ còn được phục vụ trong route hiện tại). Khi route hiện tại cũng hết chỗ → còn arc chưa phục vụ =
-   **infeasible** (xem 1.3).
-3. `M` lấy từ td (`num_vehicle`) — Phase 2 sẽ truyền vào `td_reset`; tạm thời đọc `self.num_vehicle`.
+- **Đầu vào** lấy từ `td` per-instance (qua `run_parallel` cắt `td[i]` như hiện tại). `M = td["num_vehicle"]`.
+- **Đầu ra** `T_vec` đúng định nghĩa paper: `T_k` = thời điểm mọi xe phục vụ xong arc lớp `k`.
+- **Tôn trọng P/U:** P enforce precedence; U dùng **hierarchy-level** (paper §problem) khi tính `T_k`.
 
-> ⚠️ Tinh tế: "mở route mới" = rời depot. Phải phân biệt depot-return (kết thúc route) với depot-departure
-> (mở route). Cap đếm trên **departure**.
+## 1.2 — Thuật toán `Φ`: multi-trip (tự suy biến single-trip khi K≤M)
 
-## 1.2 — Reward tính trên đúng ≤ M tour
+`Q = Σq/3` khít (Phase 0) ⇒ Scheduler **một mode duy nhất: multi-trip**, nhưng đường nhanh single-trip khi đủ xe.
+
+1. **Chia order** (chuỗi α của policy, bỏ qua các `0` policy tự chèn) thành **`K = max(M, ⌈Σdemand/Q⌉≈3)`
+   segment capacity-feasible** (mỗi segment ≤ Q). Vì Q khít, tối thiểu ~3 segment; với M≥3 chia đúng M segment.
+2. **Gán K segment → M xe:**
+   - **K ≤ M** (M≥3): mỗi segment 1 xe, **single-trip** (xe dư idle). ← đường nhanh "evaluator".
+   - **K > M** (vd M=2, K=3): **multi-trip** — gán bằng LPT + ưu tiên lớp, xe ≥2 segment chạy nối tiếp.
+3. **`T_k`** tính trên lịch (single-trip: song song; multi-trip: cộng nối tiếp), tôn trọng P (precedence) /
+   U (hierarchy-level) theo paper.
+
+> **Continuity:** K≤M → công thức = makespan song song cũ (≤1e-6). M=2 → 1 xe ôm 2 trip → makespan cao hơn,
+> không infeasible. **Không có vách deadlock.**
+
+## 1.3 — `calc_reward` mỏng lại + env/generator KHÔNG đổi
 
 **File:** `common/cal_reward.py`
+- `calc_reward` chỉ còn: gọi `Scheduler(...)` → `T_vec` → **scalarize** (RL reward = `−T_1`, giữ như
+  `env.get_reward` hiện tại; vector `T` đầy đủ cho eval `get_objective`).
 
-`calc_reward` + `action_to_tours` hiện tách tour theo số `0` — **bao nhiêu cũng nhận**. Sau khi env cap M,
-action hợp lệ sẽ có ≤ M tour, nên `cal_reward` **tự nhiên đúng** NẾU env chặn chuẩn. Nhưng cần:
-1. **Assert/guard:** số tour ≤ M; nếu >M (do mask lỗi) → raise hoặc phạt nặng (bắt bug sớm).
-2. Makespan song song giữ nguyên (max theo lớp qua các tour) — không đổi công thức.
+**File:** `env/env.py`
+- **KHÔNG đổi** `get_action_mask`/rollout (policy M-agnostic; capacity+depot+P mask giữ nguyên).
+- `reset` đưa `num_vehicle` (per-instance, tensor `(B,1)`) vào `td` để Scheduler đọc.
 
-## 1.3 — Xử lý infeasible (M quá nhỏ)
-
-Với dải `{3,5,7,10}` (Phase 0-A) thì M≥3 → luôn đủ chở (`Σdemand≈3`). Nhưng để **chắc chắn**:
-- Test feasibility: với M=3, tồn tại lời giải hợp lệ (mọi arc phục vụ, mỗi route ≤ cap, ≤ M route).
-- Nếu cho M<3 (không khuyến nghị) → env phải báo infeasible rõ ràng, không treo vòng lặp decode.
+**File:** `env/generator.py` — **KHÔNG đổi `Q`** (`Σq/3 + 0.5` đã đúng paper gốc). Chỉ Phase 3 sửa pick M
+per-instance (cho reward quét M), không liên quan capacity.
 
 ---
 
 ## ✅ Cổng test Phase 1
 
-**File test:** thêm `tests/test_env_fleet.py`.
+**File test:** `tests/test_scheduler.py` (test Scheduler **độc lập**, không cần rollout).
 
-1. **Cap số route:** chạy rollout với M=3 trên vài instance → **số tour ≤ 3** mọi lần
-   (`len(action_to_tours(actions)) <= M`).
-2. **M lớn cho phép nhiều route hơn:** M=7 → có instance dùng >3 tour (chứng tỏ cap nới theo M).
-3. **Feasibility M=3:** tồn tại rollout hợp lệ phục vụ hết arc, mỗi route ≤ cap.
-4. **Reward guard:** ép action có >M tour → `cal_reward` raise/phạt (không trả số "đẹp" sai).
-5. **Mask không khóa cứng:** action_mask tại depot khi `routes_used<M` vẫn cho mở route (không deadlock).
-6. **⭐ Rollout smoke (chống vỡ):** `env.reset → policy → reward → backward` vẫn chạy, reward finite
-   (như data_plan Phase 0). Chạy ở M=3 và M=7.
+1. **⭐ T_k đúng định nghĩa:** ví dụ tay (như Figure paper) → `Scheduler` trả `(T_1,T_2,T_3)` khớp.
+2. **⭐ Hierarchy-level P vs U:** cùng routes, variant P và U cho `T_k` khác đúng như paper mô tả.
+3. **⭐ Đơn điệu theo M:** cùng chuỗi α, `T_1(M)` **không tăng** khi M tăng.
+4. **⭐ Continuity (K≤M):** M≥3 → mỗi segment 1 xe → `T_vec` **bằng** makespan song song cũ (≤1e-6).
+5. **⭐ M=2 multi-trip:** Q khít → 3 trip → 2 xe; ví dụ tay khớp scheduler; **feasible, không deadlock**.
+6. **⭐ Rollout smoke (tích hợp):** `env.reset → policy(M-agnostic) → calc_reward(Scheduler) → backward`,
+   reward finite — ở **`M∈{2,3,5}` × variant `{P,U}`**.
 
 ### Lệnh
 ```bash
 uv run python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-### Checklist
-- [ ] `env`: state `routes_used`, tăng khi rời depot; `get_action_mask` cap ở M.
-- [ ] `cal_reward`: guard ≤ M tour; makespan song song giữ nguyên.
-- [ ] Feasibility M=3 OK; infeasible (M<3) báo rõ.
-- [ ] Test cap route, nới theo M, feasibility, reward-guard, no-deadlock, **rollout smoke** — xanh.
-- [ ] `unittest discover` xanh (gồm test data_plan cũ — không được vỡ).
-- [ ] Commit "Dynamic Phase 1: M là ràng buộc thật (cap route + reward theo M)".
+### Checklist — ✅ ĐÃ XONG
+- [x] `common/scheduler.py`: class `Scheduler` multi-trip; **`_segment` resplit** (chia order→max(M,k_min) segment capacity-feasible, **bỏ qua `0` của policy**), `_assign` LPT, `_completion_times` nối tiếp.
+- [x] `calc_reward` mỏng: delegate `Scheduler` → `−T_1`; `env/env.py:reset` đưa `num_vehicle (B,1)`. **Q code KHÔNG đổi.**
+- [x] `tests/test_scheduler.py` (11 test): accounting==parallel-ref, resplit feasible, **⭐ M matters** (nhiều xe→makespan giảm), M=2 multitrip, đơn điệu M, calc_reward delegate, **⭐ rollout-smoke `M∈{2,3,7}×{P,U}`** — xanh.
+- [x] `unittest discover` xanh — **76/76** (65 cũ không vỡ + 11 mới).
+- [ ] Commit "Dynamic Phase 1: Scheduler module (M-agnostic policy + Φ)".
 
-> Lưu ý: ở phase này policy **chưa thấy M** (vẫn chưa vào input) — M chỉ ràng buộc qua env/mask. Phase 2 mới
-> đưa M vào model để policy **chủ động** dùng đúng số xe.
+> Còn TODO (đánh dấu trong `scheduler.py`): `[hierarchy]` HDCARP-U dùng hierarchy-level cho `T_k`; `[assign]`
+> xếp thứ tự trip trong xe theo ưu tiên. Policy vẫn M-agnostic — cho thấy M = Phase 2 (hoãn).
