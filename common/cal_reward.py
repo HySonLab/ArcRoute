@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-from common.local_search import lsRL
 
 def action_to_tours(action):
     zero_indices = np.where(action == 0)[0]

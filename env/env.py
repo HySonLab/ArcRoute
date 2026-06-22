@@ -71,19 +71,13 @@ class CARPEnv:
 
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
         # For demand steps_dim is inserted by indexing with id, for used_capacity insert node dim for broadcasting
-        # print(td["demand"][:, None, :].shape, td["used_capacity"][..., None].shape, td["vehicle_capacity"][..., None].shape)
-        # exit()
         exceeds_cap = (
             td["demand"][..., 1:][:, None, :] + td["used_capacity"][..., None] > td["vehicle_capacity"][..., None]
         )
-        # print(exceeds_cap.shape)
-        # exit()
         # Nodes that cannot be visited are already visited or too much demand to be served now
         mask_loc = td["visited"][..., 1:].to(exceeds_cap.dtype) | exceeds_cap
         # Cannot visit the depot if just visited and still unserved nodes
         mask_depot = (td["current_node"] == 0) & ((mask_loc == 0).int().sum(-1) > 0)
-        # print(mask_loc.shape, mask_depot.shape)
-        # exit()
         if self.variant == 'P':
             # GLOBAL precedence (B+): serve ALL of the lowest unserved class before
             # any higher class -> the policy emits one coherent tour per class, and
