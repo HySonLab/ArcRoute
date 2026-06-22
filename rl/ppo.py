@@ -276,10 +276,10 @@ class PPO(LightningModule):
         return self.train_dataset
 
     def val_dataloader(self):
-        return self.train_dataset
+        return self.val_dataset      # held-out val (was train_dataset by mistake)
 
     def test_dataloader(self):
-        return self.train_dataset
+        return self.test_dataset     # held-out test (was train_dataset by mistake)
 
     def on_train_epoch_end(self):
         sch = self.lr_schedulers()
