@@ -50,6 +50,42 @@ class TestEvalGrid(unittest.TestCase):
             self.assertEqual(len(got), len(rows))
             self.assertIn("T1", got[0])
 
+    def test_algo_column_present(self):
+        """D2 Phase 6: rows carry an `algo` tag; base schema is preserved."""
+        from eval.run_grid import DryRunSolver, run_grid
+        rows = run_grid(DryRunSolver(), self.files[:2], [3], ["P"], num_sample=10,
+                        algo="grpo")
+        self.assertTrue(all(r["algo"] == "grpo" for r in rows))
+        for k in ("file", "M", "variant", "T1", "T2", "T3"):
+            self.assertIn(k, rows[0])
+
+    def test_yield_curve_monotone_in_K(self):
+        """⭐ best-of-K yield: one row per (file, K); DryRunSolver's T is constant
+        in K (no worsening) -> lex-best T_1 is non-increasing as K grows."""
+        from eval.run_grid import DryRunSolver, yield_curve
+        Ks = [1, 2, 4, 8]
+        rows = yield_curve(DryRunSolver(), self.files[:2], M=3, variant="P", Ks=Ks)
+        self.assertEqual(len(rows), len(self.files[:2]) * len(Ks))
+        by_file = {}
+        for r in rows:
+            by_file.setdefault(r["file"], {})[r["K"]] = r["T1"]
+        for fK in by_file.values():
+            seq = [fK[k] for k in Ks]
+            self.assertTrue(all(b <= a + 1e-9 for a, b in zip(seq, seq[1:])))
+
+    def test_paired_win_rate_zero_t1_regression(self):
+        """⭐ paired win-rate over the SAME grid; identical solver vs itself ->
+        all ties and zero T_1 regression."""
+        from eval.run_grid import DryRunSolver, run_grid, paired_win_rate
+        a = run_grid(DryRunSolver(), self.files[:3], [3, 5], ["P"], num_sample=10,
+                     algo="grpo")
+        b = run_grid(DryRunSolver(), self.files[:3], [3, 5], ["P"], num_sample=10,
+                     algo="ppo")
+        r = paired_win_rate(a, b)
+        self.assertEqual(r["n"], len(self.files[:3]) * 2)
+        self.assertEqual(r["t1_regression"], 0)
+        self.assertAlmostEqual(r["tie_rate"], 1.0)   # same synthetic T -> all ties
+
 
 if __name__ == "__main__":
     unittest.main()

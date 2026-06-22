@@ -78,6 +78,51 @@ def _rankdata(row):
 
 
 # --------------------------------------------------------------------------- #
+# D2 Phase 6: lexicographic (T_1, T_2, T_3) paired win-rate
+# --------------------------------------------------------------------------- #
+def _lex_le(a, b):
+    """True if T-vector a is lexicographically <= b on (T_1, T_2, T_3)."""
+    return tuple(float(x) for x in a) <= tuple(float(x) for x in b)
+
+
+def _lex_lt(a, b):
+    return tuple(float(x) for x in a) < tuple(float(x) for x in b)
+
+
+def win_rate(a, b):
+    """Paired lexicographic win-rate of A vs B over instances.
+
+    Args:
+        a, b: (N, 3) arrays of T-vectors (T_1, T_2, T_3), LOWER is better, one row
+              per instance, paired (same instance per row). The two solvers should
+              use the SAME selector (lex best-of-K) so only the learning signal
+              differs.
+
+    Returns dict:
+        win_rate   : fraction of instances where A is strictly lex-better than B
+        tie_rate   : fraction where A == B
+        loss_rate  : fraction where B is strictly lex-better
+        t1_regression: # instances where A's T_1 is WORSE (higher) than B's T_1
+                       (the hard invariant: must be 0 for "no T_1 regression")
+        n          : number of paired instances
+    """
+    a = np.asarray(a, dtype=float).reshape(-1, 3)
+    b = np.asarray(b, dtype=float).reshape(-1, 3)
+    assert a.shape == b.shape, f"shape mismatch {a.shape} vs {b.shape}"
+    n = a.shape[0]
+    wins = sum(1 for i in range(n) if _lex_lt(a[i], b[i]))
+    ties = sum(1 for i in range(n) if tuple(a[i]) == tuple(b[i]))
+    t1_reg = int((a[:, 0] > b[:, 0] + 1e-9).sum())
+    return {
+        "win_rate": wins / n if n else 0.0,
+        "tie_rate": ties / n if n else 0.0,
+        "loss_rate": (n - wins - ties) / n if n else 0.0,
+        "t1_regression": t1_reg,
+        "n": n,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Tightness reporting
 # --------------------------------------------------------------------------- #
 def tightness_from_dir(path):

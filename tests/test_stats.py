@@ -14,6 +14,7 @@ from eval.stats import (
     friedman,
     average_ranks,
     describe,
+    win_rate,
 )
 
 
@@ -70,6 +71,38 @@ class TestRanks(unittest.TestCase):
         self.assertAlmostEqual(ranks[0], 1.5)   # tie of first two -> (1+2)/2
         self.assertAlmostEqual(ranks[1], 1.5)
         self.assertAlmostEqual(ranks[2], 3.0)
+
+
+class TestWinRate(unittest.TestCase):
+    """D2 Phase 6: lexicographic paired win-rate + T_1 regression count."""
+
+    def test_win_rate_lexicographic_correct(self):
+        # A vs B per instance (T_1,T_2,T_3), lower better:
+        #  i0: A=[5,2,1] beats B=[5,2,9]   (lex win, T_1 tie)
+        #  i1: A=[5,2,9] loses to B=[5,2,1] (lex loss, T_1 tie)
+        #  i2: A=[3,0,0] == B=[3,0,0]       (tie)
+        a = np.array([[5, 2, 1], [5, 2, 9], [3, 0, 0]], dtype=float)
+        b = np.array([[5, 2, 9], [5, 2, 1], [3, 0, 0]], dtype=float)
+        r = win_rate(a, b)
+        self.assertEqual(r["n"], 3)
+        self.assertAlmostEqual(r["win_rate"], 1 / 3)
+        self.assertAlmostEqual(r["loss_rate"], 1 / 3)
+        self.assertAlmostEqual(r["tie_rate"], 1 / 3)
+        self.assertEqual(r["t1_regression"], 0)   # T_1 never worse
+
+    def test_t1_regression_counted(self):
+        # A's T_1 is HIGHER (worse) than B's on instance 0 -> 1 regression.
+        a = np.array([[6, 0, 0], [4, 0, 0]], dtype=float)
+        b = np.array([[5, 9, 9], [4, 9, 9]], dtype=float)
+        r = win_rate(a, b)
+        self.assertEqual(r["t1_regression"], 1)
+
+    def test_zero_t1_regression_when_t1_equal(self):
+        rng = np.random.RandomState(0)
+        t1 = rng.randint(1, 5, size=20)
+        a = np.column_stack([t1, rng.rand(20), rng.rand(20)])
+        b = np.column_stack([t1, rng.rand(20), rng.rand(20)])  # same T_1 column
+        self.assertEqual(win_rate(a, b)["t1_regression"], 0)
 
 
 class TestDescribe(unittest.TestCase):

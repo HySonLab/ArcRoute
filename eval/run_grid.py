@@ -128,7 +128,7 @@ class DryRunSolver:
 # --------------------------------------------------------------------------- #
 # Grid run + output
 # --------------------------------------------------------------------------- #
-def run_grid(solver, files, Ms, variants, num_sample):
+def run_grid(solver, files, Ms, variants, num_sample, algo="rl"):
     rows = []
     for f in files:
         meta = read_meta(f)
@@ -139,9 +139,29 @@ def run_grid(solver, files, Ms, variants, num_sample):
                 except Exception as e:                  # keep going; record failure
                     print(f"  ! {meta['file']} M={M} {variant}: {e}", file=sys.stderr)
                     continue
-                rows.append({**meta, "variant": variant, "M": int(M),
+                # D2 Phase 6: `algo` tags the learning signal (grpo/ppo) so a paired
+                # A/B win-rate can be computed across the SAME (file, M, variant) grid.
+                rows.append({**meta, "algo": algo, "variant": variant, "M": int(M),
                              "T1": float(T[0]), "T2": float(T[1]), "T3": float(T[2]),
                              "time_s": round(float(dt), 4)})
+    return rows
+
+
+def yield_curve(solver, files, M, variant, Ks):
+    """D2 Phase 6: best-of-K yield — for each K, the lex-best T over K samples.
+    Returns one row per (file, K). lex-best T is monotone non-worsening in K."""
+    rows = []
+    for f in files:
+        meta = read_meta(f)
+        for K in Ks:
+            try:
+                T, dt = solver.solve(f, M, variant, max(int(K), 10))
+            except Exception as e:
+                print(f"  ! {meta['file']} K={K}: {e}", file=sys.stderr)
+                continue
+            rows.append({**meta, "variant": variant, "M": int(M), "K": int(K),
+                         "T1": float(T[0]), "T2": float(T[1]), "T3": float(T[2]),
+                         "time_s": round(float(dt), 4)})
     return rows
 
 
@@ -150,10 +170,13 @@ def write_csv(rows, out):
         print("no rows to write", file=sys.stderr)
         return
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    fields = ["file", "topology", "n_req", "density", "tau",
-              "variant", "M", "T1", "T2", "T3", "time_s"]
+    # Union of base + optional (algo/K) columns; keep base order stable.
+    base = ["file", "topology", "n_req", "density", "tau",
+            "variant", "M", "T1", "T2", "T3", "time_s"]
+    extra = [k for k in ("algo", "K") if any(k in r for r in rows)]
+    fields = base[:6] + extra + base[6:]
     with open(out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     print(f"wrote {len(rows)} rows -> {out}")
@@ -195,6 +218,25 @@ def summarize(rows):
                 print(f"  {axis}={v}: n={st['n']} mean={st['mean']:.3f}")
 
 
+def paired_win_rate(rows_a, rows_b):
+    """D2 Phase 6: lexicographic win-rate of A vs B over the shared (file, M,
+    variant) grid (paired). Returns the eval.stats.win_rate dict; t1_regression
+    MUST be 0 (no T_1 regression invariant)."""
+    from eval.stats import win_rate
+
+    def key(r):
+        return (r["file"], int(r["M"]), r["variant"])
+
+    bmap = {key(r): r for r in rows_b}
+    A, B = [], []
+    for r in rows_a:
+        k = key(r)
+        if k in bmap:
+            A.append([r["T1"], r["T2"], r["T3"]])
+            B.append([bmap[k]["T1"], bmap[k]["T2"], bmap[k]["T3"]])
+    return win_rate(A, B)
+
+
 # --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 5 eval grid (RL over fleet M).")
@@ -207,6 +249,12 @@ def parse_args():
                    help="rollouts/instance; best by T_1 is kept (>=10)")
     p.add_argument("--limit", type=int, default=None, help="cap #files (quick runs)")
     p.add_argument("--out", type=str, default="eval/results.csv")
+    p.add_argument("--algo", type=str, default="rl",
+                   help="tag (grpo/ppo/...) written to the algo column for A/B")
+    p.add_argument("--yield_curve", action="store_true",
+                   help="best-of-K yield: sweep num_sample/K and record lex-best T")
+    p.add_argument("--Ks", type=str, default="1,2,4,8,16,32",
+                   help="K sweep for --yield_curve")
     p.add_argument("--dry-run", action="store_true",
                    help="no model: synthetic T to validate the scaffold")
     return p.parse_args()
@@ -228,7 +276,18 @@ def main():
             sys.exit("--ckpt is required (or use --dry-run)")
         solver = RLSolver(a.ckpt)
 
-    rows = run_grid(solver, files, Ms, variants, num_sample)
+    if a.yield_curve:
+        Ks = [int(x) for x in a.Ks.split(",")]
+        rows = yield_curve(solver, files, Ms[0], variants[0], Ks)
+        write_csv(rows, a.out)
+        print("\nbest-of-K yield (lex-best T per K; should not worsen as K grows):")
+        from eval.run_grid import _group
+        for K, kr in sorted(_group(rows, "K").items()):
+            st = describe([r["T1"] for r in kr])
+            print(f"  K={K:<3} n={st['n']} T1_mean={st['mean']:.3f}")
+        return
+
+    rows = run_grid(solver, files, Ms, variants, num_sample, algo=a.algo)
     write_csv(rows, a.out)
     summarize(rows)
     # TODO: RL-vs-baseline (EA/ACO/ILS/LP) under the SAME (M, variant) -> feed
