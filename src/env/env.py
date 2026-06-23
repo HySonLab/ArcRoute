@@ -3,9 +3,20 @@ import torch
 import numpy as np
 from env.generator import (CARPGenerator, MultiSizeCARPGenerator,
                            SizeBucketBatchSampler)
-from common.cal_reward import calc_reward
-from common.ops import gather_by_index, run_parallel
+from solvers.cal_reward import calc_reward
+from utils.ops import gather_by_index, run_parallel
 from torch.utils.data import DataLoader
+
+
+def reward_num_workers(n):
+    """Worker count for the reward/objective DataLoader, profiled on the Scheduler
+    (sub-millisecond numpy tasks). The old fixed `num_workers=24` was the WORST
+    choice at every batch size: forking 24 procs + pickling TensorDict slices costs
+    more than the compute. Below ~1k tasks inline (0 workers, main process) wins;
+    above it a modest pool (8) amortizes the fork overhead. Output is identical
+    regardless of worker count (DataLoader keeps order; calc_reward is pure)."""
+    return 0 if n < 1024 else 8
+
 
 class CARPEnv:
     def __init__(
@@ -143,13 +154,15 @@ class CARPEnv:
     def get_objective(self, td, actions, local_search=True):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
-        return run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10,
+        return run_parallel(calc_reward, actions, td,
+                            num_workers=reward_num_workers(len(actions)), num_epochs=10,
                             local_search=local_search, variant=self.variant)
 
     def get_reward(self, td, actions):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
-        rs = run_parallel(calc_reward, actions, td, num_workers=24, num_epochs=10,
+        rs = run_parallel(calc_reward, actions, td,
+                          num_workers=reward_num_workers(len(actions)), num_epochs=10,
                           local_search=False, return_torch=True, variant=self.variant)  # (B,3) T-vector
         if self.reward_mode == 'vector':
             # GRPO path: hand the raw (B,3) T-vector (T positive, lower=better) to

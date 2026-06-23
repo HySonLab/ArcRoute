@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-from common.ops import  gather_by_index
+from utils.ops import  gather_by_index
 
 class ARPContext(nn.Module):
     def __init__(self, embed_dim, linear_bias=False):

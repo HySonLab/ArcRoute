@@ -3,10 +3,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import numpy as np
 from numpy.random import random, randint, permutation
 
-from common.ops import import_instance, run_parallel2
-from common.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
-from common.cal_reward import get_Ts
-from common.local_search import ls
+from utils.ops import import_instance, run_parallel2
+from utils.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
+from solvers.cal_reward import get_Ts
+from utils.local_search import ls
 from copy import deepcopy
 
 class BaseHCARP:

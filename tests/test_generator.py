@@ -1,7 +1,7 @@
 """Unit tests for env/generator.py — verify the on-the-fly training generator
 matches the paper's "Create HDCARP instances" formulas (arXiv:2501.00852) AND
 shares the sparse shortest-path metric with the benchmark loader
-(common.ops.import_instance). See docs/plan/data_plan/01_phase0_restore_formula.md.
+(utils.ops.import_instance). See docs/plan/data_plan/01_phase0_restore_formula.md.
 
 Run from the project root:
     uv run python -m unittest tests.test_generator -v
@@ -24,7 +24,7 @@ from env.generator import (
     build_sparse_adj,
     generate,
 )
-from common.ops import import_instance
+from utils.ops import import_instance
 
 
 class TestPriorityClasses(unittest.TestCase):
@@ -114,7 +114,7 @@ class TestVehicleCapacity(unittest.TestCase):
 
 class TestSparseMetricMatchesTest(unittest.TestCase):
     """⭐ The KEY gate (plan §0.6): the train `adj` must be byte-identical to what
-    common.ops.import_instance computes on the SAME sparse arc set — i.e. both go
+    utils.ops.import_instance computes on the SAME sparse arc set — i.e. both go
     through floyd-warshall over the real arcs, NOT the old complete-Euclid metric.
     """
 

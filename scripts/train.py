@@ -3,8 +3,8 @@ import numpy as np
 import argparse
 from env.env import CARPEnv
 from policy.policy import AttentionModelPolicy
-from rl.ppo import PPO
-from rl.grpo import GRPO
+from trainers.ppo import PPO
+from trainers.grpo import GRPO
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
@@ -39,7 +39,7 @@ def parse_args():
                         help='Phase 6 multi-size training: "nloc:narc,..." e.g. '
                              '"20:40,30:60,40:80,50:100,40:120". Overrides num_loc/num_arc.')
     parser.add_argument('--variant', type=str, default='U', help='Environment variant')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/60arcs', help='Checkpoint directory')
+    parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints/60arcs', help='Checkpoint directory')
     parser.add_argument('--num_workers', type=int, default=24, help='Number of workers for data loader') 
     parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
     parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
@@ -108,17 +108,22 @@ if __name__ == "__main__":
                 **extra)
     
     # Setup checkpoint callback
+    # GRPO selects by the lexicographic best-of-K scalar (val/lex_best, logged in
+    # grpo.py) so the saved checkpoint matches the T_1>>T_2>>T_3 training objective;
+    # PPO keeps val/reward (the weighted-sum monitor) unchanged for A/B + rollback.
+    monitor_metric = "val/lex_best" if args.algo == "grpo" else "val/reward"
     checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_dir,
                                           filename="{epoch:03d}",
                                           save_top_k=1,
                                           save_last=True,
-                                          monitor="val/reward",
+                                          monitor=monitor_metric,
                                           mode="max")
     
     trainer = Trainer(
         max_epochs=args.max_epoch,
         accelerator=args.accelerator,
         devices=args.devices,
+        default_root_dir="outputs",   # lightning_logs under outputs/
         callbacks=[checkpoint_callback]
     )
 

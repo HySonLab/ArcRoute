@@ -16,8 +16,18 @@ dependencies = [
     "osmnx>=2.0.7",
 ]
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# src layout: the library packages (env, policy, trainers, solvers, eval, utils)
+# live under src/ and are installed (editable) so imports like `from env.env import`
+# resolve without relying on the CWD. Entry points live in scripts/.
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.uv]
-# The code is run from the project root (e.g. `python train.py`,
-# `python baseline/ils.py`) with imports like `from env.env import ...`,
-# so we manage the environment without building this repo as a package.
-package = false
+package = true

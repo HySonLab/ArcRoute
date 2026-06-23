@@ -3,15 +3,18 @@ per-objective metrics. Parses args and builds models; does NOT run a full train.
 
 Run: uv run python -m unittest tests.test_train_config -v
 """
+import os
 import sys
 import unittest
 from unittest import mock
 
 import torch
 
+# train.py is an entry-point script under scripts/ (not a package) — add it to path.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import train
-from rl.grpo import GRPO
-from rl.ppo import PPO
+from trainers.grpo import GRPO
+from trainers.ppo import PPO
 
 
 def _parse(argv):

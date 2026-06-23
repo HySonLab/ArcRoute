@@ -25,7 +25,7 @@ def calc_reward(action, td, pos_val=[1,2,3], **kwargs):
     of M vehicles (multi-trip when needed) and computes the T_k. M is read from
     td['num_vehicle']; falls back to k_min (capacity-minimum, parallel) if absent.
     """
-    from common.scheduler import Scheduler  # local import to avoid cycles
+    from solvers.scheduler import Scheduler  # local import to avoid cycles
     sched = Scheduler(variant=kwargs.get("variant", "P"), pos_val=tuple(pos_val))
     M = kwargs.get("M", None)
     if M is None and "num_vehicle" in td:

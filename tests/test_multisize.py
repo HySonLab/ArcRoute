@@ -89,7 +89,7 @@ class TestFleetPerInstance(unittest.TestCase):
         import numpy as np
         from env.env import CARPEnv
         from env.generator import generate_dataset
-        from common.cal_reward import calc_reward
+        from solvers.cal_reward import calc_reward
 
         env = CARPEnv(num_loc=30, num_arc=30, num_vehicle=[2, 3, 7], variant="P")
         ds = generate_dataset(12, 30, 30, [2, 3, 7], num_workers=0)

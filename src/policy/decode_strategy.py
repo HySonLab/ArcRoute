@@ -1,7 +1,7 @@
 import torch
 import abc
 import torch.nn.functional as F
-from common.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
+from utils.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
 
 def modify_logits_for_top_k_filtering(logits, top_k):
     """Set the logits for none top-k values to -inf. Done out-of-place.

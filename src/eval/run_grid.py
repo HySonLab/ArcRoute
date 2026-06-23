@@ -55,7 +55,7 @@ def load_instance_td(file, M):
     """Build a batch-1 td (env.reset input keys) from a .npz, with fleet M."""
     import torch
     from tensordict import TensorDict
-    from common.ops import import_instance
+    from utils.ops import import_instance
 
     dms, P, _M, demands, clss, s, d, _edge = import_instance(file, M=M)
     td_in = TensorDict(
@@ -89,7 +89,7 @@ class RLSolver:
 
     def __init__(self, ckpt, device="cuda"):
         import torch
-        from rl.ppo import PPO
+        from trainers.ppo import PPO
 
         self.device = device if torch.cuda.is_available() else "cpu"
         self.model = PPO.load_from_checkpoint(ckpt, map_location=self.device)
@@ -98,7 +98,7 @@ class RLSolver:
 
     def solve(self, file, M, variant, num_sample):
         import torch
-        from common.ops import batchify
+        from utils.ops import batchify
 
         td_in, _ = load_instance_td(file, M)
         self.env.variant = variant

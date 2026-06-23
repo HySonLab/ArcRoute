@@ -27,8 +27,19 @@ Temporary Items
 .apdisk
 __pycache__
 ckpts
+checkpoints
 lightning_logs
 data/cache
 data/instances
 logs
 *.out
+
+# Python / uv
+.venv/
+*.egg-info/
+.python-version
+# Note: uv.lock is intentionally committed for reproducible installs.
+outputs/
+data/ood/
+data/osm/
+*.data

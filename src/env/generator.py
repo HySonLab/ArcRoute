@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampl
 from tqdm import tqdm
 import os
 
-from common.ops import dist_edges_from_file
+from utils.ops import dist_edges_from_file
 
 # Plan Phase 1: hard cap |A_r| <= 100 (n <= 101) so every config fits one 4090
 # without AMP/checkpointing. With ¼-split |A_r| = 3*floor(|A|/4), this means
@@ -51,7 +51,7 @@ def get_sampler(
 # Paper F1 graph (Hà 2024): a SPARSE, strongly-connected directed graph on the
 # unit square. NOTE (plan Phase 0 §0.6): the old generator used `cdist` over all
 # nodes -> `adj` was the COMPLETE-Euclidean metric (straight-line teleport),
-# whereas test (common.ops.import_instance) uses floyd-warshall over the SPARSE
+# whereas test (utils.ops.import_instance) uses floyd-warshall over the SPARSE
 # arc set. That train/test metric gap is closed here: we build a real sparse
 # strongly-connected graph and compute `adj` with the SAME pipeline as test.
 # ---------------------------------------------------------------------------- #
@@ -81,7 +81,7 @@ def sample_priority_classes(num_arc):
     """Paper F2 (¼-split, balanced): each priority class in {1,2,3} gets exactly
      floor(num_arc/4) arcs; the remainder are non-required (class 0). Returns a
     per-arc class vector of length `num_arc` (NO depot row — the depot is a
-    prepended row in `generate`, mirroring common.ops.import_instance).
+    prepended row in `generate`, mirroring utils.ops.import_instance).
     """
     per_class = num_arc // 4
     clss = torch.zeros(num_arc, dtype=torch.int64)
@@ -105,7 +105,7 @@ def sample_vehicle_capacity(q_req):
 
 def build_sparse_adj(edges, d, req_mask):
     """Shortest-path adjacency over the SPARSE arc set, restricted to required
-    arcs (+ a prepended depot row 0). Reuses common.ops.dist_edges_from_file so
+    arcs (+ a prepended depot row 0). Reuses utils.ops.dist_edges_from_file so
     the train metric is byte-identical to test (import_instance). `adj` only
     depends on (tail, head, traversal), so demand/class/service columns are 0.
     Returns a (|A_r|+1, |A_r|+1) float tensor.
@@ -171,7 +171,7 @@ def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
     # Sparse shortest-path adjacency, identical pipeline to import_instance.
     adj = build_sparse_adj(edges, d, req_mask.numpy())
 
-    # Prepend the depot row (all zeros) -> mirror common.ops.import_instance,
+    # Prepend the depot row (all zeros) -> mirror utils.ops.import_instance,
     # which does `vstack([[0]*6, req])`. So index 0 is the depot.
     z1 = torch.zeros(1)
     td = TensorDict(

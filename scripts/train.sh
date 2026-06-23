@@ -2,7 +2,7 @@
 # Launch HDCARP RL training via uv (nohup -> logs/). Edit hyperparameters below.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # === MODE ===================================================================
 #   "validate" : short sanity run (~1-2h) to confirm the learning curve drops
@@ -42,7 +42,7 @@ if [ "$MODE" = "validate" ]; then
     VAL_DATA_SIZE=1000
     EMBED_DIM=128
     NUM_ENCODER_LAYERS=6      # lighter than full (12) so epochs are fast
-    CHECKPOINT_DIR=checkpoints/validate_clP
+    CHECKPOINT_DIR=outputs/checkpoints/validate_clP
 else
     MAX_EPOCH=1000
     BATCH_SIZE=4096
@@ -51,7 +51,7 @@ else
     VAL_DATA_SIZE=10000
     EMBED_DIM=128
     NUM_ENCODER_LAYERS=12
-    CHECKPOINT_DIR=checkpoints/clP_ladder
+    CHECKPOINT_DIR=outputs/checkpoints/clP_ladder
 fi
 
 echo "MODE=$MODE | algo=$ALGO | group_size=$GROUP_SIZE | max_epoch=$MAX_EPOCH | "\
@@ -62,7 +62,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 LOG="logs/train_${MODE}_${TS}.out"
 
 # Run in the background via nohup so training survives a terminal close.
-nohup uv run python train.py \
+nohup uv run python scripts/train.py \
     --seed "$SEED" \
     --max_epoch "$MAX_EPOCH" \
     --batch_size "$BATCH_SIZE" \

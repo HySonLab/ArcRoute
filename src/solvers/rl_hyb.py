@@ -1,14 +1,14 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from rl.ppo import PPO
+from trainers.ppo import PPO
 import torch
 import numpy as np
 from glob import glob
 from time import time
 import argparse
-from common.ops import import_instance, batchify
-from common.nb_utils import gen_tours
+from utils.ops import import_instance, batchify
+from utils.nb_utils import gen_tours
 class RLHCARP:
     def __init__(self, pw, variant, device='cuda'):
         model = PPO.load_from_checkpoint(pw)

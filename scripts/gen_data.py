@@ -153,7 +153,7 @@ _TOPOLOGIES = {"unit_square": make_unit_square, "cluster": make_cluster}
 
 
 def _save_instance(fpath, req, nonreq, M, C, topology, rng=np.random):
-    """Write an .npz with the schema common.ops.import_instance reads, plus
+    """Write an .npz with the schema utils.ops.import_instance reads, plus
     metadata for per-axis reporting (Phase 2/4/5): d, topology, tightness tau,
     and n_req. tau = (sum of required demands) / (M * Q) describes how binding
     the capacity is (Smith-Miles 2023)."""
@@ -210,6 +210,7 @@ def load_osm_graph(north, south, east, west):
     signatures of graph_from_bbox.
     """
     import osmnx as ox
+    ox.settings.cache_folder = "data/cache"   # keep the OSM download cache under data/ (gitignored)
     try:
         G = ox.graph_from_bbox(north=north, south=south, east=east, west=west,
                                network_type="drive")

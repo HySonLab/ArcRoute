@@ -1,4 +1,4 @@
-"""Phase 1 gate tests for common.scheduler.Scheduler (M-agnostic policy + Φ)
+"""Phase 1 gate tests for solvers.scheduler.Scheduler (M-agnostic policy + Φ)
 and the calc_reward -> Scheduler rewire, incl. an integration rollout smoke.
 
 Run: uv run python -m unittest tests.test_scheduler -v
@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import torch
 
-from common.scheduler import Scheduler
+from solvers.scheduler import Scheduler
 
 
 # ----------------------------------------------------------------- fixtures
@@ -195,7 +195,7 @@ class TestScheduler(unittest.TestCase):
 
     # calc_reward now delegates to the Scheduler (reads td['num_vehicle']).
     def test_calc_reward_delegates(self):
-        from common.cal_reward import calc_reward
+        from solvers.cal_reward import calc_reward
         td = toy_instance()
         td["num_vehicle"] = torch.tensor([3])
         rs = calc_reward(self.action, td, return_numpy=True)

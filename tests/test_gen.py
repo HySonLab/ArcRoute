@@ -13,13 +13,13 @@ import unittest
 import numpy as np
 import networkx as nx
 
-# data/gen.py is a script under a non-package dir; load it by path.
-_GEN_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "gen.py")
+# gen_data.py is a script under a non-package dir; load it by path.
+_GEN_PATH = os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_data.py")
 _spec = importlib.util.spec_from_file_location("hdcarp_gen", _GEN_PATH)
 gen = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen)
 
-from common.ops import import_instance
+from utils.ops import import_instance
 
 
 def make_strongly_connected_cycle(n, rng):
@@ -257,7 +257,7 @@ class TestTightnessMetadata(unittest.TestCase):
 
 
 class TestRoundTripWithImportInstance(unittest.TestCase):
-    """A generated .npz must load cleanly through common.ops.import_instance."""
+    """A generated .npz must load cleanly through utils.ops.import_instance."""
 
     def test_npz_roundtrip(self):
         rng = np.random.RandomState(2)

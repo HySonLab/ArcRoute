@@ -1,10 +1,10 @@
 import torch.nn as nn
 import torch
-from common.ops import get_log_likelihood
+from utils.ops import get_log_likelihood
 from policy.encoder import Encoder 
 from policy.decoder import Decoder 
-from policy.decode_stragegy import get_decoding_strategy, calculate_entropy
-from common.ops import gather_by_index, refine_routes, prob_idxs, run_parallel
+from policy.decode_strategy import get_decoding_strategy, calculate_entropy
+from utils.ops import gather_by_index, refine_routes, prob_idxs, run_parallel
 import numpy as np
 
 
@@ -50,10 +50,18 @@ class AttentionModelPolicy(nn.Module):
         return_sum_log_likelihood: bool = True,
         actions=None,
         max_steps=1_000_000,
+        hidden=None,
         **decoding_kwargs,
     ) -> dict:
-        # Encoder: get encoder output and initial embeddings from initial state
-        hidden, init_embeds = self.encoder(td)
+        # Encoder: get encoder output and initial embeddings from initial state.
+        # `hidden` may be supplied pre-computed (POMO-style encoder sharing: encode
+        # an instance ONCE, reuse for its K group) to skip the redundant encode.
+        # Valid only because the encoder uses instance-norm (batch-independent), so
+        # a shared encoding is numerically identical to per-sample encoding.
+        if hidden is None:
+            hidden, init_embeds = self.encoder(td)
+        else:
+            init_embeds = None
 
         # Get decode type depending on phase and whether actions are passed for evaluation
         decode_type = decoding_kwargs.pop("decode_type", None)
