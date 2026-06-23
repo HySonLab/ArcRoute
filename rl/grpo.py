@@ -85,6 +85,17 @@ class GRPO(PPO):
             # metric (val/reward, mode='max'); this never touches gradients.
             reward = out["reward"]
             if reward.dim() == 2 and reward.shape[-1] == 3:
+                # Held-out per-objective learning curve: lex-best of K per instance
+                # (the deployed best-of-K quality). T_2/T_3 must DESCEND under GRPO
+                # (they stay flat under the weighted reward) — this is the D2 proof.
+                T = unbatchify(reward, K).detach().cpu().numpy()         # (B, K, 3)
+                best = np.stack([
+                    T[b][np.lexsort((T[b][:, 2], T[b][:, 1], T[b][:, 0]))[0]]
+                    for b in range(T.shape[0])
+                ])                                                       # (B, 3)
+                for j, name in enumerate(("T1", "T2", "T3")):
+                    self.log(f"{phase}/{name}_best", float(best[:, j].mean()),
+                             sync_dist=True, batch_size=T.shape[0])
                 out["reward"] = -reward[:, 0:1]
             metrics = self.log_metrics(out, phase, dataloader_idx=dataloader_idx)
             return {"loss": out.get("loss", None), **metrics}
