@@ -7,7 +7,6 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from utils.local_search import (
-    calc_length,
     calc_swap_delta_intra,
     calc_swap_delta_inter,
     best_swap_intra,

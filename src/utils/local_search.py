@@ -25,23 +25,6 @@ EPS = 1e-9
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def calc_length(adj, service, sub):
-    """Total cost (service + deadheading) of a single route ``sub``.
-
-    Works for both numpy arrays and torch tensors (used by the RL path).
-    """
-    if hasattr(sub, "clone"):  # torch tensor
-        s = service[sub].clone()
-        a = adj[sub[:-1], sub[1:]].clone()
-        s[1:] += a
-        return s.sum()
-    sub = np.asarray(sub)
-    s = service[sub].astype(np.float64).copy()
-    a = adj[sub[:-1], sub[1:]]
-    s[1:] += a
-    return s.sum()
-
-
 def get_subtour_p(route, clss, p):
     """Interior indices of ``route`` whose arc has priority class ``p``."""
     route = np.asarray(route)
@@ -237,13 +220,6 @@ def best_swap_inter(r1, r2, adj, demands, capacity, clss, variant='P', p=None):
         a, b = divmod(flat, len(idx2))
         return best_delta, int(idx1[a]), int(idx2[b])
     return 0.0, -1, -1
-
-
-def _route_cost(route, adj):
-    route = np.asarray(route)
-    if len(route) < 2:
-        return 0.0
-    return float(adj[route[:-1], route[1:]].sum())
 
 
 def inter_route_opt(routes, adj, demands, clss, capacity=1.0, variant='P', max_iter=100):
