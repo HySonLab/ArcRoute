@@ -17,6 +17,29 @@ def action_to_tours(action):
         padded[idx][1:len(tour)+1] = tour
     return padded
 
+def get_Ts(vars, actions, pos_val=[1, 2, 3]):
+    """Hierarchical completion times for a batch of actions.
+
+    vars : {'adj': dms, 'service_time': s, 'clss': clss, 'demand': demands, 'nv': M}
+    actions : 2D array (batch, n) — flat arc-index sequences with 0-separators.
+    Returns : np.ndarray shape (batch, len(pos_val)).
+    """
+    from solvers.scheduler import Scheduler
+    td = {
+        'adj':           vars['adj'],
+        'service_times': vars['service_time'],
+        'clss':          vars['clss'],
+        'demand':        vars['demand'],
+    }
+    M = vars.get('nv', None)
+    sched = Scheduler(pos_val=tuple(pos_val))
+    results = []
+    for action in actions:
+        _, T = sched(np.asarray(action), td, M=M)
+        results.append(T)
+    return np.array(results, dtype=np.float64)
+
+
 def calc_reward(action, td, pos_val=[1,2,3], **kwargs):
     """Hierarchical completion times (T_1,...,T_p) for one instance.
 

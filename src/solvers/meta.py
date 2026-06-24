@@ -27,7 +27,8 @@ class BaseHCARP:
             'adj': self.dms,
             'service_time': self.s,
             'clss': self.clss,
-            'demand': self.demands
+            'demand': self.demands,
+            'nv': self.nv,
         }
     
     def get_idx(self, prob, size=1, strategy='sampling'):
@@ -72,7 +73,8 @@ class BaseHCARP:
                     break
                 costs = [self.calc_len(paths[i]) for i in idxs]
                 idx = self.get_idx(convert_prob(costs), strategy='sampling', size=4)
-                routes[idx] = paths[idx]
+                chosen = idxs[idx]
+                routes[chosen] = paths[chosen]
                 i += 1
             if i >= len(edges):
                 return np.int32([a for tour in routes for a in tour])[1:]

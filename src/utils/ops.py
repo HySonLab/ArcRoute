@@ -272,3 +272,8 @@ def softmax(x):
     x = np.array(x)
     e_x = np.exp(x - np.max(x))
     return e_x / e_x.sum(axis=0) # only difference
+
+
+def run_parallel2(func, items, **kwargs):
+    """Map func(item, **kwargs) over items, return list of results."""
+    return [func(item, **kwargs) for item in items]
