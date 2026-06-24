@@ -41,32 +41,25 @@ def centered_lex_rank(T):
     """Centered lexicographic rank advantage for one group of K solutions.
 
     Args:
-        T: (K, P) array of T-vectors (T positive, LOWER is better), P = number of
-           priority classes. Ranked lexicographically by (T_1, then T_2, ..., T_P).
+        T: (K, P) array of T-vectors (LOWER is better), P = priority classes.
+           Ranked lexicographically: T[:,0] (T_1) primary, then T_2, ..., T_P.
 
     Returns:
-        (K,) float32 advantage in [-1, 1]: the BEST solution (lowest T lex) gets
-        +1, the worst -1, mean == 0 (group mean is the baseline). K==1 -> all 0.
-
-        TIES: solutions with an IDENTICAL T-vector are EQUALLY good, so they share
-        the AVERAGE of the ranks they span -> equal advantage (no spurious gradient
-        from the lexsort tiebreak). When the whole group is tied (common once T_1
-        saturates) every advantage is 0 -> that group contributes no gradient, the
-        DAPO "zero-variance masking" behaviour. With NO ties this is byte-identical
-        to the plain integer-rank version.
+        (K,) float32 advantage in [-1, +1], mean == 0.
+        Best solution (lowest T lex) → +1, worst → -1.
+        K == 1 → all zeros.
+        TIES: identical T-vectors share the average of the ranks they span →
+        equal advantage, no spurious gradient. Whole group tied → all zeros
+        (zero gradient; the dynamic-filter branch below drops these groups).
     """
     T = np.asarray(T, dtype=np.float64)
     K = T.shape[0]
     if K < 2:
         return np.zeros(K, dtype=np.float32)
-    # lexsort uses the LAST key as primary -> T[:,0] (T_1) primary, then T_2..T_P.
-    # T[:, ::-1].T = keys [col P-1, ..., col 0] so col 0 (T_1) is primary. Works for
-    # any P (P=3 reduces to (T[:,2],T[:,1],T[:,0])).
-    order = np.lexsort(T[:, ::-1].T)   # indices best -> worst
-    # Positional rank: best position -> K-1, worst -> 0.
-    pos = np.arange(K - 1, -1, -1, dtype=np.float64)
-    # Average-rank ties: scan the sorted order, and for each run of identical
-    # T-vectors replace their positional ranks with the run's mean.
+    # lexsort: last key is primary → T[:,0] (T_1) is primary, T_P is last key.
+    order = np.lexsort(T[:, ::-1].T)       # ascending: best (lowest T_1) first
+    pos = np.arange(K - 1, -1, -1, dtype=np.float64)   # best pos → K-1
+    # Average-rank ties: runs of identical T-vectors share the mean position.
     Ts = T[order]
     rank_sorted = pos.copy()
     i = 0
@@ -79,7 +72,57 @@ def centered_lex_rank(T):
         i = j
     rank = np.empty(K, dtype=np.float64)
     rank[order] = rank_sorted
-    adv = (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)    # [-1, 1], mean == 0
+    adv = (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)    # → [-1, +1], mean == 0
+    return adv.astype(np.float32)
+
+
+def _centered_lex_rank_batch(T_np):
+    """Batched version of centered_lex_rank.
+
+    Args:
+        T_np: (B, K, P) float64 numpy array (LOWER is better).
+
+    Returns:
+        (B, K) float32 advantage in [-1, +1], mean==0 per group.
+    """
+    B, K, P = T_np.shape
+    if K < 2:
+        return np.zeros((B, K), dtype=np.float32)
+
+    # Step 1: lexsort each group via successive stable argsorts (last->first key).
+    # order[b, i] = index in original group that belongs at sorted position i.
+    order = np.tile(np.arange(K, dtype=np.intp), (B, 1))       # (B, K)
+    Bidx = np.arange(B, dtype=np.intp)[:, None]                 # (B, 1) for fancy index
+    for p in range(P - 1, -1, -1):                             # last key = least significant
+        col = T_np[Bidx, order, p]                            # (B, K) current values
+        sub = np.argsort(col, axis=1, kind='stable')
+        order = order[Bidx, sub]
+
+    # Step 2: positions K-1 (best) down to 0 (worst), replicated for B groups.
+    pos = np.arange(K - 1, -1, -1, dtype=np.float64)          # (K,)
+    rank_sorted = np.broadcast_to(pos, (B, K)).copy()          # (B, K) writeable
+
+    # Step 3: average rank for ties. Ties = consecutive sorted rows equal on ALL P cols.
+    Ts = T_np[Bidx, order, :]                                 # (B, K, P) sorted
+    # eq[b, i] == True if sorted row i+1 equals row i (all P coords).
+    eq = np.all(Ts[:, 1:, :] == Ts[:, :-1, :], axis=2)        # (B, K-1) bool
+
+    # Process each group's runs. For groups with NO ties (common case), skip.
+    has_tie = eq.any(axis=1)                                   # (B,) bool
+    for b in np.nonzero(has_tie)[0]:
+        i = 0
+        while i < K:
+            j = i + 1
+            while j < K and eq[b, j - 1]:
+                j += 1
+            if j - i > 1:
+                rank_sorted[b, i:j] = pos[i:j].mean()
+            i = j
+
+    # Step 4: scatter back to original indices and normalise.
+    rank = np.empty((B, K), dtype=np.float64)
+    rank[Bidx, order] = rank_sorted
+    adv = (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)
     return adv.astype(np.float32)
 
 
@@ -95,8 +138,7 @@ class GRPO(BaseRL):
         lr: float = 1e-4,
         entropy_lambda: float = 0.0,
         max_grad_norm: float = 1.0,
-        clip_range: float = 0.2,       # epsilon of the PPO-style clipped surrogate (lower bound)
-        clip_range_high: float = None, # DAPO clip-higher upper bound; None -> symmetric
+        clip_range: float = 0.2,       # epsilon of the PPO-style clipped surrogate
         ppo_epochs: int = 1,           # inner passes over the rollout per update
         mini_batch_size: int = 256,    # chunk size of the grad-enabled inner loop
         batch_size: int = 1024,
@@ -128,8 +170,6 @@ class GRPO(BaseRL):
         self.entropy_lambda = entropy_lambda
         self.max_grad_norm = max_grad_norm
         self.clip_range = clip_range
-        # DAPO clip-higher: asymmetric upper bound for adv >= 0. None -> symmetric.
-        self.clip_range_high = clip_range if clip_range_high is None else clip_range_high
         self.ppo_epochs = ppo_epochs
         self.mini_batch_size = mini_batch_size
 
@@ -139,12 +179,8 @@ class GRPO(BaseRL):
 
     def _group_advantage(self, T_bk3):
         """(B, K, 3) T-vectors -> (B, K) centered lexicographic-rank advantage."""
-        B, K = T_bk3.shape[0], T_bk3.shape[1]
-        T = T_bk3.detach().cpu().numpy()
-        adv = np.empty((B, K), dtype=np.float32)
-        for b in range(B):
-            adv[b] = centered_lex_rank(T[b])
-        return torch.from_numpy(adv)
+        T = T_bk3.detach().cpu().numpy().astype(np.float64)
+        return torch.from_numpy(_centered_lex_rank_batch(T))
 
     def shared_step(self, batch, batch_idx, phase, dataloader_idx=None):
         if phase == "train":
@@ -227,15 +263,7 @@ class GRPO(BaseRL):
             # ratio of new/old action probabilities for the replayed actions.
             ratio = torch.exp(ll.sum(dim=-1) - sub_td["logprobs"]).view(-1, 1)
 
-            # DAPO clip-higher: asymmetric upper bound for adv >= 0 (decouple the
-            # gain on good actions from the conservative bound on bad ones). When
-            # clip_range_high == clip_range this reduces to the symmetric surrogate.
-            clip_lo = 1 - self.clip_range
-            clipped_ratio = torch.where(
-                adv >= 0,
-                torch.clamp(ratio, clip_lo, 1 + self.clip_range_high),
-                torch.clamp(ratio, clip_lo, 1 + self.clip_range),
-            )
+            clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
             surrogate_loss = -torch.min(ratio * adv, clipped_ratio * adv).mean()
             loss = surrogate_loss - self.entropy_lambda * entropy.mean()
 

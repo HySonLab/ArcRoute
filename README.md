@@ -7,9 +7,9 @@
 - [Installation](#installation)
 - [Usage](#usage)
   - [Generate Test Benchmark Grid](#generate-test-benchmark-grid)
-  - [Run Heuristic Algorithms](run-heuristic-algorithms)
-  - [Run Exact Method](#train-reinforcement-learning-model)
-  - [Run RL method](#evaluate-performance)
+  - [Run Meta Heuristic Algorithms](#run-meta-heuristic-algorithms)
+  - [Run Exact Method](#run-exact-method)
+  - [Evaluate the RL Policy](#evaluate-the-rl-policy-best-of-k-grid)
   - [RL Training](#rl-training)
 - [Results](#results)
 - [Weight and Data](#weight_and_data)
@@ -24,42 +24,41 @@ The project implements multiple approaches:
 
 - **Exact methods** for solving smaller instances.
 - **Meta Heuristic algorithms** (ea, aco, ils).
+- **Reinforcement Learning** — an attention encoder/decoder policy trained with **PPO** or
+  **GRPO** (critic-free, lexicographic-rank advantage).
 - **Hybrid algorithm combining Reinforcement Learning (RL) and heuristics**.
 
 ## Key Components
 
-The project is organized into several directories:
+The library lives under `src/` (an installed, editable package); runnable entry points are in
+`scripts/`, and generated artifacts go to `data/` (inputs) and `outputs/` (checkpoints, logs).
 
 ```
-hdcarp/
-├── baseline/
-│   ├── aco.py                 # aco algorithm
-│   ├── ea.py                  # ea algorithm
-│   ├── ils.py                 # ea algorithm
-│   ├── rl_hyb.py              # HRDA algorithm
-│   ├── lp.py                  # exact method
-│   ├── meta.py                # implemented code of Meta Heuristic algorithms
-├── common/
-├── env/
-│   ├── env.py                # Environment setup for the routing problem
-│   ├── generator.py          # Problem instance generator
-├── policy/
-│   ├── context.py            # Contextual features for the RL model
-│   ├── encoder.py            # Encoding components
-│   ├── decoder.py            # Decoding components
-│   ├── init.py               # Model initialization functions
-│   ├── policy.py             # Policy network for RL
-├── rl/
-│   ├── critic.py
-│   ├── ppo.py                # Proximal Policy Optimization (PPO) algorithm
-│   ├── policy.py             # Policy network for RL
-│   ├── trainer.py
-├── .gitignore                # Git ignore file
-├── pyproject.toml            # Python dependencies (managed with uv)
-├── setup.sh                  # One-step environment setup via uv
-├── train.py                  # Main script to start training the models
-├── README.md                 # Project documentation
-├── LICENSE                   # License information
+ArcRoute/
+├── src/
+│   ├── env/
+│   │   ├── env.py             # Environment (CARPEnv) for the routing problem
+│   │   └── generator.py       # Training-instance generator
+│   ├── policy/                # attention model (M-agnostic): encoder/decoder/policy/context/init
+│   ├── trainers/
+│   │   ├── base.py            # BaseRL — shared Lightning scaffolding
+│   │   ├── ppo.py             # PPO (clipped surrogate + critic)
+│   │   └── grpo.py            # GRPO (critic-free REINFORCE, lexicographic-rank advantage)
+│   ├── solvers/
+│   │   ├── scheduler.py       # Scheduler Φ: arc order + M -> routes + (T1,T2,T3)
+│   │   ├── cal_reward.py      # objective / reward
+│   │   ├── aco.py ea.py ils.py# metaheuristics
+│   │   ├── lp.py              # exact (gurobi)
+│   │   └── rl_hyb.py          # HRDA hybrid (RL + local search)
+│   ├── eval/                  # run_grid.py, stats.py
+│   └── utils/                 # ops, consts, local_search
+├── scripts/
+│   ├── train.py  train.sh     # RL training entry point + launcher
+│   └── gen_data.py            # benchmark-instance generator
+├── tests/                     # unittest suite
+├── configs/  docs/
+├── data/                      # inputs/artifacts (gitignored)   outputs/  # checkpoints + logs
+├── pyproject.toml  setup.sh  uv.lock  README.md  CLAUDE.md  LICENSE
 ```
 
 
@@ -76,10 +75,13 @@ hdcarp/
 This installs uv (if missing), creates a `.venv`, and installs all dependencies from `pyproject.toml`. Then either activate the env or prefix commands with `uv run`:
 
 ```bash
-source .venv/bin/activate        # then: python train.py ...
+source .venv/bin/activate        # then: python scripts/train.py ...
 # or
-uv run python train.py --help
+uv run python scripts/train.py --help
 ```
+
+`uv sync` builds the project as an editable package, so the `src/` modules import directly
+(e.g. `from trainers.grpo import GRPO`, `from solvers.scheduler import Scheduler`).
 
 ## Usage
 
@@ -94,23 +96,23 @@ arcs are generated **once** — not per `M`.
 **Synthetic topologies (no internet / osmnx required):**
 ```bash
 # unit_square (in-distribution, paper F1)  -> data/ood/unit_square/<|A|>/*.npz
-uv run python data/gen.py --topology unit_square \
+uv run python scripts/gen_data.py --topology unit_square \
     --density 1.5 2.0 2.5 3.0 --per_bucket 20 --min_arc 40 --seed 6868
 
 # cluster (OOD, Gaussian clusters)         -> data/ood/cluster/<|A|>/*.npz
-uv run python data/gen.py --topology cluster \
+uv run python scripts/gen_data.py --topology cluster \
     --density 1.5 2.0 2.5 3.0 --per_bucket 20 --min_arc 40 --seed 6868
 ```
 
 **Real road networks from OpenStreetMap (requires `uv add osmnx`):**
 ```bash
 # city A = Da Nang  -> data/ood/osm_cityA/<|A|>/*.npz
-uv run python data/gen.py --topology osm --out data/ood/osm_cityA \
+uv run python scripts/gen_data.py --topology osm --out data/ood/osm_cityA \
     --per_bucket 20 --min_arc 40 --tol 5 --seed 6868 \
     --bbox 16.0741 16.0591 108.2187 108.1972
 
 # city B = Hanoi    -> data/ood/osm_cityB/<|A|>/*.npz
-uv run python data/gen.py --topology osm --out data/ood/osm_cityB \
+uv run python scripts/gen_data.py --topology osm --out data/ood/osm_cityB \
     --per_bucket 20 --min_arc 40 --tol 6 --seed 777 \
     --bbox 21.0450 21.0180 105.8650 105.8350
 ```
@@ -122,26 +124,37 @@ full size ladder), `--m_nominal` (nominal fleet stored in the `.npz`), `--tol`
 buckets, so it is safe to resume. Training data is generated on the fly (see
 [RL Training](#rl-training)) and does not need this script.
 ### Run Meta Heuristic Algorithms
-```python
-    python3 baseline/ils.py --data_path "data/instances/30/61_20.npz"
-    python3 baseline/ea.py --data_path "data/instances/30/61_20.npz"
-    python3 baseline/aco.py --data_path "data/instances/30/61_20.npz"
+```bash
+    uv run python -m solvers.ils --data_path "data/instances/30/61_20.npz"
+    uv run python -m solvers.ea  --data_path "data/instances/30/61_20.npz"
+    uv run python -m solvers.aco --data_path "data/instances/30/61_20.npz"
 ```
 
 ### Run Exact Method
-```python
-    python3 baseline/lp.py
+```bash
+    uv run python -m solvers.lp
 ```
-### Run RL Method
-```python
-    python3 baseline/rl_infer.py \
-    --checkpoint_path "best.ckpt" \
-    --data_path "data/30/61_20.npz"
+### Evaluate the RL Policy (best-of-K grid)
+```bash
+    uv run python -m eval.run_grid \
+    --ckpt "outputs/checkpoints/.../best.ckpt" \
+    --path data/ood --M 2,3,5,7,10 --variant P --num_sample 100 \
+    --out outputs/grid.csv
 ```
 
 ### RL Training
-```python
-    python3 train.py \
+
+Use the launcher (`scripts/train.sh`, runs in the background via `nohup`):
+```bash
+    MODE=validate ALGO=grpo ./scripts/train.sh      # GRPO (critic-free, default)
+    MODE=full     ALGO=ppo  ./scripts/train.sh      # PPO baseline
+```
+
+Or call the entry point directly. `--algo {ppo,grpo}` selects the trainer (GRPO auto-uses the
+vector reward + the `val/lex_best` checkpoint monitor; `--group_size K` sets the group size):
+```bash
+    uv run python scripts/train.py \
+    --algo grpo --group_size 8 \
     --seed 6868 \
     --max_epoch 1000 \
     --batch_size 4096 \
@@ -154,7 +167,7 @@ buckets, so it is safe to resume. Training data is generated on the fly (see
     --num_loc 20 \
     --num_arc 20 \
     --variant P \
-    --checkpoint_dir /home/project/checkpoints/cl123 \
+    --checkpoint_dir outputs/checkpoints/cl123 \
     --accelerator gpu \
     --devices 1
 ```

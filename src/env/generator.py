@@ -77,16 +77,17 @@ def sample_arcs(num_loc, num_arc):
             edges.append((u, v))
     return torch.tensor(edges, dtype=torch.long)
 
-def sample_priority_classes(num_arc):
-    """Paper F2 (¼-split, balanced): each priority class in {1,2,3} gets exactly
-     floor(num_arc/4) arcs; the remainder are non-required (class 0). Returns a
-    per-arc class vector of length `num_arc` (NO depot row — the depot is a
-    prepended row in `generate`, mirroring utils.ops.import_instance).
+def sample_priority_classes(num_arc, P=3):
+    """Paper F2 generalized: each of the P priority classes {1..P} gets exactly
+    floor(num_arc/(P+1)) arcs; the remainder are non-required (class 0). The split
+    is 1/(P+1) so #required ≈ P/(P+1) of all arcs (P=3 -> the paper's ¼-split).
+    Returns a per-arc class vector of length `num_arc` (NO depot row — the depot is
+    a prepended row in `generate`, mirroring utils.ops.import_instance).
     """
-    per_class = num_arc // 4
+    per_class = num_arc // (P + 1)
     clss = torch.zeros(num_arc, dtype=torch.int64)
     perm = torch.randperm(num_arc)
-    for c in (1, 2, 3):
+    for c in range(1, P + 1):
         idx = perm[(c - 1) * per_class: c * per_class]
         clss[idx] = c
     return clss
@@ -133,7 +134,7 @@ def _pick_density(density, num_loc):
     return float(density)
 
 
-def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
+def generate(num_loc, num_arc=None, num_vehicle=3, density=None, P=3):
     # Phase 1: each arg may be a scalar or an inclusive (lo, hi) range. A single
     # generate() call resolves to ONE concrete size (the dataloader must keep a
     # batch single-size; see save_cache + the encoder's `assert mask is None`).
@@ -159,7 +160,7 @@ def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
     d_eucl = (coords[edges[:, 0]] - coords[edges[:, 1]]).pow(2).sum(-1).sqrt()
     d = d_eucl / d_eucl.max()
 
-    clss_e = sample_priority_classes(num_arc)
+    clss_e = sample_priority_classes(num_arc, P)
     req_mask = clss_e > 0
 
     d_req = d[req_mask]
@@ -190,7 +191,7 @@ def generate(num_loc, num_arc=None, num_vehicle=3, density=None):
     return td
 
 def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
-                     progress=False):
+                     progress=False, P=3):
     """Generate `num_samples` instances of ONE size in parallel; returns a single
     batched TensorDict (all the same size, so torch.cat is valid)."""
     # Size is fixed ONCE per dataset (a batch must stay single-size for torch.cat),
@@ -204,7 +205,7 @@ def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
             return num_samples
 
         def __getitem__(self, idx):
-            return generate(num_loc, num_arc, num_vehicle)
+            return generate(num_loc, num_arc, num_vehicle, P=P)
 
         @staticmethod
         def collate_fn(batch):
@@ -218,11 +219,11 @@ def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
     return torch.cat([td for td in it], dim=0)
 
 
-def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt"):
+def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt", P=3):
     # Bucketing (Phase 1 §1.3): the encoder cannot mix sizes in one batch
     # (collate = torch.cat of (1,n,n); encoder asserts mask is None). So resolve
     # any ranges to ONE concrete size here -> a cache file is a single bucket.
-    tds = generate_dataset(num_sample, num_loc, num_arc, num_vehicle, progress=True)
+    tds = generate_dataset(num_sample, num_loc, num_arc, num_vehicle, progress=True, P=P)
 
     parent_dir = os.path.dirname(path_data)
     if parent_dir:
@@ -270,7 +271,7 @@ class MultiSizeCARPGenerator(Dataset):
     is grouped into per-size buckets; pair with SizeBucketBatchSampler to keep
     each batch single-size. `sizes` is a list of (num_loc, num_arc) pairs."""
 
-    def __init__(self, num_samples, sizes, num_vehicle, num_workers=24, data=None):
+    def __init__(self, num_samples, sizes, num_vehicle, num_workers=24, data=None, P=3):
         if isinstance(data, str) and os.path.exists(data):
             payload = torch.load(data, weights_only=False)
             self.buckets, self.bucket_ranges = payload["buckets"], payload["ranges"]
@@ -278,7 +279,7 @@ class MultiSizeCARPGenerator(Dataset):
             per = max(1, num_samples // len(sizes))
             self.buckets, self.bucket_ranges, start = [], [], 0
             for (nl, na) in sizes:
-                tds = generate_dataset(per, nl, na, num_vehicle, num_workers)
+                tds = generate_dataset(per, nl, na, num_vehicle, num_workers, P=P)
                 self.buckets.append(tds)
                 self.bucket_ranges.append((start, start + len(tds)))
                 start += len(tds)
@@ -302,11 +303,11 @@ class MultiSizeCARPGenerator(Dataset):
         return torch.cat(batch, dim=0)
 
 class CARPGenerator(Dataset):
-    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, data="carp_data.pt"):
+    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, data="carp_data.pt", P=3):
         if isinstance(data, str):
             if not os.path.exists(data):
                 print(f"Don't have {data}, generating...")
-                save_cache(num_samples, num_loc, num_arc, num_vehicle, data)
+                save_cache(num_samples, num_loc, num_arc, num_vehicle, data, P=P)
             self.data = torch.load(data, weights_only=False)
         else:
             self.data = data

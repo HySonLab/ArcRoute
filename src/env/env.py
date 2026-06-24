@@ -28,6 +28,7 @@ class CARPEnv:
         sizes=None,
         obj_weights=None,
         reward_mode='scalar',
+        P=3,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -36,6 +37,10 @@ class CARPEnv:
         self.num_arc = num_arc
         self.num_vehicle = num_vehicle
         self.variant = variant
+        # Number of priority classes (objective is lexicographic T_1 <= ... <= T_P).
+        # Default 3 = the paper's setting. P flows to the generator (class sampling)
+        # and to the reward (Scheduler pos_val = 1..P -> a (B,P) T-vector).
+        self.P = P
         # D2 Phase 2: 'scalar' (default) keeps the old -(T . w) reward byte-identical;
         # 'vector' returns the raw (B,3) T-vector so the GRPO path (Phase 3) can rank
         # the K samples lexicographically instead of scalarizing.
@@ -50,7 +55,10 @@ class CARPEnv:
         # magnitude so PPO's critic stays well-conditioned (the absolute scale is
         # irrelevant: advantages are normalised, and eval reports T_1/T_2/T_3
         # separately). Previously the reward was -T_1 only (T_2/T_3 got no signal).
-        self.obj_weights = obj_weights if obj_weights is not None else [1.0, 1e-2, 1e-4]
+        # Weighted-sum weights (PPO path) -- one per class, geometrically separated
+        # (100x) so T_1 dominates. Default generalizes the paper's [1.0,1e-2,1e-4]
+        # to any P; P=3 reproduces it exactly.
+        self.obj_weights = obj_weights if obj_weights is not None else [100.0 ** (-i) for i in range(self.P)]
 
     def step(self, td: TensorDict):
         current_node = td["action"][:, None]  # Add dimension for step
@@ -136,34 +144,48 @@ class CARPEnv:
                 shuffle=False,
                 num_workers=24,
                 data='carp_data.pt'):
+        # Scale workers to data size: few workers for small datasets (fork overhead
+        # dominates), more for large ones. Cap at the requested num_workers.
+        effective_workers = min(num_workers, max(0, data_size // 2000))
+        pin = effective_workers > 0
         if self.sizes is not None:
             # Multi-size: bucket by size, each batch single-size (Phase 6).
             ds = MultiSizeCARPGenerator(data_size, self.sizes, self.num_vehicle,
-                                        num_workers=num_workers, data=data)
+                                        num_workers=num_workers, data=data, P=self.P)
             sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
-            return DataLoader(ds, batch_sampler=sampler, num_workers=num_workers,
-                              collate_fn=ds.collate_fn)
+            return DataLoader(ds, batch_sampler=sampler, num_workers=effective_workers,
+                              collate_fn=ds.collate_fn, pin_memory=pin,
+                              persistent_workers=effective_workers > 0)
         return DataLoader(
-            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle, data=data),
+            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle,
+                           data=data, P=self.P),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=self.generator.collate_fn
+            num_workers=effective_workers,
+            collate_fn=self.generator.collate_fn,
+            pin_memory=pin,
+            persistent_workers=effective_workers > 0,
         )
+
+    def _pos_val(self):
+        """Priority class labels 1..P for the Scheduler/reward (-> a (B,P) T-vector)."""
+        return list(range(1, self.P + 1))
 
     def get_objective(self, td, actions, local_search=True):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
         return run_parallel(calc_reward, actions, td,
                             num_workers=reward_num_workers(len(actions)), num_epochs=10,
-                            local_search=local_search, variant=self.variant)
+                            local_search=local_search, variant=self.variant,
+                            pos_val=self._pos_val())
 
     def get_reward(self, td, actions):
         actions = actions.clone().detach().cpu().numpy()
         td = td.clone().detach().cpu()
         rs = run_parallel(calc_reward, actions, td,
                           num_workers=reward_num_workers(len(actions)), num_epochs=10,
-                          local_search=False, return_torch=True, variant=self.variant)  # (B,3) T-vector
+                          local_search=False, return_torch=True, variant=self.variant,
+                          pos_val=self._pos_val())  # (B,P) T-vector
         if self.reward_mode == 'vector':
             # GRPO path: hand the raw (B,3) T-vector (T positive, lower=better) to
             # the caller, which ranks the K samples lexicographically (Phase 3).

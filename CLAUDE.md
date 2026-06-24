@@ -5,7 +5,7 @@ Guidance for working in this repository.
 ## Project
 
 **HDCARP** — Hierarchical Directed Capacitated Arc Routing Problem. Solves arc-routing
-with priority classes via a hybrid of Reinforcement Learning (PPO + attention policy)
+with priority classes via a hybrid of Reinforcement Learning (PPO/GRPO + attention policy)
 and classical heuristics. Paper: arXiv:2501.00852.
 
 **Layout** — `src/` is an installed (editable) package root; entry-point scripts live in

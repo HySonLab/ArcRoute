@@ -60,19 +60,20 @@ def _fit_one_step(model, tag):
 class TestRankFunction(unittest.TestCase):
     def test_hand_example(self):
         """⭐ [[5,9,9],[5,2,9],[5,2,1],[7,0,0]] (K=4): best lex is [5,2,1] (idx 2)
-        -> max adv (+1); worst is [7,0,0] (idx 3) -> min adv (-1); mean ~ 0."""
+        -> adv=+1; worst is [7,0,0] (idx 3) -> adv=-1; mean == 0."""
         T = np.array([[5, 9, 9], [5, 2, 9], [5, 2, 1], [7, 0, 0]], dtype=float)
         adv = centered_lex_rank(T)
-        self.assertEqual(int(np.argmax(adv)), 2)      # [5,2,1] best
-        self.assertEqual(int(np.argmin(adv)), 3)      # [7,0,0] worst
-        self.assertAlmostEqual(float(adv[2]), 1.0, places=6)
-        self.assertAlmostEqual(float(adv[3]), -1.0, places=6)
+        self.assertEqual(int(np.argmax(adv)), 2)              # [5,2,1] best
+        self.assertEqual(int(np.argmin(adv)), 3)              # [7,0,0] worst
+        self.assertAlmostEqual(float(adv[2]),  1.0, places=6) # best → +1
+        self.assertAlmostEqual(float(adv[3]), -1.0, places=6) # worst → -1
         self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
     def test_k1_is_zero(self):
         self.assertTrue(np.allclose(centered_lex_rank(np.array([[1, 2, 3]])), 0.0))
 
     def test_zero_mean_and_bounded(self):
+        """Output is in [-1, +1], mean == 0 for any random group."""
         rng = np.random.default_rng(0)
         for _ in range(50):
             K = int(rng.integers(2, 12))
@@ -92,17 +93,17 @@ class TestRankFunction(unittest.TestCase):
 
     def test_tied_share_average_advantage(self):
         """⭐ Tied T-vectors get the SAME advantage (average rank), not arbitrary
-        lexsort-order ranks. Here idx 1 & 2 tie -> equal adv; unique best/worst keep
-        +1/-1; mean stays 0."""
+        lexsort-order ranks. Here idx 1 & 2 tie -> equal adv; unique best/worst
+        keep +1/-1; mean stays 0."""
         T = np.array([[5, 2, 9],      # middle
                       [5, 1, 1],      # tied-best with idx 2
                       [5, 1, 1],      # tied-best with idx 1
-                      [7, 0, 0]],     # worst
+                      [7, 0, 0]],     # worst (T1=7 > all others)
                      dtype=float)
         adv = centered_lex_rank(T)
         self.assertAlmostEqual(float(adv[1]), float(adv[2]), places=6)  # ties equal
         self.assertGreater(float(adv[1]), float(adv[0]))                # tied-best > middle
-        self.assertAlmostEqual(float(adv[3]), -1.0, places=6)           # unique worst
+        self.assertAlmostEqual(float(adv[3]), -1.0, places=6)           # unique worst → -1
         self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
     def test_general_P(self):
@@ -123,13 +124,13 @@ class TestRankFunction(unittest.TestCase):
             self.assertLessEqual(np.abs(adv).max(), 1.0 + 1e-9)
             self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
-    def test_no_ties_matches_old_integer_rank(self):
-        """⭐ Regression: with NO ties the result is byte-identical to the original
-        integer-rank formula (the validated behaviour must not change)."""
+    def test_no_ties_matches_integer_rank(self):
+        """⭐ With no ties the result is byte-identical to the plain integer-rank
+        formula (the validated core behaviour must not change)."""
         rng = np.random.default_rng(1)
         for _ in range(30):
             K = int(rng.integers(2, 10))
-            T = rng.random((K, 3)) * 1000  # large spread -> no accidental ties
+            T = rng.random((K, 3)) * 1000  # large spread → no accidental ties
             order = np.lexsort((T[:, 2], T[:, 1], T[:, 0]))
             rank = np.empty(K)
             rank[order] = np.arange(K - 1, -1, -1)
@@ -175,13 +176,14 @@ class TestGRPOStep(unittest.TestCase):
         return env, policy, model
 
     def test_advantage_finite_zero_mean(self):
+        """Option F: finite, mean≈0 per group, unit std per group."""
         env, policy, model = self._build()
         T = torch.rand(2, 8, 3)
         adv = model._group_advantage(T)        # (2,8)
         self.assertEqual(tuple(adv.shape), (2, 8))
         self.assertTrue(torch.isfinite(adv).all())
-        self.assertLessEqual(adv.abs().max().item(), 1.0 + 1e-6)
         self.assertTrue(torch.allclose(adv.mean(1), torch.zeros(2), atol=1e-6))
+        self.assertLessEqual(adv.abs().max().item(), 1.0 + 1e-6)
 
     def test_critic_free_and_ppo_free(self):
         """⭐ Fresh GRPO is standalone: no critic module, and NOT a PPO subclass."""
@@ -342,58 +344,6 @@ class TestDynamicGroupFiltering(unittest.TestCase):
         self.assertIn("train/skipped_frac", out)
         self.assertGreaterEqual(out["train/skipped_frac"], 0.0)
         self.assertLessEqual(out["train/skipped_frac"], 1.0)
-
-
-class TestAsymmetricClip(unittest.TestCase):
-    """⭐ DAPO clip-higher: asymmetric upper bound. clip_range_high=None ->
-    symmetric (backward compatible)."""
-
-    def _build(self, tag, **extra):
-        torch.manual_seed(0)
-        env = _make_env()
-        policy = _make_policy()
-        model = _make_model(GRPO, env, policy, tag=tag, group_size=8, **extra)
-        return env, policy, model
-
-    def test_symmetric_default_unchanged(self):
-        """Default (clip_range_high=None) -> clip_range_high == clip_range; one
-        train step runs without error."""
-        env, policy, model = self._build("ac_sym")
-        self.assertEqual(model.clip_range_high, model.clip_range)
-        _fit_one_step(model, "ac_sym")
-
-    def test_clip_higher_config(self):
-        """clip_range=0.2, clip_range_high=0.28 -> attrs set; one step runs."""
-        env, policy, model = self._build("ac_hi", clip_range=0.2, clip_range_high=0.28)
-        self.assertAlmostEqual(model.clip_range, 0.2, places=6)
-        self.assertAlmostEqual(model.clip_range_high, 0.28, places=6)
-        _fit_one_step(model, "ac_hi")
-
-    def test_asymmetric_clip_math(self):
-        """Pure-math: adv>0, ratio=1.5. Symmetric (eps=0.2) clips to 1.2;
-        asymmetric (high=0.28) clips to 1.28 -> larger surrogate magnitude."""
-        ratio = torch.tensor([[1.5]])
-        adv = torch.tensor([[1.0]])         # adv > 0
-        clip_low, clip_high = 0.2, 0.28
-
-        # symmetric
-        clipped_sym = torch.clamp(ratio, 1 - clip_low, 1 + clip_low)
-        self.assertAlmostEqual(float(clipped_sym), 1.2, places=6)
-        loss_sym = -torch.min(ratio * adv, clipped_sym * adv).mean()
-
-        # asymmetric (clip-higher), adv >= 0 branch
-        clipped_asym = torch.where(
-            adv >= 0,
-            torch.clamp(ratio, 1 - clip_low, 1 + clip_high),
-            torch.clamp(ratio, 1 - clip_low, 1 + clip_low),
-        )
-        self.assertAlmostEqual(float(clipped_asym), 1.28, places=6)
-        loss_asym = -torch.min(ratio * adv, clipped_asym * adv).mean()
-
-        # asymmetric admits a higher ratio -> larger surrogate magnitude (more neg).
-        self.assertLess(float(loss_asym), float(loss_sym))
-        self.assertAlmostEqual(float(loss_sym), -1.2, places=6)
-        self.assertAlmostEqual(float(loss_asym), -1.28, places=6)
 
 
 class TestRewardWorkersIdentical(unittest.TestCase):

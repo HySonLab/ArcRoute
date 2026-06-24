@@ -148,7 +148,9 @@ class BaseRL(LightningModule):
             sch.step()
         # Regenerate fresh training data every `reload_train_dataloader` epochs.
         if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
-            if os.path.exists(self.data_cfg["path_train_data"]):
+            path = self.data_cfg["path_train_data"]
+            # Only delete generated cache files (under data/), not external paths.
+            if path.startswith("data/") and os.path.exists(path):
                 print("DELETED train_data.pt")
-                os.remove(self.data_cfg["path_train_data"])
+                os.remove(path)
             self.load_dataloader()

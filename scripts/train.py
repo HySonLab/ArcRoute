@@ -1,4 +1,5 @@
 import torch
+torch.set_float32_matmul_precision('medium')
 import numpy as np
 import argparse
 from env.env import CARPEnv
@@ -86,7 +87,7 @@ if __name__ == "__main__":
     # D2 Phase 4: select the CLASS by --algo (no flag inside ppo.py). GRPO logs
     # per-objective T1/T2/T3 means so the learning curve shows T2/T3 descending.
     Model = GRPO if args.algo == 'grpo' else PPO
-    extra = {'group_size': args.group_size} if args.algo == 'grpo' else {}
+    extra = ({'group_size': args.group_size} if args.algo == 'grpo' else {})
     metrics = ({"train": ["reward", "loss", "surrogate_loss", "entropy",
                           "T1_mean", "T2_mean", "T3_mean"]}
                if args.algo == 'grpo' else
