@@ -42,6 +42,15 @@ class Scheduler:
         # rollout mask, not here. Kept for API clarity.
         self.variant = variant
         self.pos_val = list(pos_val)
+        # numpy caches populated by __call__ (or lazily by _cache_td on first use).
+        self._svc_np = self._adj_np = self._cls_np = None
+
+    def _cache_td(self, td):
+        """Cache hot-path tensors as numpy arrays. Called once per __call__;
+        also triggered lazily when internal methods are called directly."""
+        self._adj_np = self._np(td["adj"]).astype(np.float64)
+        self._svc_np = self._np(td["service_times"]).astype(np.float64)
+        self._cls_np = self._np(td["clss"]).reshape(-1).astype(np.int64)
 
     # ------------------------------------------------------------------ public
     def __call__(self, action, td, M=None):
@@ -56,6 +65,12 @@ class Scheduler:
         """
         if M is None and "num_vehicle" in td:
             M = int(td["num_vehicle"])
+
+        # Convert hot-path tensors to numpy ONCE per call. _trip_profile is
+        # invoked O(M*trips) times per instance; torch per-op overhead (~µs/op)
+        # on tiny arrays dominates over compute at that scale. Pure numpy avoids
+        # the kernel-launch cost entirely.
+        self._cache_td(td)
 
         if self.variant == "P":
             # HDCARP-P: the env mask makes the order globally class-sorted; split
@@ -145,7 +160,7 @@ class Scheduler:
         vehicles = [[] for _ in range(M)]
         if len(order) == 0:
             return vehicles
-        clss = self._np(td["clss"]).reshape(-1)
+        clss = self._cls_np
         demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
         cap = self._capacity(td)
 
@@ -223,7 +238,9 @@ class Scheduler:
         Key: (min class present, duration) ascending."""
         if len(veh_trips) <= 1:
             return veh_trips
-        clss = td["clss"]
+        if self._cls_np is None:
+            self._cache_td(td)
+        clss = self._cls_np
 
         def key(trip):
             cs = clss[np.asarray(trip, dtype=np.int64)]
@@ -235,18 +252,23 @@ class Scheduler:
         """For one trip (1D arc indices, no depot) return:
         (arc_class, arc_completion, duration), mirroring `calc_reward`'s math.
           path = [depot, *trip, depot]; cost per step = service + incoming travel.
+
+        Uses self._svc_np / _adj_np / _cls_np cached by __call__ to avoid
+        repeated torch tensor indexing (kernel-launch overhead >> compute on
+        tiny arrays of 10-30 arcs).
         """
-        path = np.concatenate(([0], np.asarray(trip, dtype=np.int64), [0]))
-        service = td["service_times"][path].to(torch.float64)
-        travel = td["adj"][path[:-1], path[1:]].to(torch.float64)
-        t = service.clone()
-        t[1:] = t[1:] + travel
-        cum = torch.cumsum(t, dim=0)
+        if self._svc_np is None:
+            self._cache_td(td)
+        trip = np.asarray(trip, dtype=np.int64)
+        path = np.empty(len(trip) + 2, dtype=np.int64)
+        path[0] = 0
+        path[1:-1] = trip
+        path[-1] = 0
+        t = self._svc_np[path].copy()
+        t[1:] += self._adj_np[path[:-1], path[1:]]
+        cum = np.cumsum(t)
         n = len(trip)
-        arc_completion = cum[1 : 1 + n]                  # completion per arc
-        arc_class = td["clss"][np.asarray(trip, dtype=np.int64)]
-        duration = cum[-1]                               # back at depot
-        return arc_class, arc_completion, duration
+        return self._cls_np[trip], cum[1:1 + n], cum[-1]
 
     def _completion_times(self, vehicles, td):
         """Hierarchical completion times T_k = max absolute completion over arcs
