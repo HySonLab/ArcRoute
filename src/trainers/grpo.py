@@ -196,8 +196,13 @@ class GRPO(BaseRL):
         with torch.no_grad():
             td0 = self.env.reset(batch)
             B = td0.batch_size[0]
-            td = batchify(td0, K)                     # (B*K, ...): k*B+b layout
-            out = self.policy(td.clone(), self.env, phase="train")
+            # Encode B instances once. Encoder uses InstanceNorm (batch-independent) so
+            # K copies of the same instance produce identical hidden states — no need to
+            # encode B*K times. Batchify the shared hidden to match k*B+b layout of td.
+            hidden0, _ = self.policy.encoder(td0)         # (B, N, embed_dim)
+            td = batchify(td0, K)                         # (B*K, ...): k*B+b layout
+            hidden = batchify(hidden0, K)                 # (B*K, N, embed_dim)
+            out = self.policy(td.clone(), self.env, phase="train", hidden=hidden)
         reward = out["reward"]                        # (B*K, 3) T-vector (no grad)
 
         T = unbatchify(reward, K)                     # (B, K, 3)

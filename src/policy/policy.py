@@ -77,8 +77,7 @@ class AttentionModelPolicy(nn.Module):
             temperature=decoding_kwargs.pop("temperature", self.temperature),
             tanh_clipping=decoding_kwargs.pop("tanh_clipping", self.tanh_clipping),
             mask_logits=decoding_kwargs.pop("mask_logits", self.mask_logits),
-            # store_all_logp=decoding_kwargs.pop("store_all_logp", return_entropy),
-            store_all_logp=True,
+            store_all_logp=decoding_kwargs.pop("store_all_logp", return_entropy),
             **decoding_kwargs,
         )
 
