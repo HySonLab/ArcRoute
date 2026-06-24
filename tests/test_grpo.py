@@ -4,6 +4,7 @@ critic-free, with rl/ppo.py left UNCHANGED.
 Run: uv run python -m unittest tests.test_grpo -v
 """
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -103,6 +104,24 @@ class TestRankFunction(unittest.TestCase):
         self.assertGreater(float(adv[1]), float(adv[0]))                # tied-best > middle
         self.assertAlmostEqual(float(adv[3]), -1.0, places=6)           # unique worst
         self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
+
+    def test_general_P(self):
+        """⭐ Works for P != 3 (P inferred from T width; T_1 still primary)."""
+        # P=4: [5,2,1,0] is best lex (lowest T_1, then T_2,...); [7,..] worst (T_1=7).
+        T = np.array([[5, 9, 9, 9], [5, 2, 9, 1], [5, 2, 1, 0], [7, 0, 0, 0]], dtype=float)
+        adv = centered_lex_rank(T)
+        self.assertEqual(int(np.argmax(adv)), 2)
+        self.assertEqual(int(np.argmin(adv)), 3)
+        self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
+        # random P in 2..6: finite, bounded, zero-mean
+        rng = np.random.default_rng(2)
+        for _ in range(30):
+            K = int(rng.integers(2, 9))
+            P = int(rng.integers(2, 7))
+            adv = centered_lex_rank(rng.random((K, P)))
+            self.assertTrue(np.all(np.isfinite(adv)))
+            self.assertLessEqual(np.abs(adv).max(), 1.0 + 1e-9)
+            self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
     def test_no_ties_matches_old_integer_rank(self):
         """⭐ Regression: with NO ties the result is byte-identical to the original
@@ -226,6 +245,157 @@ def _tiny_rollout(seed=0, B=6, K=4, n=15, M=3):
     return env, policy, td0, out
 
 
+def _wire_and_batch(model, tag):
+    """Attach `model` to a real CPU Trainer (so optimizers / manual_backward /
+    clip_gradients are wired) and return ONE real train batch so `_train_step`
+    can be invoked directly. `log_metrics` is stubbed to a pure dict passthrough
+    (Lightning's result collection isn't registered outside the training loop).
+    Caller is responsible for cleaning data files."""
+    from lightning import Trainer
+    trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
+                      limit_train_batches=1, limit_val_batches=0,
+                      num_sanity_val_steps=0, enable_checkpointing=False,
+                      logger=False, enable_progress_bar=False)
+    trainer.strategy.connect(model)
+    trainer.strategy._lightning_module = model
+    model.trainer = trainer
+    model.setup("fit")
+    trainer.strategy.setup_optimizers(trainer)
+
+    def _passthrough(metric_dict, phase, dataloader_idx=None):
+        return {f"{phase}/{k}": (v.mean() if isinstance(v, torch.Tensor) else v)
+                for k, v in metric_dict.items()}
+    model.log_metrics = _passthrough
+
+    batch = next(iter(model.train_dataloader()))
+    return trainer, batch
+
+
+def _cleanup(tag):
+    import glob
+    import os
+    for f in glob.glob(f"data/_{tag}_*.data"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+class TestDynamicGroupFiltering(unittest.TestCase):
+    """⭐ DAPO dynamic group filtering: groups whose K rollouts are all tied
+    (all-zero advantage) are dropped; train/skipped_frac monitors the fraction."""
+
+    def _build(self, tag, **extra):
+        torch.manual_seed(0)
+        env = _make_env()
+        policy = _make_policy()
+        # batch_size=16, group_size=8 -> B=2 instances.
+        model = _make_model(GRPO, env, policy, tag=tag, group_size=8, **extra)
+        return env, policy, model
+
+    def test_all_tied_skips_backward(self):
+        """Every group tied -> all-zero advantage -> early return loss=0.0,
+        skipped_frac=1.0, no backward, no crash."""
+        env, policy, model = self._build("dgf_all")
+        try:
+            _, batch = _wire_and_batch(model, "dgf_all")
+            with mock.patch.object(model, "_group_advantage",
+                                   side_effect=lambda T: torch.zeros(T.shape[0], T.shape[1])):
+                out = model._train_step(batch)
+        finally:
+            _cleanup("dgf_all")
+        self.assertEqual(float(out["loss"]), 0.0)
+        self.assertAlmostEqual(out["train/skipped_frac"], 1.0, places=6)
+
+    def test_partial_filter_only_active_groups(self):
+        """Group 0 tied (zeros), group 1 active (non-zero) -> backward runs only
+        on the 1 active group; skipped_frac == 0.5; no crash."""
+        env, policy, model = self._build("dgf_part")
+
+        def half_zero(T):
+            B, K = T.shape[0], T.shape[1]
+            adv = torch.zeros(B, K)
+            # first half of the groups get a real centered ranking; rest stay tied.
+            for b in range(B // 2):
+                adv[b] = torch.linspace(-1.0, 1.0, K)
+            return adv
+
+        try:
+            _, batch = _wire_and_batch(model, "dgf_part")
+            with mock.patch.object(model, "_group_advantage", side_effect=half_zero):
+                out = model._train_step(batch)
+        finally:
+            _cleanup("dgf_part")
+        self.assertAlmostEqual(out["train/skipped_frac"], 0.5, places=6)
+        self.assertTrue(np.isfinite(float(out["loss"])))
+        pgrads = [p.grad for p in model.policy.parameters() if p.grad is not None]
+        self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
+
+    def test_skipped_frac_logged(self):
+        """Normal data path: 'train/skipped_frac' is present in the returned dict."""
+        env, policy, model = self._build("dgf_log")
+        try:
+            _, batch = _wire_and_batch(model, "dgf_log")
+            out = model._train_step(batch)
+        finally:
+            _cleanup("dgf_log")
+        self.assertIn("train/skipped_frac", out)
+        self.assertGreaterEqual(out["train/skipped_frac"], 0.0)
+        self.assertLessEqual(out["train/skipped_frac"], 1.0)
+
+
+class TestAsymmetricClip(unittest.TestCase):
+    """⭐ DAPO clip-higher: asymmetric upper bound. clip_range_high=None ->
+    symmetric (backward compatible)."""
+
+    def _build(self, tag, **extra):
+        torch.manual_seed(0)
+        env = _make_env()
+        policy = _make_policy()
+        model = _make_model(GRPO, env, policy, tag=tag, group_size=8, **extra)
+        return env, policy, model
+
+    def test_symmetric_default_unchanged(self):
+        """Default (clip_range_high=None) -> clip_range_high == clip_range; one
+        train step runs without error."""
+        env, policy, model = self._build("ac_sym")
+        self.assertEqual(model.clip_range_high, model.clip_range)
+        _fit_one_step(model, "ac_sym")
+
+    def test_clip_higher_config(self):
+        """clip_range=0.2, clip_range_high=0.28 -> attrs set; one step runs."""
+        env, policy, model = self._build("ac_hi", clip_range=0.2, clip_range_high=0.28)
+        self.assertAlmostEqual(model.clip_range, 0.2, places=6)
+        self.assertAlmostEqual(model.clip_range_high, 0.28, places=6)
+        _fit_one_step(model, "ac_hi")
+
+    def test_asymmetric_clip_math(self):
+        """Pure-math: adv>0, ratio=1.5. Symmetric (eps=0.2) clips to 1.2;
+        asymmetric (high=0.28) clips to 1.28 -> larger surrogate magnitude."""
+        ratio = torch.tensor([[1.5]])
+        adv = torch.tensor([[1.0]])         # adv > 0
+        clip_low, clip_high = 0.2, 0.28
+
+        # symmetric
+        clipped_sym = torch.clamp(ratio, 1 - clip_low, 1 + clip_low)
+        self.assertAlmostEqual(float(clipped_sym), 1.2, places=6)
+        loss_sym = -torch.min(ratio * adv, clipped_sym * adv).mean()
+
+        # asymmetric (clip-higher), adv >= 0 branch
+        clipped_asym = torch.where(
+            adv >= 0,
+            torch.clamp(ratio, 1 - clip_low, 1 + clip_high),
+            torch.clamp(ratio, 1 - clip_low, 1 + clip_low),
+        )
+        self.assertAlmostEqual(float(clipped_asym), 1.28, places=6)
+        loss_asym = -torch.min(ratio * adv, clipped_asym * adv).mean()
+
+        # asymmetric admits a higher ratio -> larger surrogate magnitude (more neg).
+        self.assertLess(float(loss_asym), float(loss_sym))
+        self.assertAlmostEqual(float(loss_sym), -1.2, places=6)
+        self.assertAlmostEqual(float(loss_asym), -1.28, places=6)
+
+
 class TestRewardWorkersIdentical(unittest.TestCase):
     """#1: adaptive worker count must not change reward (DataLoader keeps order,
     calc_reward is deterministic). The old fixed 24 workers was the slowest choice."""
@@ -248,6 +418,31 @@ class TestRewardWorkersIdentical(unittest.TestCase):
         r8 = run_parallel(calc_reward, a, td_cpu, num_workers=8, num_epochs=10,
                           local_search=False, variant="P").numpy()
         self.assertTrue(np.array_equal(r0, r8), f"workers changed reward:\n{r0}\n{r8}")
+
+
+class TestPriorityCountP(unittest.TestCase):
+    """⭐ P (number of priority classes) is generalized; default 3 unchanged."""
+
+    def test_env_P4_reward_vector_width(self):
+        import os
+        from torch.utils.data import DataLoader
+        from env.env import CARPEnv
+        torch.manual_seed(0)
+        env = CARPEnv(num_loc=20, num_arc=20, num_vehicle=3, variant="P",
+                      reward_mode="vector", P=4)
+        self.assertEqual(env.obj_weights, [1.0, 1e-2, 1e-4, 1e-6])   # P=4 weights
+        policy = _make_policy()
+        tmp = "data/_p4.data"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        ds = env.generator(6, 20, 20, 3, data=tmp, P=4)
+        batch = next(iter(DataLoader(ds, batch_size=6, collate_fn=env.generator.collate_fn)))
+        td0 = env.reset(batch)
+        with torch.no_grad():
+            out = policy(batchify(td0, 4).clone(), env, phase="train")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        self.assertEqual(out["reward"].shape[-1], 4)   # P=4 -> T-vector width 4
 
 
 class TestEncoderShare(unittest.TestCase):
