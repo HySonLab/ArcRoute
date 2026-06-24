@@ -167,33 +167,38 @@ class Scheduler:
     def _balanced_chunks(block, demand, n):
         """Split a 1D arc array into `n` demand-balanced CONTIGUOUS chunks by
         cumulative-demand quantile (arc -> chunk ⌊cum_before / (total/n)⌋). Spreads
-        evenly; some chunks may be empty if len(block) < n."""
-        chunks = [[] for _ in range(n)]
-        if len(block) == 0:
-            return [np.array([], dtype=np.int64) for _ in range(n)]
-        d = demand[block]
-        target = float(d.sum()) / n
-        cum = 0.0
-        for arc, dd in zip(block.tolist(), d.tolist()):
-            c = min(n - 1, int(cum / target)) if target > 1e-12 else 0
-            chunks[c].append(arc)
-            cum += dd
-        return [np.array(c, dtype=np.int64) for c in chunks]
+        evenly; some chunks may be empty if len(block) < n.
+
+        Vectorized: chunk index = ⌊cum_before / target⌋ via cumsum + clip."""
+        block = np.asarray(block, dtype=np.int64)
+        if len(block) == 0 or n == 1:
+            return [block] + [np.array([], dtype=np.int64) for _ in range(n - 1)]
+        d = np.asarray(demand)[block].astype(np.float64)
+        total = float(d.sum())
+        if total < 1e-12:                                   # all-zero demand
+            return [block] + [np.array([], dtype=np.int64) for _ in range(n - 1)]
+        target = total / n
+        cum_before = np.concatenate(([0.0], np.cumsum(d)[:-1]))
+        chunk_idx = np.minimum(n - 1, (cum_before / target).astype(np.int64))
+        return [block[chunk_idx == c] for c in range(n)]
 
     @staticmethod
     def _split_by_capacity(route, demand, cap):
         """Split a class-ordered route into capacity-feasible trips (insert a depot
         reload whenever the next arc would exceed cap). Each trip stays a contiguous
         slice -> still non-decreasing in class."""
-        trips, cur, load = [], [], 0.0
-        for arc in route.tolist():
-            d = float(demand[arc])
-            if cur and load + d > cap + 1e-9:
-                trips.append(np.array(cur, dtype=np.int64)); cur, load = [], 0.0
-            cur.append(arc); load += d
-        if cur:
-            trips.append(np.array(cur, dtype=np.int64))
-        return trips
+        route = np.asarray(route, dtype=np.int64)
+        if len(route) == 0:
+            return []
+        d = np.asarray(demand)[route].astype(np.float64)
+        trips, start, cum = [], 0, 0.0
+        for i in range(len(route)):
+            dd = float(d[i])
+            if start < i and cum + dd > cap + 1e-9:
+                trips.append(route[start:i]); start, cum = i, 0.0
+            cum += dd
+        trips.append(route[start:])
+        return [np.array(t, dtype=np.int64) for t in trips]
 
     def _assign(self, trips, td, M):
         """Assign trips to M vehicles. ≤M trips → one per vehicle (single-trip,
@@ -248,6 +253,19 @@ class Scheduler:
         duration = cum[-1]                               # back at depot
         return arc_class, arc_completion, duration
 
+    def _ordered_with_profiles(self, veh_trips, td):
+        """Sort a vehicle's trips priority-first (same key as `_order_trips`:
+        (min class present, duration) ascending) and return
+        [(trip, arc_class, arc_comp, duration), ...]. Profiles are computed ONCE
+        here (Opt B: no duplicate `_trip_profile` call in `_completion_times`)."""
+        if not veh_trips:
+            return []
+        profiles = [(trip, *self._trip_profile(trip, td)) for trip in veh_trips]
+        if len(profiles) == 1:
+            return profiles
+        return sorted(profiles,
+                      key=lambda x: (int(self._np(x[1]).min()), float(x[3])))
+
     def _completion_times(self, vehicles, td):
         """Hierarchical completion times T_k = max absolute completion over arcs
         of class k. A trip's arcs start at the vehicle's running offset (sum of
@@ -255,14 +273,16 @@ class Scheduler:
 
         Single-trip (offset 0 everywhere) reproduces `calc_reward` exactly.
         """
-        per_class = {p: [0.0] for p in self.pos_val}     # empty class -> T_k = 0
+        per_class = {p: 0.0 for p in self.pos_val}        # empty class -> T_k = 0
         for veh_trips in vehicles:
             offset = 0.0
-            for trip in self._order_trips(veh_trips, td):   # priority-first
-
-                arc_class, arc_comp, duration = self._trip_profile(trip, td)
-                for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
-                    if c in per_class:
-                        per_class[c].append(offset + ac)
+            for trip, arc_class, arc_comp, duration in \
+                    self._ordered_with_profiles(veh_trips, td):  # priority-first
+                arc_class_np = self._np(arc_class).ravel().astype(np.int64)
+                abs_comp = self._np(arc_comp).ravel() + offset
+                for p in self.pos_val:
+                    vals = abs_comp[arc_class_np == p]
+                    if vals.size:
+                        per_class[p] = max(per_class[p], float(vals.max()))
                 offset += float(duration)
-        return np.array([max(per_class[p]) for p in self.pos_val], dtype=np.float64)
+        return np.array([per_class[p] for p in self.pos_val], dtype=np.float64)

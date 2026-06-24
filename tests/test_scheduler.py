@@ -274,5 +274,128 @@ class TestRolloutSmoke(unittest.TestCase):
         self.assertTrue(grads and all(torch.isfinite(g).all() for g in grads))
 
 
+# ----------------------------------------------------------------- pinning
+def pin_instance():
+    """Tiny deterministic single-instance td (depot 0 + 4 arcs) with known
+    service/adj/demand/class so every T_vec can be derived by hand."""
+    clss = torch.tensor([0, 1, 1, 2, 3], dtype=torch.int64)
+    service_times = torch.tensor([0.0, 1.0, 2.0, 1.0, 3.0], dtype=torch.float64)
+    idx = torch.arange(5, dtype=torch.float64)
+    adj = (idx[:, None] - idx[None, :]).abs() * 0.5
+    demand = torch.tensor([0.0, 0.3, 0.4, 0.5, 0.2], dtype=torch.float64)
+    return {
+        "clss": clss,
+        "service_times": service_times,
+        "adj": adj,
+        "demand": demand,
+        "vehicle_capacity": torch.tensor([1.0]),
+    }
+
+
+class TestSchedulerPinning(unittest.TestCase):
+    """Pin the CURRENT numeric output of Scheduler internals + end-to-end so any
+    refactor that changes results fails immediately (byte-identical floats)."""
+
+    def setUp(self):
+        self.td = pin_instance()
+        self.demand = self.td["demand"].numpy()
+        self.s = Scheduler(variant="P")
+
+    # 1. _trip_profile output shape + values -------------------------------
+    def test_trip_profile_values(self):
+        ac, comp, dur = self.s._trip_profile(np.array([1, 2]), self.td)
+        np.testing.assert_array_equal(np.asarray(ac), np.array([1, 1]))
+        np.testing.assert_allclose(np.asarray(comp), np.array([1.5, 4.0]), atol=1e-10)
+        np.testing.assert_allclose(float(dur), 5.0, atol=1e-10)
+
+        ac, comp, dur = self.s._trip_profile(np.array([3]), self.td)
+        np.testing.assert_array_equal(np.asarray(ac), np.array([2]))
+        np.testing.assert_allclose(np.asarray(comp), np.array([2.5]), atol=1e-10)
+        np.testing.assert_allclose(float(dur), 4.0, atol=1e-10)
+
+    # 2. _completion_times exact -------------------------------------------
+    def test_completion_times_exact(self):
+        # veh0 = one trip [1,2]; veh1 = two trips [3] then [4] (multi-trip offset).
+        v0 = [np.array([1, 2])]
+        v1 = [np.array([3]), np.array([4])]
+        T = self.s._completion_times([v0, v1], self.td)
+        np.testing.assert_allclose(T, np.array([4.0, 2.5, 9.0]), atol=1e-10)
+
+    # 3. _balanced_chunks exact --------------------------------------------
+    def test_balanced_chunks_exact(self):
+        block = np.array([1, 2, 3, 4], dtype=np.int64)
+        c2 = self.s._balanced_chunks(block, self.demand, 2)
+        self.assertEqual([c.tolist() for c in c2], [[1, 2], [3, 4]])
+        c3 = self.s._balanced_chunks(block, self.demand, 3)
+        self.assertEqual([c.tolist() for c in c3], [[1, 2], [3], [4]])
+        c1 = self.s._balanced_chunks(block, self.demand, 1)
+        self.assertEqual([c.tolist() for c in c1], [[1, 2, 3, 4]])
+        empty = self.s._balanced_chunks(np.array([], dtype=np.int64), self.demand, 2)
+        self.assertEqual([c.tolist() for c in empty], [[], []])
+
+    # 4. _split_by_capacity exact ------------------------------------------
+    def test_split_by_capacity_exact(self):
+        route = np.array([1, 2, 3, 4], dtype=np.int64)  # dem .3,.4,.5,.2
+        trips = self.s._split_by_capacity(route, self.demand, 1.0)
+        self.assertEqual([t.tolist() for t in trips], [[1, 2], [3, 4]])
+        self.assertEqual(self.s._split_by_capacity(np.array([], dtype=np.int64),
+                                                   self.demand, 1.0), [])
+
+    # 5. end-to-end variant P -----------------------------------------------
+    def test_e2e_P(self):
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        _, T1 = Scheduler(variant="P")(action, self.td, M=1)
+        _, T2 = Scheduler(variant="P")(action, self.td, M=2)
+        _, T5 = Scheduler(variant="P")(action, self.td, M=5)
+        np.testing.assert_allclose(T1, np.array([4.0, 7.5, 11.0]), atol=1e-10)
+        np.testing.assert_allclose(T2, np.array([4.0, 2.5, 8.0]), atol=1e-10)
+        np.testing.assert_allclose(T5, np.array([3.0, 2.5, 7.0]), atol=1e-10)
+
+    # 6. end-to-end variant U -----------------------------------------------
+    def test_e2e_U(self):
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        _, T1 = Scheduler(variant="U")(action, self.td, M=1)
+        _, T2 = Scheduler(variant="U")(action, self.td, M=2)
+        _, T5 = Scheduler(variant="U")(action, self.td, M=5)
+        np.testing.assert_allclose(T1, np.array([4.0, 7.5, 11.0]), atol=1e-10)
+        np.testing.assert_allclose(T2, np.array([4.0, 2.5, 6.0]), atol=1e-10)
+        np.testing.assert_allclose(T5, np.array([4.0, 2.5, 5.0]), atol=1e-10)
+
+    # 7. calc_reward matches Scheduler directly ----------------------------
+    def test_calc_reward_matches(self):
+        from solvers.cal_reward import calc_reward
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        td = pin_instance()
+        td["num_vehicle"] = torch.tensor([2])
+        rs = calc_reward(action, td, return_numpy=True, variant="P")
+        _, T = Scheduler(variant="P")(action, td, M=2)
+        np.testing.assert_allclose(rs.astype(np.float64), T, atol=1e-10)
+        np.testing.assert_allclose(rs.astype(np.float64),
+                                   np.array([4.0, 2.5, 8.0]), atol=1e-10)
+
+    # 8. numerical edge cases ----------------------------------------------
+    def test_edge_single_arc(self):
+        _, T = Scheduler(variant="P")(np.array([3]), self.td, M=1)
+        np.testing.assert_allclose(T, np.array([0.0, 2.5, 0.0]), atol=1e-10)
+
+    def test_edge_all_same_class(self):
+        td = pin_instance()
+        td["clss"] = torch.tensor([0, 1, 1, 1, 1], dtype=torch.int64)
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        _, T = Scheduler(variant="P")(action, td, M=2)
+        np.testing.assert_allclose(T, np.array([6.0, 0.0, 0.0]), atol=1e-10)
+
+    def test_edge_M1(self):
+        # single vehicle: all 4 arcs serialised on one vehicle (multi-trip).
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        _, T = Scheduler(variant="P")(action, self.td, M=1)
+        np.testing.assert_allclose(T, np.array([4.0, 7.5, 11.0]), atol=1e-10)
+
+    def test_edge_M_larger_than_trips(self):
+        action = np.array([1, 0, 2, 3, 0, 4], dtype=np.int64)
+        _, T = Scheduler(variant="P")(action, self.td, M=10)
+        np.testing.assert_allclose(T, np.array([3.0, 2.5, 5.0]), atol=1e-10)
+
+
 if __name__ == "__main__":
     unittest.main()
