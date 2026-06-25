@@ -36,11 +36,9 @@ class ARPContext(nn.Module):
 
         remaining_cap = td["vehicle_capacity"] - td["used_capacity"]       # (B,1)
 
-        # Fraction of arcs served per priority class
         total = td["clss_total"].clamp(min=1.0)                            # (B,3)
         frac_served = td["clss_served"] / total                            # (B,3)
 
-        # Deadhead cost to return to depot from current arc
         adj = td["adj"]                                                    # (B,N+1,N+1)
         cn  = td["current_node"].view(B)                                   # (B,)
         dist_to_depot = adj[torch.arange(B, device=dev), cn, 0].unsqueeze(-1)  # (B,1)
