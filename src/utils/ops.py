@@ -247,10 +247,8 @@ def dist_edges_from_file(es):
     return dms
 
 def import_instance(es, M=None):
-    # M (fleet size) is a SOLVE-time parameter, not an instance property: the
-    # instance (arcs, demands, C) is identical for any M because C = sum(q)/3 +
-    # 0.5 has a fixed /3 (paper F5). Pass M to override the nominal value stored
-    # in the .npz; leave it None to use the stored default.
+    # C is generated as Σq/M_nominal + 0.5 (M-dependent). Pass M to override
+    # the nominal fleet stored in the .npz at eval time; None uses the stored default.
     if isinstance(es, str):
         es = np.load(es)
     C = es['C']

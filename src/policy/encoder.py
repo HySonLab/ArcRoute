@@ -1,15 +1,42 @@
-from typing import Tuple, Union, List
-from typing import Callable, Optional
-import torch.nn as nn
+import math
+from typing import Callable, List, Optional, Tuple, Union
+
 import torch
+import torch.nn as nn
+from einops import rearrange
 from tensordict import TensorDict
 from torch import Tensor
-from typing import Tuple, Union
-from einops import rearrange
 from torch.nn.functional import scaled_dot_product_attention
-import math
-from policy.init import ARPInitEmbedding
-    
+
+
+
+class ARPInitEmbedding(nn.Module):
+    def __init__(self, embed_dim, linear_bias=True, node_dim: int = 4):
+        super(ARPInitEmbedding, self).__init__()
+        self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)
+        self.init_embed_depot = nn.Linear(
+            node_dim, embed_dim, linear_bias
+        )  # depot embedding
+
+    def forward(self, td):
+        node_feats = torch.cat(
+            (
+                td["demand"][..., None],
+                td["clss"][..., None],
+                td["service_times"][..., None],
+                td["traversal_times"][..., None],
+            ),
+            -1,
+        )
+
+        # node_feats = torch.nan_to_num(node_feats, nan=0.0, posinf=0.0, neginf=0.0)
+        depot_embedding = self.init_embed_depot(node_feats[:, :1, :])
+        node_embeddings = self.init_embed(node_feats[:, 1:, :])
+        # depot_feats = torch.nan_to_num(depot_feats, nan=0.0, posinf=0.0, neginf=0.0)
+        out = torch.cat((depot_embedding, node_embeddings), -2)
+        return out
+
+
 class SkipConnection(nn.Module):
     def __init__(self, module):
         super(SkipConnection, self).__init__()
@@ -44,6 +71,7 @@ class Normalization(nn.Module):
         else:
             assert self.normalizer is None, "Unknown normalizer type"
             return x
+
 
 class MLP(nn.Module):
     def __init__(
@@ -113,8 +141,8 @@ class MLP(nn.Module):
 
     def _get_act(self, is_last):
         return self.out_act if is_last else self.hidden_act
-    
-            
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(
         self,
@@ -135,11 +163,13 @@ class MultiHeadAttention(nn.Module):
         self.sdpa_fn = sdpa_fn if sdpa_fn is not None else scaled_dot_product_attention
 
         self.num_heads = num_heads
-        assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
+        assert self.embed_dim % num_heads == 0, (
+            "self.kdim must be divisible by num_heads"
+        )
         self.head_dim = self.embed_dim // num_heads
-        assert (
-            self.head_dim % 8 == 0 and self.head_dim <= 128
-        ), "Only support head_dim <= 128 and divisible by 8"
+        assert self.head_dim % 8 == 0 and self.head_dim <= 128, (
+            "Only support head_dim <= 128 and divisible by 8"
+        )
 
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
@@ -164,7 +194,9 @@ class MultiHeadAttention(nn.Module):
         # Modify attention using adjacency matrix
         # Here we multiply the attention scores by the adjacency matrix to mask out non-neighbors
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights * adj.unsqueeze(1)  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
+        attn_weights = attn_weights * adj.unsqueeze(
+            1
+        )  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
         attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
 
         attn_weights = nn.Softmax(dim=-1)(attn_weights)
@@ -175,7 +207,8 @@ class MultiHeadAttention(nn.Module):
         out = torch.matmul(attn_weights, v)
         out = rearrange(out, "b h s d -> b s (h d)")
         return self.out_proj(out)
-    
+
+
 class MultiHeadAttentionLayer(nn.Sequential):
     def __init__(
         self,
@@ -188,15 +221,20 @@ class MultiHeadAttentionLayer(nn.Sequential):
         moe_kwargs: Optional[dict] = None,
     ):
 
-
         super(MultiHeadAttentionLayer, self).__init__()
-        
+
         num_neurons = [feedforward_hidden] if feedforward_hidden > 0 else []
         self.f1 = MultiHeadAttention(embed_dim, num_heads, bias=bias, sdpa_fn=sdpa_fn)
         self.f2 = Normalization(embed_dim, normalization)
-        self.f3 = SkipConnection(MLP(input_dim=embed_dim, output_dim=embed_dim, num_neurons=num_neurons, hidden_act="ReLU"))
+        self.f3 = SkipConnection(
+            MLP(
+                input_dim=embed_dim,
+                output_dim=embed_dim,
+                num_neurons=num_neurons,
+                hidden_act="ReLU",
+            )
+        )
         self.f4 = Normalization(embed_dim, normalization)
-    
 
     def forward(self, x: Tensor, adj: Optional[Tensor] = None) -> Tensor:
         """Forward pass of the MHA layer
@@ -210,9 +248,10 @@ class MultiHeadAttentionLayer(nn.Sequential):
         x = self.f2(x)  # Normalization
         x = self.f3(x)  # SkipConnection with Feedforward (MLP)
         x = self.f4(x)  # Normalization
-        
+
         return x
-    
+
+
 class GraphAttentionNetwork(nn.Module):
     """Graph Attention Network to encode embeddings with a series of MHA layers consisting of a MHA layer,
     normalization, feed-forward layer, and normalization. Similar to Transformer encoder, as used in Kool et al. (2019).
@@ -270,7 +309,7 @@ class Encoder(nn.Module):
         normalization: str = "instance",
         feedforward_hidden: int = 512,
         net: nn.Module = None,
-        sdpa_fn = None,
+        sdpa_fn=None,
         moe_kwargs: dict = None,
     ):
         super(Encoder, self).__init__()
@@ -300,7 +339,7 @@ class Encoder(nn.Module):
         init_h = self.init_embedding(td)
 
         # Process embedding
-        h = self.net(init_h, td['adj'])
+        h = self.net(init_h, td["adj"])
 
         # Return latent representation and initial embedding
         return h, init_h

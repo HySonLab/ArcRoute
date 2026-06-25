@@ -1,27 +1,16 @@
 """GRPO — group-relative policy optimization with a centered lexicographic-rank
-advantage. A STANDALONE sibling of PPO (both inherit `BaseRL`); GRPO does NOT
-depend on PPO.
+advantage. Critic-free: the centered group rank IS the advantage.
 
-This is the rl4co/POMO-style design: a group baseline, but the baseline/advantage
-is a *lexicographic rank* over the K group samples instead of the group mean (the
-project's multi-objective T₁≺T₂≺T₃ signal).
-
-What it deliberately does NOT have (vs a PPO-style trainer):
-  * no critic / value network — the centered group rank IS the advantage.
-  * no value loss.
-
-Memory-efficient update (same structure as the old PPO-subclassing GRPO):
-  1. Roll out the full B*K group inside `torch.no_grad()` — NO activation graph is
-     kept, so the huge B*K forward costs almost no memory. The rollout's reward,
-     summed log-prob (the "old" log-prob) and actions are stashed in `td`.
+Memory-efficient update:
+  1. Roll out the full B*K group inside `torch.no_grad()` — no activation graph,
+     so the B*K forward costs almost no memory. Reward, summed log-prob and actions
+     are stashed in `td`.
   2. Re-run the policy in MINI-BATCHES (chunks of `mini_batch_size`) with grad on,
-     replaying the stored actions (`actions=...`, `calc_reward=False`). Gradient
-     is only ever materialized for one small slice at a time.
-  3. PPO-style clipped surrogate with the lexicographic rank as the advantage:
+     replaying stored actions. Gradient materializes for one slice at a time.
+  3. Clipped surrogate with the lexicographic rank as the advantage:
          ratio     = exp(ll_new - ll_old)
          surrogate = -min(ratio*adv, clip(ratio, 1-eps, 1+eps)*adv).mean()
          loss      = surrogate - entropy_lambda * entropy.mean()
-     No value loss (critic-free): the group mean is the baseline.
 
 The env must run in reward_mode='vector' so the rollout reward is the (B*K,3)
 T-vector that the rank consumes.
@@ -138,9 +127,8 @@ class GRPO(BaseRL):
         lr: float = 1e-4,
         entropy_lambda: float = 0.0,
         max_grad_norm: float = 1.0,
-        clip_range: float = 0.2,       # epsilon of the PPO-style clipped surrogate
-        ppo_epochs: int = 1,           # inner passes over the rollout per update
-        mini_batch_size: int = 256,    # chunk size of the grad-enabled inner loop
+        clip_range: float = 0.2,
+        mini_batch_size: int = 256,
         batch_size: int = 1024,
         train_data_size: int = 100000,
         val_data_size: int = 10000,
@@ -170,7 +158,6 @@ class GRPO(BaseRL):
         self.entropy_lambda = entropy_lambda
         self.max_grad_norm = max_grad_norm
         self.clip_range = clip_range
-        self.ppo_epochs = ppo_epochs
         self.mini_batch_size = mini_batch_size
 
     def configure_optimizers(self):
@@ -244,17 +231,15 @@ class GRPO(BaseRL):
         keep = (torch.arange(K).view(K, 1) * B + active_idx.view(1, -1)).reshape(-1)
         td = td[keep.to(reward.device)]
 
-        # (2) Grad-enabled inner loop over mini-batches. ppo_epochs shuffled passes.
+        # (2) Grad-enabled inner loop: one shuffled pass over active rollouts.
         mini_batch_size = max(1, min(self.mini_batch_size, td.size(0)))
-        idxs = torch.cat([torch.randperm(td.size(0)) for _ in range(self.ppo_epochs)])
-        size_inner = td.size(0) * self.ppo_epochs
+        idxs = torch.randperm(td.size(0))
 
         opt = self.optimizers()
-        loss = surrogate_loss = entropy = None
-        for i in range(0, size_inner, mini_batch_size):
-            id_sub = idxs[i:i + mini_batch_size]
-            sub_td = td[id_sub]
-            adv = sub_td["advantage"].view(-1, 1)     # rank, already centered
+        loss = entropy = None
+        for i in range(0, td.size(0), mini_batch_size):
+            sub_td = td[idxs[i:i + mini_batch_size]]
+            adv = sub_td["advantage"].view(-1, 1)
 
             out_i = self.policy(
                 sub_td.clone(),
@@ -265,12 +250,11 @@ class GRPO(BaseRL):
                 return_sum_log_likelihood=False,
             )
             ll, entropy = out_i["log_likelihood"], out_i["entropy"]
-            # ratio of new/old action probabilities for the replayed actions.
             ratio = torch.exp(ll.sum(dim=-1) - sub_td["logprobs"]).view(-1, 1)
 
             clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
-            surrogate_loss = -torch.min(ratio * adv, clipped_ratio * adv).mean()
-            loss = surrogate_loss - self.entropy_lambda * entropy.mean()
+            loss = -torch.min(ratio * adv, clipped_ratio * adv).mean() \
+                   - self.entropy_lambda * entropy.mean()
 
             opt.zero_grad()
             self.manual_backward(loss)

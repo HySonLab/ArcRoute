@@ -76,7 +76,7 @@ class TestVectorReward(unittest.TestCase):
 
 
 class TestRolloutSmokeScalar(unittest.TestCase):
-    """⭐ The OLD scalar PPO path still works: reset -> policy(calc_reward=True)
+    """⭐ Scalar reward mode: reset -> policy(calc_reward=True)
     -> reward (B,1) -> backward, finite. Variant P then U."""
 
     def _run(self, variant):

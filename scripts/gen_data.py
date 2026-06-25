@@ -9,15 +9,15 @@ Pipeline:
   4. Priority class of each required arc drawn uniformly from {1,2,3}.
   5. Traversal time d_a = d'_a / d'_max (Euclidean, normalized); service = 2*d_a.
   6. Demand q_a = d_a * 0.5 + 0.5.
-  7. Vehicle capacity Q = sum_{a in A_r} (q_a / 3 + 0.5).
+  7. Vehicle capacity Q = sum_{a in A_r} q_a / M + 0.5  (M = fleet size).
 
 The per-instance physics live in `build_instance`, which is pure (no OSMnx) and
 unit-tested in tests/test_gen.py. OSMnx is only needed to run this script
 end to end; install it first, e.g. `uv add osmnx`.
 
-Phase 3 (revised): M (fleet) is a SOLVE-time parameter, not a generation axis.
-Arcs are generated ONCE per (topology, |A|); the fleet sweep happens at eval by
-overriding M (import_instance(M=...) / baseline --M). No per-M folders.
+M (fleet size) is used at generation time to set capacity Q = Σq/M + 0.5, so
+each instance is designed for exactly M vehicles. Default M=2. Pass --m_nominal
+to override. No per-M folders; arcs generated once per (topology, |A|).
 
 Usage:
     uv run python data/gen.py --topology unit_square --min_arc 40   # data/ood/unit_square/<|A|>/*.npz
@@ -99,9 +99,10 @@ def build_instance(edges, coords, M, rng=np.random):
     ])
     rng.shuffle(clss)
 
-    # Paper F5: vehicle capacity Q = (sum over required arcs of q_a) / 3 + 0.5.
-    # (add 0.5 ONCE — the old `(q/3 + 0.5).sum()` added 0.5 per arc, ~75x too loose.)
-    C = float(q_req.sum() / 3.0 + 0.5)
+    # Vehicle capacity Q = Σq_a / M + 0.5: M vehicles is the tight minimum fleet.
+    # Ha et al. (2024) hardcode M=3; we generalise so each instance is designed for
+    # exactly M vehicles regardless of fleet size used at eval.
+    C = float(q_req.sum() / M + 0.5)
 
     req = np.column_stack([e_req, q_req, clss, s_req, d_req]).astype(np.float64)
     z = np.zeros(len(e_nonreq))
@@ -250,7 +251,7 @@ def gen_graph(G_proj, target_nodes, M, save_dir, rng=np.random):
 
 def main():
     p = argparse.ArgumentParser(description="Generate paper-faithful HDCARP instances.")
-    p.add_argument("--m_nominal", type=int, default=3,
+    p.add_argument("--m_nominal", type=int, default=2,
                    help="nominal fleet M written into the .npz. M is a SOLVE-time "
                         "parameter (Phase 3 revised): generate arcs ONCE and override "
                         "M at eval (import_instance(M=...) / baseline --M). NOT a "

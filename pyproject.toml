@@ -14,6 +14,8 @@ dependencies = [
     "gurobipy",
     "scipy>=1.15.3",
     "osmnx>=2.0.7",
+    "matplotlib>=3.10.9",
+    "networkx>=3.4.2",
 ]
 
 [build-system]

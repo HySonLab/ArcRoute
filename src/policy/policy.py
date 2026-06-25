@@ -1,12 +1,9 @@
 import torch.nn as nn
-import torch
-from utils.ops import get_log_likelihood
-from policy.encoder import Encoder 
-from policy.decoder import Decoder 
-from policy.decode_strategy import get_decoding_strategy, calculate_entropy
-from utils.ops import gather_by_index, refine_routes, prob_idxs, run_parallel
-import numpy as np
 
+from policy.decode_strategy import calculate_entropy, get_decoding_strategy
+from policy.decoder import Decoder
+from policy.encoder import Encoder
+from utils.ops import get_log_likelihood
 
 class AttentionModelPolicy(nn.Module):
     def __init__(
@@ -24,7 +21,9 @@ class AttentionModelPolicy(nn.Module):
     ):
         super(AttentionModelPolicy, self).__init__()
 
-        self.encoder = Encoder(embed_dim=embed_dim, num_layers=num_encoder_layers, num_heads=num_heads)
+        self.encoder = Encoder(
+            embed_dim=embed_dim, num_layers=num_encoder_layers, num_heads=num_heads
+        )
         self.decoder = Decoder(embed_dim=embed_dim, num_heads=num_heads)
 
         self.embed_dim = embed_dim
@@ -36,7 +35,7 @@ class AttentionModelPolicy(nn.Module):
         self.train_decode_type = train_decode_type
         self.val_decode_type = val_decode_type
         self.test_decode_type = test_decode_type
-    
+
     def forward(
         self,
         td,
@@ -97,7 +96,7 @@ class AttentionModelPolicy(nn.Module):
             td = env.step(td)
             step += 1
             if step > max_steps:
-                print(
+                print(f"Exceeded maximum number of steps ({max_steps}) duing decoding")
                     f"Exceeded maximum number of steps ({max_steps}) duing decoding"
                 )
                 break

@@ -14,7 +14,6 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import train
 from trainers.grpo import GRPO
-from trainers.ppo import PPO
 
 
 def _parse(argv):
@@ -23,7 +22,7 @@ def _parse(argv):
 
 
 def _auto_reward_mode(args):
-    return args.reward_mode or ("vector" if args.algo == "grpo" else "scalar")
+    return args.reward_mode
 
 
 def _make_env(reward_mode, variant="P", n=15, M=3):
@@ -66,29 +65,25 @@ def _fit_one_step(model, tag):
                 pass
 
 
-GRPO_METRICS = {"train": ["reward", "loss", "surrogate_loss", "entropy",
+GRPO_METRICS = {"train": ["reward", "loss", "entropy",
                           "T1_mean", "T2_mean", "T3_mean"]}
-PPO_METRICS = {"train": ["reward", "loss", "surrogate_loss", "value_loss", "entropy"]}
 
 
 class TestParseArgs(unittest.TestCase):
-    def test_algo_and_group_size(self):
-        a = _parse(["--algo", "grpo", "--group_size", "16"])
-        self.assertEqual(a.algo, "grpo")
+    def test_group_size(self):
+        a = _parse(["--group_size", "16"])
         self.assertEqual(a.group_size, 16)
 
     def test_defaults(self):
         a = _parse([])
-        self.assertEqual(a.algo, "ppo")
         self.assertEqual(a.group_size, 8)
-        self.assertIsNone(a.reward_mode)
+        self.assertEqual(a.reward_mode, "vector")
 
     def test_auto_reward_mode(self):
-        self.assertEqual(_auto_reward_mode(_parse(["--algo", "grpo"])), "vector")
-        self.assertEqual(_auto_reward_mode(_parse(["--algo", "ppo"])), "scalar")
+        self.assertEqual(_auto_reward_mode(_parse([])), "vector")
         # explicit override is respected
         self.assertEqual(
-            _auto_reward_mode(_parse(["--algo", "grpo", "--reward_mode", "scalar"])),
+            _auto_reward_mode(_parse(["--reward_mode", "scalar"])),
             "scalar")
 
 
@@ -126,15 +121,6 @@ class TestBuildAndStep(unittest.TestCase):
             self.assertIn(k, captured)
             self.assertIsNotNone(captured[k])
             self.assertTrue(torch.isfinite(captured[k]).all())
-
-    def test_ppo_build_still_works(self):
-        """⭐ default ppo path still trains (A/B)."""
-        torch.manual_seed(0)
-        env = _make_env("scalar")
-        model = _make_model(PPO, env, _make_policy(), "ppo", PPO_METRICS)
-        _fit_one_step(model, "ppo")
-        pg = [p.grad for p in model.policy.parameters() if p.grad is not None]
-        self.assertTrue(pg and all(torch.isfinite(g).all() for g in pg))
 
 
 if __name__ == "__main__":

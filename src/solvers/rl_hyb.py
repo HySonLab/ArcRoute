@@ -1,7 +1,6 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from trainers.ppo import PPO
 import torch
 import numpy as np
 from glob import glob
@@ -9,13 +8,30 @@ from time import time
 import argparse
 from utils.ops import import_instance, batchify
 from utils.nb_utils import gen_tours
+
+
 class RLHCARP:
     def __init__(self, pw, variant, device='cuda'):
-        model = PPO.load_from_checkpoint(pw)
+        from policy.policy import AttentionModelPolicy
+        from env.env import CARPEnv
+        ckpt = torch.load(pw, map_location="cpu", weights_only=False)
+        hp = ckpt.get("hyper_parameters", {})
+        policy = AttentionModelPolicy(
+            embed_dim=hp.get("embed_dim", 128),
+            num_encoder_layers=hp.get("num_encoder_layers", 6),
+            num_heads=hp.get("num_heads", 8),
+        )
+        sd = {k[len("policy."):]: v for k, v in ckpt["state_dict"].items()
+              if k.startswith("policy.")}
+        policy.load_state_dict(sd, strict=False)
         self.device = device
-        self.policy = model.policy.to(device)
-        self.env = model.env
-        self.env.variant = variant
+        self.policy = policy.to(device)
+        self.env = CARPEnv(
+            num_loc=hp.get("num_loc", 40),
+            num_arc=hp.get("num_arc", 80),
+            variant=variant,
+            reward_mode="vector",
+        )
         
     
     def import_instance(self, f, M=None):

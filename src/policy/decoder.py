@@ -1,13 +1,39 @@
+import math
 from dataclasses import dataclass
 from typing import Tuple, Union
+
 import torch
 import torch.nn as nn
 from einops import rearrange
 from tensordict import TensorDict
 from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention
-import math
-from policy.context import ARPContext
+
+from utils.ops import gather_by_index
+
+
+class ARPContext(nn.Module):
+    def __init__(self, embed_dim, linear_bias=False):
+        super(ARPContext, self).__init__()
+        self.project_context = nn.Linear(embed_dim + 1, embed_dim, bias=linear_bias)
+
+    def _cur_node_embedding(self, embeddings, td):
+        """Get embedding of current node"""
+        cur_node_embedding = gather_by_index(embeddings, td["current_node"])
+        return cur_node_embedding
+
+    def _state_embedding(self, embeddings, td):
+        state_embedding = td["vehicle_capacity"] - td["used_capacity"]
+        return state_embedding
+
+    def forward(self, embeddings, td):
+        cur_node_embedding = self._cur_node_embedding(embeddings, td)
+        state_embedding = self._state_embedding(embeddings, td)
+        if len(cur_node_embedding.shape) == 1:
+            cur_node_embedding = cur_node_embedding[None, :]
+        context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
+        return self.project_context(context_embedding)
+
 
 class StaticEmbedding(nn.Module):
     """Static embedding for general problems.
@@ -23,7 +49,6 @@ class StaticEmbedding(nn.Module):
 
 
 class PointerAttention(nn.Module):
-
     def __init__(
         self,
         embed_dim: int,
@@ -31,7 +56,7 @@ class PointerAttention(nn.Module):
         mask_inner: bool = True,
         out_bias: bool = False,
         check_nan: bool = True,
-        sdpa_fn = None,
+        sdpa_fn=None,
         **kwargs,
     ):
         super(PointerAttention, self).__init__()
@@ -80,7 +105,8 @@ class PointerAttention(nn.Module):
 
     def _project_out(self, out, *kwargs):
         return self.project_out(out)
-    
+
+
 @dataclass
 class PrecomputedCache:
     node_embeddings: Tensor
@@ -88,6 +114,7 @@ class PrecomputedCache:
     glimpse_key: Tensor
     glimpse_val: Tensor
     logit_key: Tensor
+
 
 class Decoder(nn.Module):
     def __init__(
@@ -107,7 +134,7 @@ class Decoder(nn.Module):
     ):
         super().__init__()
 
-        self.env_name = 'tsp'
+        self.env_name = "tsp"
         self.embed_dim = embed_dim
         self.num_heads = num_heads
 
@@ -118,14 +145,14 @@ class Decoder(nn.Module):
         self.is_dynamic_embedding = False
 
         self.pointer = PointerAttention(
-                embed_dim,
-                num_heads,
-                mask_inner=mask_inner,
-                out_bias=out_bias_pointer_attn,
-                check_nan=check_nan,
-                sdpa_fn=sdpa_fn,
-                moe_kwargs=moe_kwargs,
-            )
+            embed_dim,
+            num_heads,
+            mask_inner=mask_inner,
+            out_bias=out_bias_pointer_attn,
+            check_nan=check_nan,
+            sdpa_fn=sdpa_fn,
+            moe_kwargs=moe_kwargs,
+        )
 
         # For each node we compute (glimpse key, glimpse value, logit key) so 3 * embed_dim
         self.project_node_embeddings = nn.Linear(
@@ -177,19 +204,16 @@ class Decoder(nn.Module):
 
         return logits, mask
 
-    def pre_decoder_hook(
-        self, td, env, embeddings):
+    def pre_decoder_hook(self, td, env, embeddings):
         """Precompute the embeddings cache before the decoder is called"""
         return td, env, self._precompute_cache(embeddings)
-    
+
     def post_decoder_hook(self, td, env):
         logprobs = torch.stack(self.logprobs, 1)
         actions = torch.stack(self.actions, 1)
         return logprobs, actions, td, env
-    
-    def _precompute_cache(
-        self, embeddings: torch.Tensor
-    ) -> PrecomputedCache:
+
+    def _precompute_cache(self, embeddings: torch.Tensor) -> PrecomputedCache:
         """Compute the cached embeddings for the pointer attention.
 
         Args:

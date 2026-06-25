@@ -1,9 +1,8 @@
-"""Shared Lightning scaffolding for the RL trainers.
+"""Shared Lightning scaffolding for GRPO.
 
-`BaseRL` holds everything PPO and GRPO have in common — data config, dataloaders,
-metric logging, the train/val/test step dispatch, and the per-epoch data reload.
-The two algorithms are SIBLINGS (PPO(BaseRL), GRPO(BaseRL)); neither depends on
-the other. Subclasses implement only the algorithm-specific parts:
+`BaseRL` provides data config, dataloaders, metric logging, the train/val/test
+step dispatch, and the per-epoch data reload. Subclasses implement only the
+algorithm-specific parts:
 
     * configure_optimizers   (which params to train)
     * shared_step            (the loss / update rule)
@@ -142,7 +141,7 @@ class BaseRL(LightningModule):
         return self.shared_step(batch, batch_idx, phase="test", dataloader_idx=dataloader_idx)
 
     def on_train_epoch_end(self):
-        # Step a MultiStepLR scheduler if one is configured (PPO may; GRPO doesn't).
+        # Step a MultiStepLR scheduler if one is configured.
         sch = self.lr_schedulers()
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()

@@ -1,5 +1,4 @@
-"""D2 Phase 3: GRPO core (rl/grpo.py) — centered lexicographic-rank advantage,
-critic-free, with rl/ppo.py left UNCHANGED.
+"""GRPO core — centered lexicographic-rank advantage, critic-free.
 
 Run: uv run python -m unittest tests.test_grpo -v
 """
@@ -11,7 +10,6 @@ import torch
 
 from utils.ops import batchify, unbatchify
 from trainers.grpo import GRPO, centered_lex_rank
-from trainers.ppo import PPO
 
 
 def _make_env(reward_mode="vector", M=3, n=15):
@@ -185,11 +183,10 @@ class TestGRPOStep(unittest.TestCase):
         self.assertTrue(torch.allclose(adv.mean(1), torch.zeros(2), atol=1e-6))
         self.assertLessEqual(adv.abs().max().item(), 1.0 + 1e-6)
 
-    def test_critic_free_and_ppo_free(self):
-        """⭐ Fresh GRPO is standalone: no critic module, and NOT a PPO subclass."""
+    def test_critic_free(self):
+        """⭐ Fresh GRPO has no critic module and uses manual optimization."""
         env, policy, model = self._build(tag="grpo_nc")
         self.assertFalse(hasattr(model, "critic"))
-        self.assertNotIsInstance(model, PPO)
         self.assertFalse(model.automatic_optimization)
 
     def test_backward_policy_grad(self):
@@ -410,23 +407,6 @@ class TestEncoderShare(unittest.TestCase):
                             decode_type="greedy", hidden=batchify(h0, K))
         self.assertTrue(torch.equal(out_ns["actions"], out_sh["actions"]))
         self.assertTrue(torch.equal(out_ns["reward"], out_sh["reward"]))
-
-
-class TestPPOCritic(unittest.TestCase):
-    def test_critic_merged_into_ppo(self):
-        """⭐ Critic now lives in rl/ppo.py (rl/critic.py removed); importable there."""
-        from trainers.ppo import CriticNetwork, create_critic_from_actor  # noqa: F401
-        self.assertTrue(callable(create_critic_from_actor))
-
-    def test_ppo_still_trains_critic_gets_grad(self):
-        """⭐ The PPO path still trains and the critic DOES get grad."""
-        torch.manual_seed(0)
-        env = _make_env(reward_mode="scalar")
-        policy = _make_policy()
-        model = _make_model(PPO, env, policy, tag="ppo_ck")
-        _fit_one_step(model, "ppo_ck")
-        cgrads = [p.grad for p in model.critic.parameters() if p.grad is not None]
-        self.assertTrue(cgrads and all(torch.isfinite(g).all() for g in cgrads))
 
 
 if __name__ == "__main__":

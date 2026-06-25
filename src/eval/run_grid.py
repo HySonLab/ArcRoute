@@ -84,17 +84,30 @@ def iter_files(path, limit=None):
 # Solvers
 # --------------------------------------------------------------------------- #
 class RLSolver:
-    """Loads a PPO checkpoint and solves an instance under a given (M, variant)
-    by sampling `num_sample` rollouts and keeping the best by T_1."""
+    """Loads a GRPO checkpoint and solves an instance by sampling rollouts."""
 
-    def __init__(self, ckpt, device="cuda"):
+    def __init__(self, ckpt, device="cuda", algo="grpo"):
         import torch
-        from trainers.ppo import PPO
+        from policy.policy import AttentionModelPolicy
+        from env.env import CARPEnv
 
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.model = PPO.load_from_checkpoint(ckpt, map_location=self.device)
-        self.policy = self.model.policy.to(self.device).eval()
-        self.env = self.model.env
+        # GRPO.__init__ requires env+policy so load_from_checkpoint fails.
+        # Load policy weights directly from the checkpoint state_dict instead.
+        ckpt_data = torch.load(ckpt, map_location="cpu", weights_only=False)
+        hp = ckpt_data.get("hyper_parameters", {})
+        policy = AttentionModelPolicy(
+            embed_dim=hp.get("embed_dim", 128),
+            num_encoder_layers=hp.get("num_encoder_layers", 6),
+            num_heads=hp.get("num_heads", 8),
+        )
+        sd = {k[len("policy."):]: v
+              for k, v in ckpt_data["state_dict"].items()
+              if k.startswith("policy.")}
+        policy.load_state_dict(sd, strict=False)
+        self.policy = policy.to(self.device).eval()
+        env_kw = {k: hp[k] for k in ("num_loc", "num_arc", "variant") if k in hp}
+        self.env = CARPEnv(**env_kw, reward_mode="vector")
 
     def solve(self, file, M, variant, num_sample):
         import torch
@@ -240,7 +253,7 @@ def paired_win_rate(rows_a, rows_b):
 # --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 5 eval grid (RL over fleet M).")
-    p.add_argument("--ckpt", type=str, default=None, help="PPO checkpoint (.ckpt)")
+    p.add_argument("--ckpt", type=str, default=None, help="GRPO checkpoint (.ckpt)")
     p.add_argument("--path", type=str, default="data/ood",
                    help="OOD dir (recursed for *.npz) or a single .npz")
     p.add_argument("--M", type=str, default="2,3,5,7,10", help="comma fleet sizes")
@@ -274,7 +287,7 @@ def main():
     else:
         if not a.ckpt:
             sys.exit("--ckpt is required (or use --dry-run)")
-        solver = RLSolver(a.ckpt)
+        solver = RLSolver(a.ckpt, algo=a.algo)
 
     if a.yield_curve:
         Ks = [int(x) for x in a.Ks.split(",")]

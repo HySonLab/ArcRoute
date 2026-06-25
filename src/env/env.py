@@ -48,16 +48,9 @@ class CARPEnv:
         # Phase 6: if `sizes` (list of (num_loc, num_arc)) is given, train over a
         # size LADDER (bucketed so each batch stays single-size). Else single-size.
         self.sizes = sizes
-        # Hierarchical objective weights (T_1, T_2, T_3). The RL reward is -(T . w),
-        # giving T_1 priority (w_1 >> w_2 >> w_3) with T_2/T_3 breaking ties.
-        # Default is PROPORTIONAL to baseline/meta.py:calc_obj's [1e3,1e1,1e-1]
-        # (same 100x ratios -> identical solution ranking) but scaled to ~O(T_1)
-        # magnitude so PPO's critic stays well-conditioned (the absolute scale is
-        # irrelevant: advantages are normalised, and eval reports T_1/T_2/T_3
-        # separately). Previously the reward was -T_1 only (T_2/T_3 got no signal).
-        # Weighted-sum weights (PPO path) -- one per class, geometrically separated
-        # (100x) so T_1 dominates. Default generalizes the paper's [1.0,1e-2,1e-4]
-        # to any P; P=3 reproduces it exactly.
+        # Weighted-sum weights (T_1, T_2, T_3) for scalar reward mode — geometrically
+        # separated (100x) so T_1 dominates. Default generalizes [1.0,1e-2,1e-4]
+        # to any P; P=3 reproduces the paper's values exactly.
         self.obj_weights = obj_weights if obj_weights is not None else [100.0 ** (-i) for i in range(self.P)]
 
     def step(self, td: TensorDict):

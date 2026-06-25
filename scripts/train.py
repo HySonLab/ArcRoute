@@ -4,128 +4,115 @@ import numpy as np
 import argparse
 from env.env import CARPEnv
 from policy.policy import AttentionModelPolicy
-from trainers.ppo import PPO
 from trainers.grpo import GRPO
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Training script for PPO on CARPEnv")
-    
-    # Add arguments
-    parser.add_argument('--algo', type=str, default='ppo', choices=['ppo', 'grpo'],
-                        help='RL algorithm: ppo (weighted-sum + critic, default) or '
-                             'grpo (group lexicographic rank, critic-free).')
+    parser = argparse.ArgumentParser(description="GRPO training for HDCARP")
+
     parser.add_argument('--group_size', type=int, default=8,
-                        help='K samples/instance for GRPO (group size).')
-    parser.add_argument('--reward_mode', type=str, default=None,
-                        help='scalar|vector. Auto = vector if algo==grpo else scalar.')
+                        help='K samples/instance (group size).')
+    parser.add_argument('--reward_mode', type=str, default='vector',
+                        help='scalar|vector (default: vector for GRPO).')
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
-    parser.add_argument('--max_epoch', type=int, default=1000, help='Maximum number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
-    parser.add_argument('--mini_batch_size', type=int, default=256, help='Mini-batch size')
-    parser.add_argument('--train_data_size', type=int, default=100000, help='Training data size')
-    parser.add_argument('--val_data_size', type=int, default=10000, help='Validation data size')
-    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
-    parser.add_argument('--num_encoder_layers', type=int, default=12, help='Number of encoder layers')
-    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--num_loc', type=int, default=20, help='Number of nodes')
-    parser.add_argument('--num_arc', type=int, default=20, help='Number of arcs')
+    parser.add_argument('--max_epoch', type=int, default=1000)
+    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--mini_batch_size', type=int, default=256)
+    parser.add_argument('--train_data_size', type=int, default=100000)
+    parser.add_argument('--val_data_size', type=int, default=10000)
+    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--num_encoder_layers', type=int, default=12)
+    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--num_loc', type=int, default=20)
+    parser.add_argument('--num_arc', type=int, default=20)
     parser.add_argument('--num_vehicle', type=str, default='3',
-                        help='Fleet size(s): an int "3" OR a comma list "2,3,5,7,10". '
-                             'A list mixes M PER-INSTANCE (M is swept in the reward/'
-                             'Scheduler; the policy stays M-agnostic). dynamic_plan Phase 3.')
+                        help='Fleet size(s): "3" or comma list "2,3,5,7,10".')
     parser.add_argument('--sizes', type=str, default=None,
-                        help='Phase 6 multi-size training: "nloc:narc,..." e.g. '
-                             '"20:40,30:60,40:80,50:100,40:120". Overrides num_loc/num_arc.')
-    parser.add_argument('--variant', type=str, default='U', help='Environment variant')
-    parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints/60arcs', help='Checkpoint directory')
-    parser.add_argument('--num_workers', type=int, default=24, help='Number of workers for data loader') 
-    parser.add_argument('--accelerator', type=str, default='gpu', help='Training accelerator')
-    parser.add_argument('--devices', type=int, default=1, help='Number of devices to use')
-    parser.add_argument('--path_train_data', type=str, default="data/train_data.data", help='path_train_data')
-    parser.add_argument('--path_val_data', type=str, default="data/val_data.data", help='path_val_data')
-    parser.add_argument('--path_test_data', type=str, default="data/test_data.data", help='path_test_data')
-    
+                        help='Multi-size ladder: "nloc:narc,..." e.g. '
+                             '"20:40,30:60,40:80,50:100,40:120".')
+    parser.add_argument('--variant', type=str, default='U')
+    parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints/clP_ladder')
+    parser.add_argument('--num_workers', type=int, default=24)
+    parser.add_argument('--accelerator', type=str, default='gpu')
+    parser.add_argument('--devices', type=int, default=1)
+    parser.add_argument('--path_train_data', type=str, default="data/train_data.data")
+    parser.add_argument('--path_val_data', type=str, default="data/val_data.data")
+    parser.add_argument('--path_test_data', type=str, default="data/test_data.data")
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Checkpoint to load policy weights from (curriculum warm-start). '
+                             'Loads weights only — epoch/optimizer state is NOT restored.')
+
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Set random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # Phase 6: parse the optional size ladder "nloc:narc,nloc:narc,...".
     sizes = None
     if args.sizes:
         sizes = [tuple(int(x) for x in pair.split(":")) for pair in args.sizes.split(",")]
         print(f"Multi-size training over (num_loc, num_arc) buckets: {sizes}")
 
-    # Phase 3: parse fleet "2,3,5,7,10" -> list (mixed per-instance) or single int.
     fleet = [int(x) for x in str(args.num_vehicle).split(",")]
     fleet = fleet[0] if len(fleet) == 1 else fleet
     print(f"Fleet M (swept in reward, policy M-agnostic): {fleet}")
+    print(f"Algo=grpo  reward_mode={args.reward_mode}  group_size={args.group_size}")
 
-    # D2 Phase 4: reward_mode auto-selects vector for GRPO (it ranks the T-vector),
-    # scalar for PPO (the old -(T.w) reward). Explicit --reward_mode overrides.
-    reward_mode = args.reward_mode or ('vector' if args.algo == 'grpo' else 'scalar')
-    print(f"Algo={args.algo}  reward_mode={reward_mode}"
-          + (f"  group_size={args.group_size}" if args.algo == 'grpo' else ''))
-
-    # Initialize environment
     env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=fleet,
-                  variant=args.variant, sizes=sizes, reward_mode=reward_mode)
+                  variant=args.variant, sizes=sizes, reward_mode=args.reward_mode)
 
-    # Initialize policy
     policy = AttentionModelPolicy(
-                    embed_dim=args.embed_dim,
-                    num_encoder_layers=args.num_encoder_layers,
-                    num_heads=args.num_heads)
+        embed_dim=args.embed_dim,
+        num_encoder_layers=args.num_encoder_layers,
+        num_heads=args.num_heads,
+    )
 
-    # D2 Phase 4: select the CLASS by --algo (no flag inside ppo.py). GRPO logs
-    # per-objective T1/T2/T3 means so the learning curve shows T2/T3 descending.
-    Model = GRPO if args.algo == 'grpo' else PPO
-    extra = ({'group_size': args.group_size} if args.algo == 'grpo' else {})
-    metrics = ({"train": ["reward", "loss", "surrogate_loss", "entropy",
-                          "T1_mean", "T2_mean", "T3_mean"]}
-               if args.algo == 'grpo' else
-               {"train": ["reward", "loss", "surrogate_loss", "value_loss", "entropy"]})
+    metrics = {"train": ["reward", "loss", "entropy",
+                         "T1_mean", "T2_mean", "T3_mean"]}
 
-    # Initialize RL model
-    model = Model(env,
-                policy,
-                path_train_data=args.path_train_data,
-                path_val_data=args.path_val_data,
-                path_test_data=args.path_test_data,
-                batch_size=args.batch_size,
-                mini_batch_size=args.mini_batch_size,
-                train_data_size=args.train_data_size,
-                val_data_size=args.val_data_size,
-                dataloader_num_workers=args.num_workers,
-                metrics=metrics,
-                reload_train_dataloader=4,
-                **extra)
-    
-    # Setup checkpoint callback
-    # GRPO selects by the lexicographic best-of-K scalar (val/lex_best, logged in
-    # grpo.py) so the saved checkpoint matches the T_1>>T_2>>T_3 training objective;
-    # PPO keeps val/reward (the weighted-sum monitor) unchanged for A/B + rollback.
-    monitor_metric = "val/lex_best" if args.algo == "grpo" else "val/reward"
-    checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_dir,
-                                          filename="{epoch:03d}",
-                                          save_top_k=1,
-                                          save_last=True,
-                                          monitor=monitor_metric,
-                                          mode="max")
-    
+    if args.resume_from:
+        import os
+        assert os.path.isfile(args.resume_from), f"resume_from not found: {args.resume_from}"
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        sd = {k[len("policy."):]: v for k, v in ckpt["state_dict"].items()
+              if k.startswith("policy.")}
+        policy.load_state_dict(sd, strict=True)
+        print(f"Loaded policy weights from {args.resume_from} (epoch/optimizer reset)")
+
+    model = GRPO(
+        env, policy,
+        path_train_data=args.path_train_data,
+        path_val_data=args.path_val_data,
+        path_test_data=args.path_test_data,
+        batch_size=args.batch_size,
+        mini_batch_size=args.mini_batch_size,
+        train_data_size=args.train_data_size,
+        val_data_size=args.val_data_size,
+        dataloader_num_workers=args.num_workers,
+        metrics=metrics,
+        reload_train_dataloader=4,
+        group_size=args.group_size,
+    )
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.checkpoint_dir,
+        filename="{epoch:03d}",
+        save_top_k=1,
+        save_last=True,
+        monitor="val/lex_best",
+        mode="max",
+    )
+
     trainer = Trainer(
         max_epochs=args.max_epoch,
         accelerator=args.accelerator,
         devices=args.devices,
-        default_root_dir="outputs",   # lightning_logs under outputs/
-        callbacks=[checkpoint_callback]
+        default_root_dir="outputs",
+        callbacks=[checkpoint_callback],
     )
 
     trainer.fit(model)

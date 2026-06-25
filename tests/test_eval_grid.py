@@ -78,9 +78,9 @@ class TestEvalGrid(unittest.TestCase):
         all ties and zero T_1 regression."""
         from eval.run_grid import DryRunSolver, run_grid, paired_win_rate
         a = run_grid(DryRunSolver(), self.files[:3], [3, 5], ["P"], num_sample=10,
-                     algo="grpo")
+                     algo="grpo_a")
         b = run_grid(DryRunSolver(), self.files[:3], [3, 5], ["P"], num_sample=10,
-                     algo="ppo")
+                     algo="grpo_b")
         r = paired_win_rate(a, b)
         self.assertEqual(r["n"], len(self.files[:3]) * 2)
         self.assertEqual(r["t1_regression"], 0)
