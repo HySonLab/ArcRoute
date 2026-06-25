@@ -198,8 +198,12 @@ class MultiHeadAttention(nn.Module):
 
         # Additive distance bias: dist_bias < 0 penalises far arcs so nearby arcs
         # receive higher attention. adj diagonal = 0 so self-attention is unaffected.
+        # Normalise adj per-instance to [0,1] so dist_bias has a consistent scale
+        # across instance sizes (curriculum small→large would otherwise shift adj
+        # values by 3-4×, making the bias uninterpretable across training phases).
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights + self.dist_bias * adj.unsqueeze(1)
+        adj_norm = adj / adj.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        attn_weights = attn_weights + self.dist_bias * adj_norm.unsqueeze(1)
 
         attn_weights = nn.Softmax(dim=-1)(attn_weights)
 
