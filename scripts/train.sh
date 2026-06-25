@@ -48,6 +48,7 @@ elif [ "$MODE" = "curriculum_small" ]; then
     NUM_ENCODER_LAYERS=12
     SIZES="20:40"
     CHECKPOINT_DIR=outputs/checkpoints/curriculum_small
+    PATH_VAL_DATA="${PATH_VAL_DATA:-data/bench_small_val.data}"
     RESUME_FROM="${RESUME_FROM:-}"
 
 elif [ "$MODE" = "curriculum_medium" ]; then
@@ -121,6 +122,7 @@ nohup env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python scripts
     --checkpoint_dir "$CHECKPOINT_DIR" \
     --accelerator "$ACCELERATOR" \
     --devices "$DEVICES" \
+    ${PATH_VAL_DATA:+--path_val_data "$PATH_VAL_DATA"} \
     "${RESUME_ARGS[@]}" \
     > "$LOG" 2>&1 &
 

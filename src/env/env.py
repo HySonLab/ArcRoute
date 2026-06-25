@@ -155,7 +155,7 @@ class CARPEnv:
                 "clss_served": torch.zeros(batch_size, 3, device=dev),
             },
             batch_size=batch_size,
-        )
+        ).to(dev)
         td_reset.set("action_mask", self.get_action_mask(td_reset))
         return td_reset
     
