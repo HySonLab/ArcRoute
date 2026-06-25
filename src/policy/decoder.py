@@ -13,23 +13,50 @@ from utils.ops import gather_by_index
 
 
 class ARPContext(nn.Module):
+    # Context dim breakdown (7 scalars appended to current-node embedding):
+    #   remaining_cap       (1) — vehicle_capacity - used_capacity
+    #   frac_served_cls1/2/3(3) — clss_served / clss_total per class
+    #   dist_to_depot       (1) — adj[current_node, depot=0]
+    #   M_norm              (1) — num_vehicle / 10.0
+    #   frac_cap_used       (1) — used_capacity / vehicle_capacity
+    _STATE_DIM = 7
+
     def __init__(self, embed_dim, linear_bias=False):
         super(ARPContext, self).__init__()
-        self.project_context = nn.Linear(embed_dim + 1, embed_dim, bias=linear_bias)
+        self.project_context = nn.Linear(
+            embed_dim + self._STATE_DIM, embed_dim, bias=linear_bias
+        )
 
     def _cur_node_embedding(self, embeddings, td):
-        """Get embedding of current node"""
-        cur_node_embedding = gather_by_index(embeddings, td["current_node"])
-        return cur_node_embedding
+        return gather_by_index(embeddings, td["current_node"])
 
     def _state_embedding(self, embeddings, td):
-        state_embedding = td["vehicle_capacity"] - td["used_capacity"]
-        return state_embedding
+        B = td["used_capacity"].shape[0]
+        dev = td["used_capacity"].device
+
+        remaining_cap = td["vehicle_capacity"] - td["used_capacity"]       # (B,1)
+
+        # Fraction of arcs served per priority class
+        total = td["clss_total"].clamp(min=1.0)                            # (B,3)
+        frac_served = td["clss_served"] / total                            # (B,3)
+
+        # Deadhead cost to return to depot from current arc
+        adj = td["adj"]                                                    # (B,N+1,N+1)
+        cn  = td["current_node"].view(B)                                   # (B,)
+        dist_to_depot = adj[torch.arange(B, device=dev), cn, 0].unsqueeze(-1)  # (B,1)
+
+        M_norm = td["num_vehicle"].float().view(B, 1) / 10.0              # (B,1)
+
+        frac_cap_used = td["used_capacity"] / td["vehicle_capacity"].clamp(min=1e-6)  # (B,1)
+
+        return torch.cat(
+            [remaining_cap, frac_served, dist_to_depot, M_norm, frac_cap_used], dim=-1
+        )  # (B, 7)
 
     def forward(self, embeddings, td):
         cur_node_embedding = self._cur_node_embedding(embeddings, td)
         state_embedding = self._state_embedding(embeddings, td)
-        if len(cur_node_embedding.shape) == 1:
+        if cur_node_embedding.ndim == 1:
             cur_node_embedding = cur_node_embedding[None, :]
         context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
         return self.project_context(context_embedding)

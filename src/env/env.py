@@ -70,12 +70,23 @@ class CARPEnv:
         # SECTION: get done
         done = visited.sum(-1) == visited.size(-1)
 
+        # Track arcs served per priority class (depot=0 excluded)
+        not_depot = (current_node.squeeze(-1) != 0)                   # (B,)
+        cls_action = gather_by_index(td["clss"], current_node, squeeze=True)  # (B,)
+        cls_idx = (cls_action - 1).clamp(0, 2)                        # (B,) in [0,1,2]
+        update = torch.zeros(
+            current_node.shape[0], 3, device=current_node.device
+        )
+        update.scatter_(1, cls_idx.unsqueeze(1), not_depot.float().unsqueeze(1))
+        clss_served = td["clss_served"] + update
+
         td.update(
             {
                 "current_node": current_node,
                 "used_capacity": used_capacity,
                 "visited": visited,
                 "done": done,
+                "clss_served": clss_served,
             }
         )
         td.set("action_mask", self.get_action_mask(td))
@@ -105,17 +116,26 @@ class CARPEnv:
         return ~torch.cat((mask_depot[..., None], mask_loc), -1).squeeze(-2)
 
     def reset(self, td):
-        batch_size = td.batch_size[0]      
+        batch_size = td.batch_size[0]
+        dev = td.device
+
+        # Count arcs per priority class (clss[:,1:] — exclude depot at index 0)
+        clss_arc = td["clss"][:, 1:]                                   # (B, N_arc)
+        clss_total = torch.stack(
+            [(clss_arc == c).sum(dim=-1).float() for c in range(1, 4)],
+            dim=-1,
+        ).to(dev)                                                       # (B, 3)
+
         td_reset = TensorDict(
             {
                 "demand": td["demands"],
                 "current_node": torch.zeros(
-                    batch_size, 1, dtype=torch.long),
-                "used_capacity": torch.zeros((batch_size, 1)),
-                "vehicle_capacity": torch.full((batch_size, 1), 1),
+                    batch_size, 1, dtype=torch.long, device=dev),
+                "used_capacity": torch.zeros(batch_size, 1, device=dev),
+                "vehicle_capacity": torch.ones(batch_size, 1, device=dev),
                 "visited": torch.zeros(
-                    (batch_size, 1, td["service_times"].shape[1]),
-                    dtype=torch.uint8
+                    batch_size, 1, td["service_times"].shape[1],
+                    dtype=torch.uint8, device=dev,
                 ),
                 'clss': td["clss"],
                 'service_times': td["service_times"],
@@ -123,11 +143,19 @@ class CARPEnv:
                 'adj': td["adj"],
                 # M-agnostic policy doesn't read this; the Scheduler (calc_reward)
                 # does. Carry per-instance M as (B,1) so run_parallel slices it right.
-                "num_vehicle": torch.as_tensor(td["num_vehicle"]).reshape(batch_size, 1),
-                "done": torch.zeros(batch_size, td["service_times"].shape[1], dtype=torch.bool),
+                "num_vehicle": torch.as_tensor(
+                    td["num_vehicle"], device=dev
+                ).reshape(batch_size, 1),
+                "done": torch.zeros(
+                    batch_size, td["service_times"].shape[1],
+                    dtype=torch.bool, device=dev,
+                ),
+                # Class-level arc counters for policy context (updated in step).
+                "clss_total":  clss_total,
+                "clss_served": torch.zeros(batch_size, 3, device=dev),
             },
             batch_size=batch_size,
-        ).to(td.device)
+        )
         td_reset.set("action_mask", self.get_action_mask(td_reset))
         return td_reset
     

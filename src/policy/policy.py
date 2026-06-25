@@ -96,9 +96,7 @@ class AttentionModelPolicy(nn.Module):
             td = env.step(td)
             step += 1
             if step > max_steps:
-                print(f"Exceeded maximum number of steps ({max_steps}) duing decoding")
-                    f"Exceeded maximum number of steps ({max_steps}) duing decoding"
-                )
+                print(f"Exceeded maximum number of steps ({max_steps}) during decoding")
                 break
 
         # Post-decoding hook: used for the final step(s) of the decoding strategy

@@ -173,10 +173,15 @@ class MultiHeadAttention(nn.Module):
 
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+        # Learnable per-head distance bias: negative → closer arcs attend more.
+        # Shape (num_heads, 1, 1) broadcasts over (B, H, S, S).
+        # Init -0.1: small inductive bias toward spatial locality without dominating
+        # content-based attention early in training.
+        self.dist_bias = nn.Parameter(torch.full((num_heads, 1, 1), -0.1))
 
     def forward(self, x, adj, attn_mask=None):
         """x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim)
-        adj: (batch, seqlen, seqlen) adjacency matrix
+        adj: (batch, seqlen, seqlen) Floyd-Warshall distance matrix
         attn_mask: bool tensor of shape (batch, seqlen)
         """
         # Project query, key, value
@@ -191,13 +196,10 @@ class MultiHeadAttention(nn.Module):
                 else attn_mask.unsqueeze(1).unsqueeze(2)
             )
 
-        # Modify attention using adjacency matrix
-        # Here we multiply the attention scores by the adjacency matrix to mask out non-neighbors
+        # Additive distance bias: dist_bias < 0 penalises far arcs so nearby arcs
+        # receive higher attention. adj diagonal = 0 so self-attention is unaffected.
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights * adj.unsqueeze(
-            1
-        )  # Broadcast adj to (batch, num_heads, seqlen, seqlen)
-        attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
+        attn_weights = attn_weights + self.dist_bias * adj.unsqueeze(1)
 
         attn_weights = nn.Softmax(dim=-1)(attn_weights)
 
