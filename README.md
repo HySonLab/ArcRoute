@@ -24,8 +24,7 @@ The project implements multiple approaches:
 
 - **Exact methods** for solving smaller instances.
 - **Meta Heuristic algorithms** (ea, aco, ils).
-- **Reinforcement Learning** — an attention encoder/decoder policy trained with **PPO** or
-  **GRPO** (critic-free, lexicographic-rank advantage).
+- **Reinforcement Learning** — an attention encoder/decoder policy trained with **GRPO** (critic-free, lexicographic-rank advantage).
 - **Hybrid algorithm combining Reinforcement Learning (RL) and heuristics**.
 
 ## Key Components

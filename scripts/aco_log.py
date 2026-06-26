@@ -1,18 +1,16 @@
-"""Run ILS on one instance and write the route log to a file.
+"""Run ACO on one instance and write the route log to a file.
 
 Usage:
-    uv run python scripts/ils_log.py [--file <path.npz>] [--variant P|U]
-                                     [--seed 42] [--num_init_sample 5]
-                                     [--max_iter 200] [--strength 3]
-                                     [--accept_mode best|sa]
-                                     [--log outputs/route_log.txt]
-    uv run python scripts/ils_log.py \
-        --file data/ood/osm_cityA/40/38_17_358.npz \
+    uv run python scripts/aco_log.py [--file <path.npz>] [--variant P|U]
+                                     [--seed 42] [--n_epoch 50] [--n_ant 30]
+                                     [--is_local_search] [--log outputs/aco_route_log.txt]
+    uv run python scripts/aco_log.py \
+        --file data/ood/osm_cityB/40/38_14_859.npz \
         --variant P \
-        --vehicles 2 \
-        --num_init_sample 5 \
-        --max_iter 200 \
-        --log outputs/ils_route_log.txt
+        --n_epoch 20 \
+        --n_ant 20 \
+        --seed 42 \
+        --log outputs/aco_route_log.txt
 """
 
 import argparse
@@ -26,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import numpy as np
 
 from solvers.cal_reward import get_Ts
-from solvers.meta import ILSHCARP
+from solvers.meta import ACOHCARP
 from utils.nb_utils import gen_tours
 
 
@@ -127,11 +125,14 @@ def main():
     parser.add_argument("--file", default="data/ood/osm_cityB/40/34_13_632.npz")
     parser.add_argument("--variant", default="P", choices=["P", "U"])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_init_sample", type=int, default=5)
-    parser.add_argument("--max_iter", type=int, default=200)
-    parser.add_argument("--strength", type=int, default=3)
-    parser.add_argument("--accept_mode", default="best", choices=["best", "sa"])
-    parser.add_argument("--log", default="outputs/route_log.txt")
+    parser.add_argument("--n_epoch", type=int, default=50)
+    parser.add_argument("--n_ant", type=int, default=30)
+    parser.add_argument("--is_local_search", action="store_true", default=True,
+                        help="refine ant tours with local search (default: True)")
+    parser.add_argument("--no_local_search", dest="is_local_search",
+                        action="store_false",
+                        help="disable local search refinement")
+    parser.add_argument("--log", default="outputs/aco_route_log.txt")
     parser.add_argument(
         "--solution",
         default=None,
@@ -147,10 +148,8 @@ def main():
 
     es = np.load(args.file)
 
-    solver = ILSHCARP(
-        strength=args.strength,
-        accept_mode=args.accept_mode,
-    )
+    np.random.seed(args.seed)
+    solver = ACOHCARP(n_ant=args.n_ant)
     solver.import_instance(args.file, M=args.vehicles)
 
     total_demand = float(solver.demands[1:].sum())
@@ -166,10 +165,9 @@ def main():
 
     t0 = time()
     best_T = solver(
-        max_iter=args.max_iter,
+        n_epoch=args.n_epoch,
         variant=args.variant,
-        num_init_sample=args.num_init_sample,
-        seed=args.seed,
+        is_local_search=args.is_local_search,
         verbose=True,
     )[0]  # shape (1, P) -> (P,)
     elapsed = time() - t0
@@ -181,6 +179,7 @@ def main():
     req = es["req"]
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
+        print("ACO solver")
         print(f"Instance : {args.file}")
         print(
             f"P={es['P']} classes | M={solver.nv} vehicles | "

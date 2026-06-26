@@ -7,6 +7,7 @@ from utils.ops import import_instance, run_parallel2
 from utils.nb_utils import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
 from solvers.cal_reward import get_Ts
 from utils.local_search import ls
+from utils.ils_operators import perturbate, accept
 from copy import deepcopy
 
 class BaseHCARP:
@@ -43,8 +44,11 @@ class BaseHCARP:
         return True
     
     def is_valid(self, routes):
-        if (self.demands[gen_tours(routes)].sum(-1) > 1).sum() > 0:
-            return False
+        # gen_tours yields variable-length routes (a ragged list), so index/sum
+        # per route instead of fancy-indexing the ragged list at once.
+        for tour in gen_tours(routes):
+            if self.demands[tour].sum() > 1:
+                return False
         return True
     
     def calc_obj(self, actions):
@@ -91,6 +95,71 @@ class InsertCheapestHCARP(BaseHCARP):
         # print(gen_tours(best))
         return get_Ts(self.vars, actions=best[None])
     
+class ILSHCARP(BaseHCARP):
+    """Iterated Local Search for HDCARP.
+
+    Constructive sampling (``get_once``) seeds an initial solution that is
+    refined by the inter/intra ``ls`` operators; the ILS loop then alternates a
+    feasibility-preserving ``perturbate`` kick with a full local search and an
+    acceptance test (``'best'`` improvement-only or ``'sa'`` simulated
+    annealing). The objective (``calc_obj``, higher = better) is the negated
+    lexicographically-weighted (T1, T2, T3).
+    """
+
+    def __init__(self, strength=3, accept_mode='best', T_init=0.05, T_final=0.001):
+        super().__init__()
+        self.strength = strength
+        self.accept_mode = accept_mode
+        self.T_init = T_init
+        self.T_final = T_final
+
+    def __call__(self, max_iter=200, variant='P', num_init_sample=5,
+                 seed=None, verbose=False):
+        assert self.has_instance, "please import instance first"
+        rng = np.random.default_rng(seed)
+        if seed is not None:
+            np.random.seed(seed)
+
+        # 1. constructive seeds -> local search -> pick the best as s0
+        samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
+        samples = [s for s in samples if s is not None]
+        assert samples, "construction failed to produce a feasible solution"
+        tours_batch = ls(self.vars, variant=variant, actions=samples)
+        action_batch = deserialize_tours_batch(tours_batch, self.nseq)
+        cur_obj, cur_action = self.get_best(action_batch)
+        cur_routes = gen_tours(cur_action)
+
+        best_action = cur_action.copy()
+        best_obj = cur_obj
+        capacity = 1.0
+
+        # 2. ILS loop: perturb -> local search -> accept
+        for it in range(max_iter):
+            pert = perturbate(cur_routes, self.dms, self.demands, self.clss,
+                              capacity, variant, rng, strength=self.strength)
+            pert_action = deserialize_tours(pert, self.max_len)
+            tours = ls(self.vars, variant=variant, actions=[pert_action])
+            cand_action = deserialize_tours(tours[0], self.max_len)
+            cand_obj = float(self.calc_obj(cand_action[None])[0])
+
+            if accept(cur_obj, cand_obj, it, max_iter, mode=self.accept_mode,
+                      T_init=self.T_init, T_final=self.T_final):
+                cur_action = cand_action
+                cur_obj = cand_obj
+                cur_routes = gen_tours(cand_action)
+
+            if cand_obj > best_obj:
+                best_action = cand_action.copy()
+                best_obj = cand_obj
+
+            if verbose and it % 20 == 0:
+                print(f"iter {it}: cur={cur_obj:.4f} best={best_obj:.4f}")
+
+        # 3. report the hierarchical completion times of the best solution
+        self._last_best_action = best_action
+        return get_Ts(self.vars, actions=best_action[None])
+
+
 class EAHCARP(BaseHCARP):
     def __init__(self, n_population=50, pathnament_size=4, mutation_rate=0.5, crossover_rate=0.9):
         super().__init__()
@@ -100,8 +169,11 @@ class EAHCARP(BaseHCARP):
         self.crossover_rate = crossover_rate
 
     def init_population(self):
-        population = np.array([self.get_once(self.M, self.clss) for _ in range(self.n_population)])
-        return population
+        samples = [self.get_once(self.M, self.clss) for _ in range(self.n_population)]
+        samples = [s for s in samples if s is not None]
+        if not samples:
+            raise RuntimeError("init_population: construction failed to produce any feasible individual")
+        return np.array(samples)
 
     def _cross_over(self, p1, p2):
         child1 = p1[:np.where(p1==0)[0][0]+1]
@@ -140,20 +212,17 @@ class EAHCARP(BaseHCARP):
         parent1 = self.get_parent(population, prob)
         parent2 = self.get_parent(population, prob)
 
+        # default to the parents so child1/child2 are always defined
+        child1, child2 = parent1, parent2
         if random() < self.crossover_rate:
             # print(parent1, parent2)
             child1 = self.cross_over(parent1, parent2)
             child2 = self.cross_over(parent2, parent1)
 
-        # If crossover not happen
-        else:
-            child1 = parent1
-            child2 = parent2
-
         # MUTATION
         if random() < self.mutation_rate:
             child1 = self.mutate(child1, variant)
-            child2 = self.mutate(child1, variant)
+            child2 = self.mutate(child2, variant)
         return child1, child2
 
     def __call__(self, n_epoch=50, variant='P', verbose=False):
@@ -177,6 +246,7 @@ class EAHCARP(BaseHCARP):
                     print(f"epoch {epoch}:", obj[idx])
 
         routes = population[self.calc_obj(population).argmax()]
+        self._last_best_action = np.asarray(routes)
         return get_Ts(self.vars, actions=routes[None])
 
 class ACOHCARP(BaseHCARP):
@@ -216,33 +286,47 @@ class ACOHCARP(BaseHCARP):
             mask[next] = -np.inf
         return None
 
-    def _construct_route(self, a, masks):
+    def _construct_route(self, a, masks, variant='P'):
         visited = list(np.unique(a))
+        visited_set = set(int(x) for x in visited)
         while len(visited) < self.nseq:
-            # print(sorted(visited))
+            # F5: enforce a GLOBAL priority frontier in P-variant. The per-arc
+            # pheromone mask only forbids a route from dropping to a lower class;
+            # it does NOT stop routes from racing ahead to higher classes while
+            # high-priority arcs are still unserved, which deadlocks construction
+            # (every route ends on a class above the stranded arcs and can't go
+            # back). Mirror `get_once`: only the lowest still-unserved class is
+            # eligible, so classes are exhausted in priority order.
+            frontier = None
+            if variant == 'P':
+                frontier = min(self.clss[i] for i in range(self.nseq)
+                               if i not in visited_set)
             all_none = True
             for i in permutation(range(len(a))):
                 mask = masks[a[i][-1]].copy()
+                if frontier is not None:
+                    mask[self.clss > frontier] = -np.inf
                 next = self.get_next(a[i], mask)
-                if next is None: 
+                if next is None:
                     continue
                 a[i].append(next)
                 visited.append(next)
+                visited_set.add(int(next))
                 masks[:, next] = -np.inf
                 all_none = False
             if all_none: return None
-            
+
         routes = np.int32(np.concatenate(a))
         if self.is_valid(routes):
             return routes[1:]
         return None
-    
-    def construct_route(self, ant, pheromones, attemp=10):
+
+    def construct_route(self, ant, pheromones, variant='P', attemp=10):
         pheromones = pheromones.copy()
         pheromones[:, np.unique(ant)] = -np.inf
 
         for _ in range(attemp):
-            route = self._construct_route(deepcopy(ant), pheromones.copy())
+            route = self._construct_route(deepcopy(ant), pheromones.copy(), variant=variant)
             # print(route)
             if route is not None:
                 return route
@@ -262,21 +346,22 @@ class ACOHCARP(BaseHCARP):
         best_obj = -np.inf
         elitist_epochs = []
         for epoch in range(n_epoch):
-            
+
             # Constructing tour of ants
-            elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones)
-            # self.construct_route(ants[0], pheromones=pheromones)
-            # exit()
-            # elitist_ants = [self.construct_route(ant, pheromones=pheromones) for ant in ants]
-            # print(elitist_ants)
+            elitist_ants = run_parallel2(self.construct_route, ants, pheromones=pheromones, variant=variant)
             elitist_ants = [ant for ant in elitist_ants if ant is not None]
-            
+
+            # F3: every ant failed to construct a feasible solution this epoch ->
+            # nothing to score / deposit. Skip rather than crash get_best([]).
+            if not elitist_ants:
+                continue
+
             # refine tours by local search
             if is_local_search:
                 tours = ls(self.vars, variant=variant, actions=elitist_ants)
                 elitist_ants = deserialize_tours_batch(tours, self.nseq)
 
-            # Update pheromones 
+            # Update pheromones
             ant_obj, best_ants = self.get_best(elitist_ants)
             pheromones = self.update_pheromones(best_ants, pheromones)
 
@@ -285,6 +370,12 @@ class ACOHCARP(BaseHCARP):
             if verbose:
                 if epoch % 10 == 0:
                     print(f"epoch {epoch}:", best_obj)
-            # print(f"epoch {epoch}:", best_obj)
-        best = self.get_best(elitist_epochs)[1][None]
-        return get_Ts(self.vars, actions=best)
+
+        # F3: guard the all-epochs-empty case before scoring the elite archive.
+        assert elitist_epochs, "ACO failed to construct any feasible solution"
+        # elitist_epochs is a list of (possibly ragged) 1-D flat actions; get_best
+        # -> calc_obj -> get_Ts iterates element-wise, so ragged lengths are fine.
+        _, best_action = self.get_best(elitist_epochs)
+        # F1: expose the winning arc order for downstream logging (cf. ILS/EA).
+        self._last_best_action = np.asarray(best_action)
+        return get_Ts(self.vars, actions=best_action[None])

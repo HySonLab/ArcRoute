@@ -13,9 +13,11 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=100, help='num epoch')
-    parser.add_argument('--variant', type=str, default='U', help='Environment variant')
+    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
     parser.add_argument('--M', type=int, default=None, help='override fleet size at eval (Phase 3: M is a solve-time param)')
-    parser.add_argument('--n_population', type=int, default=200, help='num epoch')
+    parser.add_argument('--n_population', type=int, default=200, help='population size')
+    parser.add_argument('--accept_mode', type=str, default='best', choices=['best', 'sa'],
+                        help='kept for interface parity with ILS (unused by EA)')
     parser.add_argument('--path', type=str, default='data/5m', help='path to instances')
     
     return parser.parse_args()

@@ -13,11 +13,13 @@ def parse_args():
     # Add arguments
     parser.add_argument('--seed', type=int, default=6868, help='Random seed')
     parser.add_argument('--max_epoch', type=int, default=100, help='num epoch')
-    parser.add_argument('--variant', type=str, default='U', help='Environment variant')
+    parser.add_argument('--variant', type=str, default='P', help='Environment variant')
     parser.add_argument('--M', type=int, default=None, help='override fleet size at eval (Phase 3: M is a solve-time param)')
     parser.add_argument('--n_ant', type=int, default=50, help='num epoch')
+    parser.add_argument('--is_local_search', type=lambda x: x.lower() in ('1', 'true', 'yes'),
+                        default=True, help='refine ant tours with local search (default: True)')
     parser.add_argument('--path', type=str, default='data/5m', help='path to instances')
-    
+
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -29,4 +31,5 @@ if __name__ == "__main__":
     for f in files:
         al.import_instance(f, M=args.M)
         t1 = time()
-        print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant),':::', time() - t1)
+        print(f,':::', al(n_epoch=args.max_epoch, variant=args.variant,
+                          is_local_search=args.is_local_search),':::', time() - t1)
