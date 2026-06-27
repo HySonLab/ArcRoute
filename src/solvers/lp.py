@@ -320,13 +320,19 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
             model.addCons(quicksum(y[(m, a, k)] for a in G['A_f']) == 1)
         # (6) class 1 starts at the depot
         model.addCons(y[(m, (dummy, depot), 1)] == 1)
-        # (8) link level entry to previous-level exit
+        # (8) link level entry to previous-level exit.
+        #
+        # The paper writes (8) over ∪_{k'<k} V_t^{k'} ∪ {v_0}, but that set
+        # omits vertices in V_t^k that are not tails of lower-class arcs. A
+        # vehicle can exit level k-1 at such a vertex (via a deadhead traversal)
+        # and re-enter level k at a different vertex with zero deadhead cost —
+        # a free repositioning that under-counts deadheading. Using the full V_t
+        # (as MILP-U's analogous constraint (25) does) closes this gap and
+        # ensures every inter-level transition is physically accounted for.
         for k in classes:
             if k == 1:
                 continue
-            prev_tails = set().union(*[G['V_t_k'][kp] for kp in range(1, k)])
-            prev_tails = prev_tails | {depot}
-            for v in prev_tails:
+            for v in sorted(G['V_t']):  # V_t already includes the depot
                 model.addCons(y[(m, (dummy, v), k)] == y[(m, (v, dummy), k - 1)])
         # (10) capacity
         model.addCons(quicksum(G['q'][a] * x[(m, a)] for a in G['req_arcs'])
@@ -431,11 +437,28 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
                     <= nk * r[(m, k, h)])
         # (23) level 1 starts at the depot
         model.addCons(y[(m, (dummy, depot), 1)] == 1)
-        # (25) link level entry to previous-level exit (over all V_t U {v_0})
+        # (25) link level entry to previous-level exit.
+        #
+        # The paper's literal (25) couples every v in V_t U {v_0}: the vertex
+        # at which a route enters hierarchy level h (through v'_0) must equal
+        # the vertex at which it left level h-1. This encodes the physical
+        # requirement (paper, Section 3.2) that "the node visited immediately
+        # after v'_0 must be the same as the node visited right before v'_0" --
+        # i.e. v'_0 is a zero-cost *marker* between levels, not a teleporter.
+        #
+        # Because A_f / A_t connect v'_0 to *every* vertex in V_t U {v_0}, the
+        # entry and exit vertices of any level can be any element of that set,
+        # so the coupling MUST cover all of V_t to guarantee continuity. A
+        # previous restriction to only the tails of lower-index classes left
+        # the coupling missing at every other vertex, letting a vehicle exit
+        # level h-1 at one vertex and re-enter level h at a different one for
+        # free (e.g. exit at v8, re-enter at v7 with zero deadhead). That free
+        # repositioning under-counts deadheading and produced impossibly small
+        # completion times (T_1 below the true service+deadhead of its arcs).
         for h in levels:
             if h == 1:
                 continue
-            for v in sorted(G['V_t']):
+            for v in sorted(G['V_t']):  # V_t already includes the depot
                 model.addCons(y[(m, (dummy, v), h)] == y[(m, (v, dummy), h - 1)])
         # (27) capacity
         model.addCons(

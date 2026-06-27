@@ -1,10 +1,13 @@
+import gc
+import os
+
 import torch
+import torch.multiprocessing as mp
 import numpy as np
 from torch.distributions import Uniform, Normal
 from tensordict.tensordict import TensorDict
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
-import os
 
 from utils.ops import dist_edges_from_file
 
@@ -211,12 +214,23 @@ def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
         def collate_fn(batch):
             return torch.cat(batch, dim=0)
 
-    dataloader = DataLoader(
-        WrapDataset(), batch_size=128, shuffle=False,
-        num_workers=num_workers, collate_fn=WrapDataset.collate_fn,
-    )
-    it = tqdm(dataloader) if progress else dataloader
-    return torch.cat([td for td in it], dim=0)
+    # file_system sharing avoids the Linux default's per-tensor FD leak (EMFILE across reloads);
+    # process-global, so set it before workers fork and restore after.
+    _prev_strategy = mp.get_sharing_strategy()
+    mp.set_sharing_strategy('file_system')
+    try:
+        dataloader = DataLoader(
+            WrapDataset(), batch_size=128, shuffle=False,
+            num_workers=num_workers, collate_fn=WrapDataset.collate_fn,
+        )
+        it = tqdm(dataloader) if progress else dataloader
+        result = torch.cat([td for td in it], dim=0)
+        # Free the loader's worker pipes now; 3 sequential bucket calls stack 3×workers FDs.
+        del it, dataloader
+        gc.collect()
+        return result
+    finally:
+        mp.set_sharing_strategy(_prev_strategy)
 
 
 def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt", P=3):

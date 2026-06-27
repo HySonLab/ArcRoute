@@ -113,6 +113,8 @@ if __name__ == "__main__":
         devices=args.devices,
         default_root_dir="outputs",
         callbacks=[checkpoint_callback],
+        # Required for BaseRL.on_train_epoch_end's per-epoch data refresh to take effect.
+        reload_dataloaders_every_n_epochs=model.reload_train_dataloader,
     )
 
     trainer.fit(model)

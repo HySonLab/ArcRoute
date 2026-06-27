@@ -89,6 +89,7 @@ class BaseRL(LightningModule):
 
     # ---- data ---------------------------------------------------------------
     def load_dataloader(self):
+        # Don't shut workers down here — Lightning owns their lifecycle and reloads them itself.
         self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"],
                                               batch_size=self.data_cfg["batch_size"], shuffle=True,
                                               data=self.data_cfg["path_train_data"],
@@ -145,7 +146,7 @@ class BaseRL(LightningModule):
         sch = self.lr_schedulers()
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()
-        # Regenerate fresh training data every `reload_train_dataloader` epochs.
+        # Refresh training data every N epochs (requires Trainer's reload_dataloaders_every_n_epochs to match).
         if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
             path = self.data_cfg["path_train_data"]
             # Only delete generated cache files (under data/), not external paths.
