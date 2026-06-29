@@ -24,7 +24,7 @@ class AttentionModelPolicy(nn.Module):
         self.encoder = Encoder(
             embed_dim=embed_dim, num_layers=num_encoder_layers, num_heads=num_heads
         )
-        self.decoder = Decoder(embed_dim=embed_dim, num_heads=num_heads)
+        self.decoder = Decoder(embed_dim=embed_dim, num_heads=num_heads, check_nan=False)
 
         self.embed_dim = embed_dim
 

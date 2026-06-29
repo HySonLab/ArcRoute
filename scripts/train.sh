@@ -53,8 +53,8 @@ elif [ "$MODE" = "curriculum_small" ]; then
 
 elif [ "$MODE" = "curriculum_medium" ]; then
     MAX_EPOCH=200
-    BATCH_SIZE=2048
-    MINI_BATCH_SIZE=512
+    BATCH_SIZE=4096
+    MINI_BATCH_SIZE=1024
     TRAIN_DATA_SIZE=100000
     VAL_DATA_SIZE=10000
     EMBED_DIM=128
@@ -65,8 +65,8 @@ elif [ "$MODE" = "curriculum_medium" ]; then
 
 elif [ "$MODE" = "curriculum_large" ]; then
     MAX_EPOCH=200
-    BATCH_SIZE=2048
-    MINI_BATCH_SIZE=512
+    BATCH_SIZE=4096
+    MINI_BATCH_SIZE=1024
     TRAIN_DATA_SIZE=100000
     VAL_DATA_SIZE=10000
     EMBED_DIM=128
@@ -77,8 +77,8 @@ elif [ "$MODE" = "curriculum_large" ]; then
 
 else  # full
     MAX_EPOCH=100
-    BATCH_SIZE=2048
-    MINI_BATCH_SIZE=512
+    BATCH_SIZE=4096
+    MINI_BATCH_SIZE=1024
     TRAIN_DATA_SIZE=100000
     VAL_DATA_SIZE=10000
     EMBED_DIM=128

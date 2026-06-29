@@ -1,5 +1,10 @@
 import torch
 torch.set_float32_matmul_precision('medium')
+# Decoder pointer attention uses q_len=1: Flash/MemEfficient SDPA hit CUDA grid
+# limits at large batch×heads and are slower for q_len=1 (tiling buys nothing).
+# Math backend has no kernel limits and is ~11% faster per sample here.
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
 import numpy as np
 import argparse
 from env.env import CARPEnv
