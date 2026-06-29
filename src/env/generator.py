@@ -285,7 +285,7 @@ class MultiSizeCARPGenerator(Dataset):
     is grouped into per-size buckets; pair with SizeBucketBatchSampler to keep
     each batch single-size. `sizes` is a list of (num_loc, num_arc) pairs."""
 
-    def __init__(self, num_samples, sizes, num_vehicle, num_workers=24, data=None, P=3):
+    def __init__(self, num_samples, sizes, num_vehicle, data=None, P=3):
         if isinstance(data, str) and os.path.exists(data):
             payload = torch.load(data, weights_only=False)
             self.buckets, self.bucket_ranges = payload["buckets"], payload["ranges"]
@@ -293,7 +293,10 @@ class MultiSizeCARPGenerator(Dataset):
             per = max(1, num_samples // len(sizes))
             self.buckets, self.bucket_ranges, start = [], [], 0
             for (nl, na) in sizes:
-                tds = generate_dataset(per, nl, na, num_vehicle, num_workers, P=P)
+                # num_workers=0: generation is pure CPU math, no I/O; spawning workers
+                # here accumulates pipe FDs alongside Lightning's persistent DataLoader
+                # workers → os.pipe() EMFILE on repeated reloads.
+                tds = generate_dataset(per, nl, na, num_vehicle, 0, P=P)
                 self.buckets.append(tds)
                 self.bucket_ranges.append((start, start + len(tds)))
                 start += len(tds)

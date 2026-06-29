@@ -172,7 +172,7 @@ class CARPEnv:
         if self.sizes is not None:
             # Multi-size: bucket by size, each batch single-size (Phase 6).
             ds = MultiSizeCARPGenerator(data_size, self.sizes, self.num_vehicle,
-                                        num_workers=num_workers, data=data, P=self.P)
+                                        data=data, P=self.P)
             sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
             return DataLoader(ds, batch_sampler=sampler, num_workers=effective_workers,
                               collate_fn=ds.collate_fn, pin_memory=pin,

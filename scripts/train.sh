@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 #   "curriculum_large"  : phase 3 — full ladder; warm-starts from phase 2.
 #   "full"              : single full-scale run (no curriculum).
 # Override: MODE=curriculum_small bash scripts/train.sh
-# Warm-start: RESUME_FROM=path/to/last.ckpt MODE=curriculum_medium bash scripts/train.sh
+# Warm-start: RESUME_FROM=outputs/checkpoints/curriculum_small/epoch\=166.ckpt MODE=curriculum_medium bash scripts/train.sh
 MODE="${MODE:-validate}"
 
 # --- shared across modes ---

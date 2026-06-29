@@ -28,7 +28,6 @@ class BaseRL(LightningModule):
         test_data_size: int = 1000,
         metrics: dict = None,
         log_on_step: bool = True,
-        shuffle_train_dataloader: bool = True,
         dataloader_num_workers: int = 24,
         reload_train_dataloader: int = 4,
     ):
@@ -53,7 +52,6 @@ class BaseRL(LightningModule):
         }
         self.instantiate_metrics(metrics or {})
         self.log_on_step = log_on_step
-        self.shuffle_train_dataloader = shuffle_train_dataloader
         self.dataloader_num_workers = dataloader_num_workers
         self.reload_train_dataloader = reload_train_dataloader
 
@@ -69,7 +67,6 @@ class BaseRL(LightningModule):
         self.train_metrics = metrics.get("train", ["loss", "reward"])
         self.val_metrics = metrics.get("val", ["reward"])
         self.test_metrics = metrics.get("test", ["reward"])
-        self.log_on_step = metrics.get("log_on_step", True)
 
     def log_metrics(self, metric_dict: dict, phase: str, dataloader_idx=None):
         """Log metrics to logger and progress bar."""
@@ -88,12 +85,14 @@ class BaseRL(LightningModule):
         return metrics
 
     # ---- data ---------------------------------------------------------------
-    def load_dataloader(self):
-        # Don't shut workers down here — Lightning owns their lifecycle and reloads them itself.
+    def _make_train_dataloader(self):
         self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"],
                                               batch_size=self.data_cfg["batch_size"], shuffle=True,
                                               data=self.data_cfg["path_train_data"],
                                               num_workers=self.dataloader_num_workers)
+
+    def load_dataloader(self):
+        self._make_train_dataloader()
         self.val_dataset = self.env.dataset(self.data_cfg["val_data_size"],
                                             batch_size=self.data_cfg["batch_size"], shuffle=False,
                                             data=self.data_cfg["path_val_data"],
@@ -104,7 +103,6 @@ class BaseRL(LightningModule):
                                              num_workers=self.dataloader_num_workers)
 
     def setup(self, stage="fit"):
-        print(">>>>>>>>>>>>>")
         print(f"train_data_size={self.data_cfg['train_data_size']}   bs={self.data_cfg['batch_size']}")
         print(f"val_data_size={self.data_cfg['val_data_size']}   bs={self.data_cfg['batch_size']}")
         print(f"test_data_size={self.data_cfg['test_data_size']}   bs={self.data_cfg['batch_size']}")
@@ -114,7 +112,7 @@ class BaseRL(LightningModule):
 
     def setup_loggers(self):
         """Log all hyperparameters except those in `nn.Module`."""
-        if self.loggers is not None:
+        if self.loggers:
             hparams_save = {k: v for k, v in self.hparams.items()
                             if not isinstance(v, nn.Module)}
             for logger in self.loggers:
@@ -146,11 +144,11 @@ class BaseRL(LightningModule):
         sch = self.lr_schedulers()
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()
-        # Refresh training data every N epochs (requires Trainer's reload_dataloaders_every_n_epochs to match).
         if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
             path = self.data_cfg["path_train_data"]
-            # Only delete generated cache files (under data/), not external paths.
             if path.startswith("data/") and os.path.exists(path):
-                print("DELETED train_data.pt")
                 os.remove(path)
-            self.load_dataloader()
+            self._make_train_dataloader()
+            # Lightning 2.x removed Trainer.reset_train_dataloader; dropping the
+            # cached loader makes the next epoch's setup_data() re-call train_dataloader().
+            self.trainer.fit_loop._combined_loader = None

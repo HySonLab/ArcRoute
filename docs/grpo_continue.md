@@ -1,8 +1,7 @@
 # GRPO / D2 — Handoff để tiếp tục ở session khác
 
-> Cập nhật: 2026-06-25 (session 3). ILS baseline hoàn thiện (scripts + validate), local search
-> inter/intra 15×, Scheduler hot-path 2.8×. GRPO sẵn sàng full-scale. Xem `docs/continue_ils.md`
-> cho chi tiết ILS.
+> Cập nhật: 2026-06-29 (session 4). FD exhaustion bug trong `curriculum_medium` đã fix xong.
+> Toàn bộ curriculum pipeline sẵn sàng chạy. Xem `docs/continue_ils.md` cho chi tiết ILS.
 
 ---
 
@@ -20,7 +19,8 @@
   - `_centered_lex_rank_batch` (batched B×K×P numpy) dùng trong `_group_advantage` để vectorize.
 - **A/B benchmark (40 epoch, validate params) đã chạy:**
   GRPO thắng PPO trên 3 objectives: T1 -9.2%, T2 -4.4%, T3 -2.9%.
-- **Chất lượng ĐÃ XÁC NHẬN** ở validate scale (40 epoch). Full-scale train chưa chạy.
+- **`curriculum_small` (20:40, 200 epoch) đã chạy ổn.** `curriculum_medium` (20:40,30:60,40:80) bị
+  crash EMFILE ~epoch 55 — đã fix xong trong session 4.
 
 ---
 
@@ -117,10 +117,33 @@ DAPO: nhóm all-tied → advantage=0 → bị lọc ra khỏi gradient update.
 | **Perf** Scheduler hot-path | `src/solvers/scheduler.py` | numpy-ify `_trip_profile` — 2.8× speedup |
 | **Perf** encoder sharing GRPO | `src/trainers/grpo.py` | Share encoder output across K rollouts + fix `store_all_logp` |
 | **Feat** inter/intra LS | `src/utils/local_search.py` | Swap-based intra-route + inter-route operators, numpy broadcasting — 15× so với Python loops |
-| **Refactor** local_search dead code | `src/utils/local_search.py` | Xóa dead code, giữ `ls()`, `lsRL()` |
 | **Fix** capacity bug `get_once` | `src/solvers/meta.py` | `chosen = idxs[idx]` thay `routes[idx]` — sai vehicle khi có vehicle infeasible |
-| **Feat** `get_Ts` | `src/solvers/cal_reward.py` | Batch T1/T2/T3 qua Scheduler cho ILS output |
-| **Feat** `run_parallel2` | `src/utils/ops.py` | Sequential map helper |
+| **Feat** `get_Ts` + `run_parallel2` | `src/solvers/cal_reward.py`, `src/utils/ops.py` | Batch T1/T2/T3 qua Scheduler cho ILS; sequential map helper |
+
+### Session 4 (commit `748be1d` + working tree, 2026-06-29)
+
+`curriculum_medium` crash `OSError: [Errno 24] Too many open files` ~epoch 55. Ba nguồn FD:
+
+| Nguồn | Fix |
+|---|---|
+| PyTorch `file_descriptor` sharing: 1 FD/tensor qua IPC | `file_system` strategy scoped trong `generate_dataset` (save/restore) |
+| Worker pipe FDs từ DataLoader không được giải phóng ngay | `del it, dataloader; gc.collect()` trước `return` trong `generate_dataset` |
+| **Root cause**: `MultiSizeCARPGenerator` gọi `generate_dataset` với `num_workers=24` × 3 buckets trong khi Lightning's 29 persistent workers đang sống | `num_workers=0` hardcode khi gọi từ `MultiSizeCARPGenerator` (generation là pure CPU math, không cần parallel workers) |
+
+**Critical Lightning 2.x API fix** (phát hiện bởi Opus review):  
+`Trainer.reset_train_dataloader()` không tồn tại trong Lightning 2.x (bị xóa từ 2.0). Thay bằng:
+```python
+self.trainer.fit_loop._combined_loader = None
+```
+Lightning's `setup_data()` rebuild từ `train_dataloader()` hook khi `_combined_loader is None` ở đầu epoch tiếp theo. Không có race condition vì `on_train_epoch_end` fire sau khi epoch đã hoàn toàn xong.
+
+**Đồng thời**: xóa `reload_dataloaders_every_n_epochs` khỏi `Trainer` (trước đó dùng để trigger reload, nhưng nó reload cả val/test mỗi 4 epoch — sai). `BaseRL` tự quản lý reload train-only qua `_make_train_dataloader()`.
+
+**Dead code removed** (Opus review):
+- `shuffle_train_dataloader` param (`BaseRL` + `GRPO`) — stored nhưng không dùng
+- `MultiSizeCARPGenerator.num_workers` param — bị hardcode `0` ngay bên trong
+- `self.log_on_step = metrics.get("log_on_step", True)` trong `instantiate_metrics` — bị overwrite ngay sau bởi constructor arg
+- `print(">>>>>>>>>>>>>>>>>>>>")` trong `setup()`
 
 ---
 
@@ -143,14 +166,8 @@ BC warmup + asymmetric clip (Option F) thử nghiệm không có lợi rõ rệt
 
 Numpy ops (`_balanced_chunks` cumsum, `_completion_times` mask) thử vectorize → **chậm hơn 5-20%**
 ở mọi training size. Lý do: per-class block chỉ 10-30 arcs, per-trip chỉ 10-20 arcs — Python loop
-thắng numpy vì numpy có fixed overhead (ravel, astype, mask creation) lớn hơn 10-20 Python iterations.
+thắng numpy vì numpy có fixed overhead lớn hơn 10-20 Python iterations.
 **Lesson:** numpy chỉ thắng khi array ≥ ~50 elements/call. (revert tại commit `b678b97`)
-
-### Bug fixes
-
-1. `KeyError: 'reward'` — `policy.forward(calc_reward=False)` vẫn echo `td["reward"]`; fix: stash trước inner loop.
-2. `on_train_epoch_end` xóa external data — fix: chỉ xóa nếu `path.startswith("data/")`.
-3. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — thêm vào `bm_trainer.sh` để giảm fragmentation.
 
 ---
 
@@ -183,58 +200,50 @@ outputs/bm_20260624_010623/
 logs/bm_runner_20260624_010623.out
 ```
 
-### Scripts
-
-```bash
-bash scripts/bm_trainer.sh          # chạy GRPO→PPO→eval, log ở logs/bm_runner_<ts>.out
-uv run python scripts/eval_bm.py \  # eval thủ công nếu cần
-    --grpo_ckpt <ckpt> --ppo_ckpt <ckpt> \
-    --num_loc 40 --num_arc 80 --fleet 3 \
-    --embed_dim 128 --num_encoder_layers 6 --num_heads 8
-```
-
 ---
 
-## 7. ILS baseline (mới — session 3)
+## 7. ILS baseline (session 3)
 
 Scripts sẵn sàng, giải và validate được trên bất kỳ `.npz` instance nào:
 
 ```bash
-# Giải 1 instance
 uv run python scripts/ils_log.py \
     --file data/ood/osm_cityB/40/34_13_632.npz \
     --variant P --vehicles 3 --num_sample 20 \
     --log outputs/my_solution.txt
-# → outputs/my_solution.txt  (node chain + timing table)
-# → outputs/my_solution.sol  (machine-readable, dùng để validate)
 
-# Validate
 uv run python scripts/validate_solution.py \
     --instance data/ood/osm_cityB/40/34_13_632.npz \
     --solution outputs/my_solution.sol
 ```
 
-**Lưu ý quan trọng:** tất cả 800 instances trong dataset đều cần **≥ 3 xe** (công thức
-`Q = Σq/3 + 0.5` hardcode `/3` → total demand normalize ≈ 3.0). Script báo lỗi rõ nếu số
-xe không đủ và gợi ý số xe tối thiểu.
-
-Xem chi tiết kiến trúc, timing model, `.sol` format: **`docs/continue_ils.md`**.
+**Lưu ý:** tất cả 800 instances đều cần **≥ 3 xe** (công thức `Q = Σq/3 + 0.5` hardcode `/3`).
+Xem chi tiết: **`docs/continue_ils.md`**.
 
 ---
 
 ## 8. VIỆC CẦN LÀM TIẾP (theo ưu tiên)
 
-### 8.1 — Train full-scale GRPO
+### 8.1 — Chạy curriculum pipeline
 
-A/B validate đã PASS. Tiếp theo:
+FD bug đã fix. Commit working tree trước, rồi chạy theo thứ tự:
 
 ```bash
-MODE=full ALGO=grpo bash scripts/train.sh
+# Phase 1 (nếu chưa có checkpoint)
+MODE=curriculum_small bash scripts/train.sh
+
+# Phase 2 — warm-start từ phase 1
+RESUME_FROM=outputs/checkpoints/curriculum_small/last.ckpt \
+MODE=curriculum_medium bash scripts/train.sh
+
+# Phase 3 — warm-start từ phase 2
+RESUME_FROM=outputs/checkpoints/curriculum_medium/last.ckpt \
+MODE=curriculum_large bash scripts/train.sh
 ```
 
-- ⚠️ **Dọn cache trước:** `rm -f data/*.data`
-- Theo dõi `outputs/lightning_logs/version_*/metrics.csv` cột `val/T1_best,T2_best,T3_best`
-- Full-scale: `max_epoch=1000`, `batch_size=4096`, `train_data=100000`, `num_encoder_layers=12`
+- ⚠️ **Dọn cache trước mỗi phase:** `rm -f data/*.data`
+- Theo dõi: `tail -f logs/train_curriculum_<mode>_<ts>.out`
+- Monitor: `outputs/lightning_logs/version_*/metrics.csv` cột `val/T1_best,T2_best,T3_best`
 
 ### 8.2 — So sánh GRPO vs ILS trên `data/ood/`
 
@@ -250,12 +259,8 @@ uv run python -m eval.run_grid --ckpt <grpo_ckpt> --path data/ood --M 3,5,7,10 -
 
 ### 8.3 — Cân nhắc tăng K hoặc ppo_epochs
 
-Hiện `group_size=8`, `ppo_epochs=1`. Với memory còn ~18 GB free (không có GPU contention), có thể thử
-K=16 hoặc ppo_epochs=2.
-
-### 8.4 — Dọn doc
-
-`README.md` còn tham chiếu đường dẫn cũ. `scripts/train.sh` MODE=full 1000 epoch — chỉnh nếu cần.
+Hiện `group_size=8` (train.sh: 16), `ppo_epochs=1`. Với memory còn ~18 GB free, có thể thử K=16/32
+hoặc ppo_epochs=2.
 
 ---
 
@@ -263,31 +268,32 @@ K=16 hoặc ppo_epochs=2.
 
 - **GPU SHARE:** kiểm `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader` trước khi
   chạy. User `iec` thỉnh thoảng chạy `wgp.py --i2v-14B` chiếm ~20 GB. Đợi hoặc hỏi trước.
-- **PYTORCH_CUDA_ALLOC_CONF:** `bm_trainer.sh` đã set `expandable_segments:True`. Nếu train thủ công
-  qua `train.sh` bị OOM fragmentation, export trước: `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+- **PYTORCH_CUDA_ALLOC_CONF:** `train.sh` đã set `expandable_segments:True` qua `nohup env ...`.
 - **Cache trap:** generator LOAD `data/*.data` nếu tồn tại. Luôn `rm -f data/*.data` trước run mới
   với size/M khác. `data/eval_bm_tmp.data` là file tạm của `eval_bm.py` — có thể xóa.
+- **FD exhaustion fixed:** `MultiSizeCARPGenerator` dùng `num_workers=0` khi generate (pure CPU math).
+  `generate_dataset` với `num_workers>0` vẫn đúng khi gọi standalone (e.g. `save_cache`, `gen_data.py`).
+- **Lightning 2.x reload:** không dùng `reload_dataloaders_every_n_epochs`. `BaseRL.on_train_epoch_end`
+  tự set `trainer.fit_loop._combined_loader = None` để trigger reload train-only.
 - **Load checkpoint:** `torch.load(ckpt, weights_only=False)`.
 - **Import qua package cài editable:** nếu `ModuleNotFoundError` → chạy `uv sync`.
 - **Test suite:** `uv run python -m unittest discover -s tests -p "test_*.py"` (146 tests, ~10s).
 - **Job sống sót session-restart:** `setsid bash -c '...' < /dev/null > log 2>&1 &`.
-- **bm_trainer.sh** dùng nohup nội bộ — follow: `tail -f logs/bm_runner_<ts>.out`.
 
 ---
 
 ## 10. Trạng thái git
 
-- Branch `dev`. HEAD: `ee61e82`.
-- Commits session 3:
-  - `ee61e82` — fix: wire get_Ts, run_parallel2, fix capacity bug in get_once
-  - `91016f8` — refactor: remove dead code from local_search.py
-  - `f1334ec` — feat: implement HDCARP inter/intra local search operators (15x speedup)
-  - `91b51df` — perf: numpy-ify Scheduler _trip_profile hot path (2.8x speedup)
-  - `e62b26c` — perf: encoder sharing in GRPO rollout + fix store_all_logp
-- Commits session 2:
-  - `56e105d` — docs: update grpo_continue.md
-  - `b678b97` — revert: Scheduler vectorization (backfired)
-  - `3d7b4e7` — perf: vectorize Scheduler hot paths + pin tests
-  - `7cc8cde` — 4 training speedups + GRPO_old cleanup
-  - `941d8fd` — refactor src layout + standalone REINFORCE-GRPO
+- Branch `dev`. HEAD: `4d07cca` (chưa commit session 4 fixes — working tree có thay đổi).
+- Session 4 changes (working tree, chưa commit):
+  - `src/trainers/base.py` — `_make_train_dataloader()` split, `fit_loop._combined_loader = None`, dead code xóa
+  - `src/trainers/grpo.py` — xóa `shuffle_train_dataloader` param
+  - `src/env/generator.py` — xóa `num_workers` param từ `MultiSizeCARPGenerator`
+  - `src/env/env.py` — xóa kwarg `num_workers` tại call site
+  - `scripts/train.py` — xóa `reload_dataloaders_every_n_epochs` khỏi Trainer
+- Session 4 committed:
+  - `4d07cca` — feat: add MILP solution verifier for HDCARP-P and HDCARP-U
+  - `748be1d` — fix: LP inter-level constraints, FD leak in generator, and dataloader reload wiring
+- Session 3: `ee61e82`, `91016f8`, `f1334ec`, `91b51df`, `e62b26c`
+- Session 2: `56e105d`, `b678b97`, `3d7b4e7`, `7cc8cde`, `941d8fd`
 - Lịch sử GRPO: subclass PPO → REINFORCE standalone → mini-batch standalone (`7cc8cde`) → GRPO_old cleanup.

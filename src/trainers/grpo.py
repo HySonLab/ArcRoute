@@ -135,7 +135,6 @@ class GRPO(BaseRL):
         test_data_size: int = 1000,
         metrics: dict = None,
         log_on_step: bool = True,
-        shuffle_train_dataloader: bool = True,
         dataloader_num_workers: int = 24,
         reload_train_dataloader: int = 4,
         **kwargs,   # swallow any remaining caller-compat args
@@ -145,7 +144,6 @@ class GRPO(BaseRL):
             batch_size=batch_size, train_data_size=train_data_size,
             val_data_size=val_data_size, test_data_size=test_data_size,
             metrics=metrics, log_on_step=log_on_step,
-            shuffle_train_dataloader=shuffle_train_dataloader,
             dataloader_num_workers=dataloader_num_workers,
             reload_train_dataloader=reload_train_dataloader,
         )
@@ -245,16 +243,17 @@ class GRPO(BaseRL):
                 sub_td.clone(),
                 actions=sub_td["action"],
                 env=self.env,
-                return_entropy=True,
+                return_entropy=(self.entropy_lambda > 0),
                 calc_reward=False,
                 return_sum_log_likelihood=False,
             )
-            ll, entropy = out_i["log_likelihood"], out_i["entropy"]
+            ll = out_i["log_likelihood"]
+            entropy = out_i.get("entropy", None)
             ratio = torch.exp(ll.sum(dim=-1) - sub_td["logprobs"]).view(-1, 1)
 
             clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
-            loss = -torch.min(ratio * adv, clipped_ratio * adv).mean() \
-                   - self.entropy_lambda * entropy.mean()
+            surr = -torch.min(ratio * adv, clipped_ratio * adv).mean()
+            loss = surr - self.entropy_lambda * entropy.mean() if entropy is not None else surr
 
             opt.zero_grad()
             self.manual_backward(loss)
@@ -263,7 +262,8 @@ class GRPO(BaseRL):
                                     gradient_clip_algorithm="norm")
             opt.step()
 
-        out_log = {"loss": loss, "reward": -Tk[0].reshape(1), "entropy": entropy.mean(),
+        out_log = {"loss": loss, "reward": -Tk[0].reshape(1),
+                   "entropy": entropy.mean() if entropy is not None else torch.tensor(0.0),
                    "skipped_frac": skipped_frac}
         out_log.update({f"T{k+1}_mean": Tk[k] for k in range(P)})
         metrics = self.log_metrics(out_log, "train")
