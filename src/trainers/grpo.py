@@ -175,12 +175,15 @@ class GRPO(BaseRL):
     def _train_step(self, batch):
         K = self.group_size
 
+        # td0 lives outside no_grad so the inner loop can index it for per-group
+        # encoder calls. env.reset is pure data preprocessing — no grad needed.
+        td0 = self.env.reset(batch)
+        B = td0.batch_size[0]
+
         # (1) Roll out the full B*K group WITHOUT a gradient graph. batchify each
         # instance K times (POMO-style, k*B+b layout), sample one rollout per copy.
         # No activations are retained, so the big B*K forward is cheap in memory.
         with torch.no_grad():
-            td0 = self.env.reset(batch)
-            B = td0.batch_size[0]
             # Encode B instances once. Encoder uses InstanceNorm (batch-independent) so
             # K copies of the same instance produce identical hidden states — no need to
             # encode B*K times. Batchify the shared hidden to match k*B+b layout of td.
@@ -223,26 +226,45 @@ class GRPO(BaseRL):
             metrics["train/skipped_frac"] = skipped_frac
             return {"loss": 0.0, **metrics}
 
-        # Keep only active groups: build (B*K,) active row indices in k*B+b order
-        # (rows k*B+b for every active b) and slice td down to the active rollouts.
-        active_idx = torch.nonzero(active_mask, as_tuple=False).flatten()
+        # Keep only active groups: build (B_a*K,) active row indices in k*B_a+b' order.
+        active_idx = torch.nonzero(active_mask, as_tuple=False).flatten()   # (B_a,) CPU
         keep = (torch.arange(K).view(K, 1) * B + active_idx.view(1, -1)).reshape(-1)
-        td = td[keep.to(reward.device)]
+        td = td[keep.to(reward.device)]   # (B_a*K, ...) k*B_a+b' layout
+        B_a = len(active_idx)
 
-        # (2) Grad-enabled inner loop: one shuffled pass over active rollouts.
-        mini_batch_size = max(1, min(self.mini_batch_size, td.size(0)))
-        idxs = torch.randperm(td.size(0))
+        # (2) Grad-enabled inner loop grouped by instance.
+        # Each mini-batch = mb_inst unique instances × K rollouts = same samples/step
+        # as before, but the encoder runs only on mb_inst rows (not mb_inst*K rows).
+        # Total encoder work: B_a (≈ B) samples vs B_a*K = B*K in the old flat loop.
+        mb_inst = max(1, self.mini_batch_size // K)
+        inst_perm = torch.randperm(B_a)   # shuffle instance dimension (CPU)
 
         opt = self.optimizers()
         loss = entropy = None
-        for i in range(0, td.size(0), mini_batch_size):
-            sub_td = td[idxs[i:i + mini_batch_size]]
+        for j in range(0, B_a, mb_inst):
+            inst_idx = inst_perm[j : j + mb_inst]            # (actual_mb,) CPU
+            orig_inst_idx = active_idx[inst_idx]             # (actual_mb,) CPU; B-indices
+
+            # Collect all K rollouts of these instances: k*actual_mb+i layout
+            actual_mb = len(inst_idx)
+            flat_row_idx = (
+                torch.arange(K, device=reward.device).view(K, 1) * B_a
+                + inst_idx.to(reward.device).view(1, -1)
+            ).reshape(-1)                                     # (actual_mb*K,)
+            sub_td = td[flat_row_idx]
             adv = sub_td["advantage"].view(-1, 1)
+
+            # Encode only the actual_mb unique instances (with grad).
+            sub_hidden, _ = self.policy.encoder(
+                td0[orig_inst_idx.to(reward.device)]
+            )                                                 # (actual_mb, N, D)
+            sub_hidden_bk = batchify(sub_hidden, K)          # (actual_mb*K, N, D)
 
             out_i = self.policy(
                 sub_td.clone(),
                 actions=sub_td["action"],
                 env=self.env,
+                hidden=sub_hidden_bk,
                 return_entropy=(self.entropy_lambda > 0),
                 calc_reward=False,
                 return_sum_log_likelihood=False,
