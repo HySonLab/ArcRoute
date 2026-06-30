@@ -54,17 +54,20 @@ class CARPEnv:
         svc_j = gather_by_index(td["service_times"], j_star[:, None], squeeze=True)  # (B,)
         step_cost = td["adj"][ar, old_cn_m, j_star] + svc_j  # (B,)
 
-        # Capacity of vehicle m_star: add demand, reset to 0 on depot return.
-        new_cap = td["used_capacity"].clone()
-        new_cap[ar, m_star] = (td["used_capacity"][ar, m_star] + dem_j) * (~is_depot).float()
+        # Scatter-update only the selected vehicle slot — no full clone.
+        # capacity: add demand, reset to 0 on depot return
+        cap_delta = (td["used_capacity"][ar, m_star] + dem_j) * (~is_depot).float() \
+                    - td["used_capacity"][ar, m_star]
+        new_cap = td["used_capacity"] + torch.zeros_like(td["used_capacity"]).scatter_(
+            1, m_star[:, None], cap_delta[:, None])
 
-        # Completion time of vehicle m_star (travel + service of this leg).
-        new_comp = td["completion"].clone()
-        new_comp[ar, m_star] = td["completion"][ar, m_star] + step_cost
+        # completion: add step cost
+        new_comp = td["completion"] + torch.zeros_like(td["completion"]).scatter_(
+            1, m_star[:, None], step_cost[:, None])
 
-        # Current node of vehicle m_star.
-        new_cn = td["current_node"].clone()
-        new_cn[ar, m_star] = j_star
+        # current node: update to j_star
+        new_cn = td["current_node"] + torch.zeros_like(td["current_node"]).scatter_(
+            1, m_star[:, None], (j_star - td["current_node"][ar, m_star])[:, None])
 
         # Global served mask (depot is never marked served).
         visited = td["visited"].scatter(-1, j_star[:, None, None], 1)
@@ -129,8 +132,8 @@ class CARPEnv:
         dem = td["demand"]                                   # (B, N+1)
         used = td["used_capacity"]                           # (B, M_max)
         exceeds_cap = (dem[:, None, :] + used[:, :, None]) > (cap + 1e-9)  # (B,M,N+1)
-        exceeds_cap = exceeds_cap.clone()
-        exceeds_cap[:, :, 0] = False                          # depot demand 0
+        # depot col: demand[0]=0 so never exceeds; zero it without clone via masking
+        exceeds_cap = exceeds_cap & (torch.arange(N1, device=dev) > 0)[None, None, :]
 
         # Depot idle-guard: a vehicle AT the depot with EMPTY load cannot pick depot
         # again (prevents standing still). When the instance is done, never block
@@ -211,8 +214,9 @@ class CARPEnv:
         ds = OSMMultiSizeDataset(data_dir, vehicle_choices=choices,
                                  cache_path=cache, buckets=buckets)
         sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
-        return DataLoader(ds, batch_sampler=sampler, num_workers=0,
-                          collate_fn=ds.collate_fn, pin_memory=False)
+        return DataLoader(ds, batch_sampler=sampler, num_workers=4,
+                          collate_fn=ds.collate_fn, pin_memory=True,
+                          persistent_workers=True)
 
     def _pos_val(self):
         """Priority class labels 1..P for the Scheduler/reward (-> a (B,P) T-vector)."""

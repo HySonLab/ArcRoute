@@ -89,7 +89,7 @@ def calculate_entropy(logprobs):
     """
     logprobs = torch.nan_to_num(logprobs, nan=0.0)
     entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
-    entropy = entropy.sum(dim=1)  # [batch] -- sum over decoding steps
+    entropy = entropy.mean(dim=1)  # [batch] -- mean over decoding steps (scale-invariant)
     assert entropy.isfinite().all(), "Entropy is not finite"
     return entropy
 

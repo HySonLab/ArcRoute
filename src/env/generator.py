@@ -138,9 +138,9 @@ def _pick_density(density, num_loc):
 
 
 def generate(num_loc, num_arc=None, num_vehicle=3, density=None, P=3):
-    # Phase 1: each arg may be a scalar or an inclusive (lo, hi) range. A single
-    # generate() call resolves to ONE concrete size (the dataloader must keep a
-    # batch single-size; see save_cache + the encoder's `assert mask is None`).
+    # Each arg may be a scalar or an inclusive (lo, hi) range. A single
+    # generate() call resolves to ONE concrete size (the encoder's collate_fn
+    # requires a uniform-size batch; `assert mask is None` enforces it).
     num_loc = _pick(num_loc)
     num_vehicle = _pick(num_vehicle)
     # Phase 2: if a density d is given, |A| = round(n*d) (paper F1). d overrides
@@ -233,19 +233,6 @@ def generate_dataset(num_samples, num_loc, num_arc, num_vehicle, num_workers=24,
         mp.set_sharing_strategy(_prev_strategy)
 
 
-def save_cache(num_sample, num_loc, num_arc, num_vehicle, path_data="carp_data.pt", P=3):
-    # Bucketing (Phase 1 §1.3): the encoder cannot mix sizes in one batch
-    # (collate = torch.cat of (1,n,n); encoder asserts mask is None). So resolve
-    # any ranges to ONE concrete size here -> a cache file is a single bucket.
-    tds = generate_dataset(num_sample, num_loc, num_arc, num_vehicle, progress=True, P=P)
-
-    parent_dir = os.path.dirname(path_data)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-    torch.save(tds, path_data)
-    print(f"Saved dataset to {path_data}...")
-
-
 class SizeBucketBatchSampler:
     """Phase 6: yields batches whose indices all live in the SAME size bucket, so
     every collated batch is single-size (the encoder cannot mix sizes). Indices
@@ -280,61 +267,3 @@ class SizeBucketBatchSampler:
         return self._len
 
 
-class MultiSizeCARPGenerator(Dataset):
-    """Phase 6: a training dataset spanning several sizes (the |A_r| ladder). Data
-    is grouped into per-size buckets; pair with SizeBucketBatchSampler to keep
-    each batch single-size. `sizes` is a list of (num_loc, num_arc) pairs."""
-
-    def __init__(self, num_samples, sizes, num_vehicle, data=None, P=3):
-        if isinstance(data, str) and os.path.exists(data):
-            payload = torch.load(data, weights_only=False)
-            self.buckets, self.bucket_ranges = payload["buckets"], payload["ranges"]
-        else:
-            per = max(1, num_samples // len(sizes))
-            self.buckets, self.bucket_ranges, start = [], [], 0
-            for (nl, na) in sizes:
-                # num_workers=0: generation is pure CPU math, no I/O; spawning workers
-                # here accumulates pipe FDs alongside Lightning's persistent DataLoader
-                # workers → os.pipe() EMFILE on repeated reloads.
-                tds = generate_dataset(per, nl, na, num_vehicle, 0, P=P)
-                self.buckets.append(tds)
-                self.bucket_ranges.append((start, start + len(tds)))
-                start += len(tds)
-            if isinstance(data, str):
-                parent = os.path.dirname(data)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                torch.save({"buckets": self.buckets, "ranges": self.bucket_ranges}, data)
-        self._map = [(bi, li) for bi, (st, en) in enumerate(self.bucket_ranges)
-                     for li in range(en - st)]
-
-    def __len__(self):
-        return len(self._map)
-
-    def __getitem__(self, gidx):
-        bi, li = self._map[gidx]
-        return self.buckets[bi][li:li + 1]
-
-    @staticmethod
-    def collate_fn(batch):
-        return torch.cat(batch, dim=0)
-
-class CARPGenerator(Dataset):
-    def __init__(self, num_samples=None, num_loc=None, num_arc=None, num_vehicle=None, data="carp_data.pt", P=3):
-        if isinstance(data, str):
-            if not os.path.exists(data):
-                print(f"Don't have {data}, generating...")
-                save_cache(num_samples, num_loc, num_arc, num_vehicle, data, P=P)
-            self.data = torch.load(data, weights_only=False)
-        else:
-            self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx:idx+1]
-
-    @staticmethod
-    def collate_fn(batch):
-        return torch.cat(batch, dim=0)

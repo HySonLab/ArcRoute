@@ -14,8 +14,7 @@ from trainers.grpo import GRPO, centered_lex_rank
 
 def _make_env(reward_mode="vector", M=3, n=15):
     from env.env import CARPEnv
-    return CARPEnv(num_loc=n, num_arc=n, num_vehicle=M, variant="P",
-                   reward_mode=reward_mode)
+    return CARPEnv(num_vehicle=M, variant="P", reward_mode=reward_mode)
 
 
 def _make_policy():
@@ -25,34 +24,37 @@ def _make_policy():
 
 def _make_model(cls, env, policy, tag="grpo", **extra):
     return cls(env, policy,
-               path_train_data=f"data/_{tag}_train.data",
-               path_val_data=f"data/_{tag}_val.data",
-               path_test_data=f"data/_{tag}_test.data",
-               batch_size=16, mini_batch_size=8,
-               train_data_size=16, val_data_size=16, test_data_size=16,
-               dataloader_num_workers=0, reload_train_dataloader=999,
-               **extra)
+               path_train_data=f"data/_{tag}_train",
+               path_val_data=f"data/_{tag}_val",
+               path_test_data=f"data/_{tag}_test",
+               batch_size=16, mini_batch_size=8, **extra)
 
 
-def _fit_one_step(model, tag):
+def _synthetic_dl(n=15, M=3, n_samples=16):
+    """Tiny DataLoader from synthetic data — used to mock env.dataset() in tests."""
+    from env.generator import generate_dataset
+    from torch.utils.data import DataLoader
+    td = generate_dataset(n_samples, n, n, M, num_workers=0)
+
+    class _DS(torch.utils.data.Dataset):
+        def __len__(self): return len(td)
+        def __getitem__(self, i): return td[i:i+1]
+
+    return DataLoader(_DS(), batch_size=n_samples, collate_fn=lambda b: torch.cat(b, dim=0))
+
+
+def _fit_one_step(model, tag, n=15):
     """Run exactly ONE train batch through a real (CPU) Trainer so Lightning's
-    optimizer + logging are wired; grads persist on params afterwards (1 batch,
-    not zeroed again). Cleans up the generated tiny data files."""
-    import glob
-    import os
+    optimizer + logging are wired; grads persist on params afterwards."""
     from lightning import Trainer
+    M = model.env.num_vehicle
+    dl = _synthetic_dl(n, M)
     trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
                       limit_train_batches=1, limit_val_batches=0,
                       num_sanity_val_steps=0, enable_checkpointing=False,
                       logger=False, enable_progress_bar=False)
-    try:
+    with mock.patch.object(model.env, 'dataset', side_effect=lambda *a, **kw: dl):
         trainer.fit(model)
-    finally:
-        for f in glob.glob(f"data/_{tag}_*.data"):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
 
 
 class TestRankFunction(unittest.TestCase):
@@ -198,22 +200,15 @@ class TestGRPOStep(unittest.TestCase):
 
     def test_eval_step_logs_lex_best(self):
         """⭐ Val rollout logs val/lex_best (the lexicographic checkpoint monitor)."""
-        import glob
-        import os
         from lightning import Trainer
         env, policy, model = self._build(tag="grpo_val")
+        dl = _synthetic_dl()
         trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
                           limit_train_batches=1, limit_val_batches=1,
                           num_sanity_val_steps=0, enable_checkpointing=False,
                           logger=False, enable_progress_bar=False)
-        try:
+        with mock.patch.object(model.env, 'dataset', side_effect=lambda *a, **kw: dl):
             trainer.fit(model)
-        finally:
-            for f in glob.glob("data/_grpo_val_*.data"):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
         self.assertIn("val/lex_best", trainer.callback_metrics)
 
     def test_smoke_P_then_U(self):
@@ -225,32 +220,28 @@ class TestGRPOStep(unittest.TestCase):
 
 
 def _tiny_rollout(seed=0, B=6, K=4, n=15, M=3):
-    """One small CPU rollout -> (td_cpu, actions_np) for reward/encoder tests."""
-    import os
-    from torch.utils.data import DataLoader
+    """One small CPU rollout -> (env, policy, td0, out) for reward/encoder tests."""
+    from env.generator import generate_dataset
     torch.manual_seed(seed)
     env = _make_env(M=M, n=n)
     policy = _make_policy()
-    tmp = f"data/_tiny_{seed}.data"
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    ds = env.generator(B, n, n, M, data=tmp)
-    batch = next(iter(DataLoader(ds, batch_size=B, collate_fn=env.generator.collate_fn)))
-    td0 = env.reset(batch)
+    td_batch = generate_dataset(B, n, n, M, num_workers=0)
+    td0 = env.reset(td_batch)
     with torch.no_grad():
         out = policy(batchify(td0, K).clone(), env, phase="train", decode_type="greedy")
-    if os.path.exists(tmp):
-        os.remove(tmp)
     return env, policy, td0, out
 
 
-def _wire_and_batch(model, tag):
+def _wire_and_batch(model, tag, n=15):
     """Attach `model` to a real CPU Trainer (so optimizers / manual_backward /
     clip_gradients are wired) and return ONE real train batch so `_train_step`
     can be invoked directly. `log_metrics` is stubbed to a pure dict passthrough
-    (Lightning's result collection isn't registered outside the training loop).
-    Caller is responsible for cleaning data files."""
+    (Lightning's result collection isn't registered outside the training loop)."""
     from lightning import Trainer
+    M = model.env.num_vehicle
+    dl = _synthetic_dl(n, M)
+    model.env.dataset = lambda *a, **kw: dl  # monkeypatch for this model's lifetime
+
     trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
                       limit_train_batches=1, limit_val_batches=0,
                       num_sanity_val_steps=0, enable_checkpointing=False,
@@ -271,13 +262,7 @@ def _wire_and_batch(model, tag):
 
 
 def _cleanup(tag):
-    import glob
-    import os
-    for f in glob.glob(f"data/_{tag}_*.data"):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
+    pass  # no .data files created any more
 
 
 class TestDynamicGroupFiltering(unittest.TestCase):
@@ -371,24 +356,16 @@ class TestPriorityCountP(unittest.TestCase):
     """⭐ P (number of priority classes) is generalized; default 3 unchanged."""
 
     def test_env_P4_reward_vector_width(self):
-        import os
-        from torch.utils.data import DataLoader
         from env.env import CARPEnv
+        from env.generator import generate_dataset
         torch.manual_seed(0)
-        env = CARPEnv(num_loc=20, num_arc=20, num_vehicle=3, variant="P",
-                      reward_mode="vector", P=4)
+        env = CARPEnv(num_vehicle=3, variant="P", reward_mode="vector", P=4)
         self.assertEqual(env.obj_weights, [1.0, 1e-2, 1e-4, 1e-6])   # P=4 weights
         policy = _make_policy()
-        tmp = "data/_p4.data"
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        ds = env.generator(6, 20, 20, 3, data=tmp, P=4)
-        batch = next(iter(DataLoader(ds, batch_size=6, collate_fn=env.generator.collate_fn)))
-        td0 = env.reset(batch)
+        ds = generate_dataset(6, 20, 20, 3, num_workers=0, P=4)
+        td0 = env.reset(ds)
         with torch.no_grad():
             out = policy(batchify(td0, 4).clone(), env, phase="train")
-        if os.path.exists(tmp):
-            os.remove(tmp)
         self.assertEqual(out["reward"].shape[-1], 4)   # P=4 -> T-vector width 4
 
 

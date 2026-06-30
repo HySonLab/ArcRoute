@@ -32,7 +32,7 @@ def run_parallel(operation, *param_set, **kwargs):
         
     dataloader = DataLoader(
         WrapDataset(operation, *param_set, **kwargs),
-        batch_size=len(param_set[0])//kwargs.get("num_epochs", 24),
+        batch_size=max(1, len(param_set[0]) // kwargs.get("num_epochs", 24)),
         shuffle=False,
         num_workers=kwargs.get("num_workers", 10),
         collate_fn=WrapDataset.collate_fn if kwargs.get("must_padding", False) else None

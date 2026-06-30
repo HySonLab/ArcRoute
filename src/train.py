@@ -1,8 +1,6 @@
+import random
 import torch
 torch.set_float32_matmul_precision('medium')
-# Decoder pointer attention uses q_len=1: Flash/MemEfficient SDPA hit CUDA grid
-# limits at large batch×heads and are slower for q_len=1 (tiling buys nothing).
-# Math backend has no kernel limits and is ~11% faster per sample here.
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 import numpy as np
@@ -15,60 +13,55 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GRPO training for HDCARP")
+    parser = argparse.ArgumentParser(description="GRPO training for HDCARP on OSM data")
 
-    parser.add_argument('--group_size', type=int, default=8,
-                        help='K samples/instance (group size).')
-    parser.add_argument('--reward_mode', type=str, default='vector',
-                        help='scalar|vector (default: vector for GRPO).')
-    parser.add_argument('--seed', type=int, default=6868, help='Random seed')
+    parser.add_argument('--group_size', type=int, default=8)
+    parser.add_argument('--reward_mode', type=str, default='vector')
+    parser.add_argument('--seed', type=int, default=6868)
     parser.add_argument('--max_epoch', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--mini_batch_size', type=int, default=256)
-    parser.add_argument('--train_data_size', type=int, default=100000)
-    parser.add_argument('--val_data_size', type=int, default=10000)
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--num_encoder_layers', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--num_loc', type=int, default=20)
-    parser.add_argument('--num_arc', type=int, default=20)
-    parser.add_argument('--num_vehicle', type=str, default='3',
-                        help='Fleet size(s): "3" or comma list "2,3,5,7,10".')
-    parser.add_argument('--sizes', type=str, default=None,
-                        help='Multi-size ladder: "nloc:narc,..." e.g. '
-                             '"20:40,30:60,40:80,50:100,40:120".')
-    parser.add_argument('--variant', type=str, default='U')
-    parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints/clP_ladder')
-    parser.add_argument('--num_workers', type=int, default=24)
+    parser.add_argument('--num_vehicle', type=str, default='2,3,5,7,10',
+                        help='Fleet size(s) sampled per instance: "3" or "2,3,5,7,10".')
+    parser.add_argument('--variant', type=str, default='P')
+    parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints/grpo_osm')
     parser.add_argument('--accelerator', type=str, default='gpu')
     parser.add_argument('--devices', type=int, default=1)
-    parser.add_argument('--path_train_data', type=str, default="data/train_data.data")
-    parser.add_argument('--path_val_data', type=str, default="data/val_data.data")
-    parser.add_argument('--path_test_data', type=str, default="data/test_data.data")
+    parser.add_argument('--path_train_data', type=str, default='data/osm_train')
+    parser.add_argument('--path_val_data',   type=str, default='data/osm_val')
+    parser.add_argument('--path_test_data',  type=str, default='data/osm_test')
+    parser.add_argument('--curriculum', type=str, default=None,
+                        choices=['small', 'medium', 'large'],
+                        help='Load only this curriculum phase of training buckets. '
+                             'small=[20_30,20_40]  medium=[30_45..50_75,40_80]  '
+                             'large=[50_100,80_120,80_133]. Default: all buckets.')
     parser.add_argument('--resume_from', type=str, default=None,
-                        help='Checkpoint to load policy weights from (curriculum warm-start). '
+                        help='Checkpoint to load policy weights from (warm-start). '
                              'Loads weights only — epoch/optimizer state is NOT restored.')
 
     return parser.parse_args()
 
+
 if __name__ == "__main__":
     args = parse_args()
 
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    sizes = None
-    if args.sizes:
-        sizes = [tuple(int(x) for x in pair.split(":")) for pair in args.sizes.split(",")]
-        print(f"Multi-size training over (num_loc, num_arc) buckets: {sizes}")
-
     fleet = [int(x) for x in str(args.num_vehicle).split(",")]
     fleet = fleet[0] if len(fleet) == 1 else fleet
-    print(f"Fleet M (swept in reward, policy M-agnostic): {fleet}")
-    print(f"Algo=grpo  reward_mode={args.reward_mode}  group_size={args.group_size}")
+    print(f"Fleet M (sampled per instance): {fleet}")
+    print(f"reward_mode={args.reward_mode}  group_size={args.group_size}")
 
-    env = CARPEnv(num_loc=args.num_loc, num_arc=args.num_arc, num_vehicle=fleet,
-                  variant=args.variant, sizes=sizes, reward_mode=args.reward_mode)
+    from utils.data_utils import CURRICULUM
+    train_buckets = CURRICULUM[args.curriculum] if args.curriculum else None
+    print(f"curriculum={args.curriculum or 'all'}  train_buckets={train_buckets}")
+
+    env = CARPEnv(num_vehicle=fleet, variant=args.variant, reward_mode=args.reward_mode)
 
     policy = AttentionModelPolicy(
         embed_dim=args.embed_dim,
@@ -76,8 +69,7 @@ if __name__ == "__main__":
         num_heads=args.num_heads,
     )
 
-    metrics = {"train": ["reward", "loss", "entropy",
-                         "T1_mean", "T2_mean", "T3_mean"]}
+    metrics = {"train": ["reward", "loss", "T1_mean", "T2_mean", "T3_mean"]}
 
     if args.resume_from:
         import os
@@ -95,12 +87,9 @@ if __name__ == "__main__":
         path_test_data=args.path_test_data,
         batch_size=args.batch_size,
         mini_batch_size=args.mini_batch_size,
-        train_data_size=args.train_data_size,
-        val_data_size=args.val_data_size,
-        dataloader_num_workers=args.num_workers,
         metrics=metrics,
-        reload_train_dataloader=4,
         group_size=args.group_size,
+        train_buckets=train_buckets,
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -118,7 +107,7 @@ if __name__ == "__main__":
         devices=args.devices,
         default_root_dir="outputs",
         callbacks=[checkpoint_callback],
-        precision="bf16-mixed",
+        precision="32-true",
     )
 
     trainer.fit(model)

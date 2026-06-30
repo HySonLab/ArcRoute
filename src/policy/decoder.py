@@ -81,25 +81,27 @@ class JointMVContext(nn.Module):
     def forward(self, node_embeddings, td):
         """node_embeddings: (B, N+1, D); td has per-vehicle current_node (B,M),
         used_capacity (B,M), completion (B,M) and adj (B,N+1,N+1).
-        Returns (B, M, D) vehicle queries."""
+        Returns (B, M, D) vehicle queries. Fully vectorised — no Python loop over M."""
         B, M = td["current_node"].shape
         dev = node_embeddings.device
-        ar = torch.arange(B, device=dev)
+        cn = td["current_node"]                              # (B, M)
 
-        # Relative completion across this instance's vehicles (scale-invariant).
-        comp_norm = td["completion"].amax(dim=-1, keepdim=True).clamp(min=1e-6)  # (B,1)
+        # Node embedding for each vehicle's current node: (B, M, D)
+        B_idx = torch.arange(B, device=dev).unsqueeze(1).expand(B, M)
+        h = node_embeddings[B_idx, cn]                       # (B, M, D)
 
-        veh_embeds = []
-        for m in range(M):
-            cn_m = td["current_node"][:, m]                  # (B,)
-            h_m = node_embeddings[ar, cn_m]                  # (B, D)
-            rem_m = (1.0 - td["used_capacity"][:, m]).unsqueeze(-1)            # (B,1)
-            comp_m = (td["completion"][:, m:m + 1] / comp_norm)               # (B,1)
-            dist_m = td["adj"][ar, cn_m, 0].unsqueeze(-1)                      # (B,1)
-            veh_embeds.append(torch.cat([h_m, rem_m, comp_m, dist_m], dim=-1))  # (B,D+3)
+        # Remaining capacity: (B, M, 1)
+        rem = (1.0 - td["used_capacity"]).unsqueeze(-1)
 
-        veh_stack = torch.stack(veh_embeds, dim=1)           # (B, M, D+3)
-        return self.project_vehicle(veh_stack)               # (B, M, D)
+        # Normalised completion (scale-invariant across vehicles): (B, M, 1)
+        comp_norm = td["completion"].amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        comp = (td["completion"] / comp_norm).unsqueeze(-1)  # (B, M, 1)
+
+        # Distance to depot: adj[:, cn, 0] -> (B, M, 1)
+        dist = td["adj"][:, :, 0].gather(1, cn).unsqueeze(-1)  # (B, M, 1)
+
+        feat = torch.cat([h, rem, comp, dist], dim=-1)       # (B, M, D+3)
+        return self.project_vehicle(feat)                    # (B, M, D)
 
 
 class StaticEmbedding(nn.Module):

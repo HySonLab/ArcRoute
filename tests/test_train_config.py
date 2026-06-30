@@ -10,9 +10,12 @@ from unittest import mock
 
 import torch
 
-# train.py is an entry-point script under scripts/ (not a package) — add it to path.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import train
+import importlib.util, pathlib
+_src = pathlib.Path(__file__).parent.parent / "src" / "train.py"
+_spec = importlib.util.spec_from_file_location("train", _src)
+train = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(train)
+
 from trainers.grpo import GRPO
 
 
@@ -25,10 +28,9 @@ def _auto_reward_mode(args):
     return args.reward_mode
 
 
-def _make_env(reward_mode, variant="P", n=15, M=3):
+def _make_env(reward_mode, variant="P", M=3, **_):
     from env.env import CARPEnv
-    return CARPEnv(num_loc=n, num_arc=n, num_vehicle=M, variant=variant,
-                   reward_mode=reward_mode)
+    return CARPEnv(num_vehicle=M, variant=variant, reward_mode=reward_mode)
 
 
 def _make_policy():
@@ -38,35 +40,38 @@ def _make_policy():
 
 def _make_model(cls, env, policy, tag, metrics, **extra):
     return cls(env, policy,
-               path_train_data=f"data/_tc_{tag}_train.data",
-               path_val_data=f"data/_tc_{tag}_val.data",
-               path_test_data=f"data/_tc_{tag}_test.data",
+               path_train_data=f"data/_tc_{tag}_train",
+               path_val_data=f"data/_tc_{tag}_val",
+               path_test_data=f"data/_tc_{tag}_test",
                batch_size=16, mini_batch_size=8,
-               train_data_size=16, val_data_size=16, test_data_size=16,
-               dataloader_num_workers=0, reload_train_dataloader=999,
                metrics=metrics, **extra)
 
 
-def _fit_one_step(model, tag):
-    import glob
-    import os
+def _synthetic_dl(n=15, M=3, n_samples=16):
+    from env.generator import generate_dataset
+    from torch.utils.data import DataLoader
+    td = generate_dataset(n_samples, n, n, M, num_workers=0)
+
+    class _DS(torch.utils.data.Dataset):
+        def __len__(self): return len(td)
+        def __getitem__(self, i): return td[i:i+1]
+
+    return DataLoader(_DS(), batch_size=n_samples, collate_fn=lambda b: torch.cat(b, dim=0))
+
+
+def _fit_one_step(model, tag, n=15):
     from lightning import Trainer
+    M = model.env.num_vehicle
+    dl = _synthetic_dl(n, M)
     trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
                       limit_train_batches=1, limit_val_batches=0,
                       num_sanity_val_steps=0, enable_checkpointing=False,
                       logger=False, enable_progress_bar=False)
-    try:
+    with mock.patch.object(model.env, 'dataset', side_effect=lambda *a, **kw: dl):
         trainer.fit(model)
-    finally:
-        for f in glob.glob(f"data/_tc_{tag}_*.data"):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
 
 
-GRPO_METRICS = {"train": ["reward", "loss", "entropy",
-                          "T1_mean", "T2_mean", "T3_mean"]}
+GRPO_METRICS = {"train": ["reward", "loss", "T1_mean", "T2_mean", "T3_mean"]}
 
 
 class TestParseArgs(unittest.TestCase):
