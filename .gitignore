@@ -42,4 +42,7 @@ logs
 outputs/
 data/ood/
 data/osm/
+data/osm_train/
+data/osm_test/
+data/benchmark/
 *.data

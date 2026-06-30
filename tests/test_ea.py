@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from utils.nb_utils import gen_tours
+from utils.ops import gen_tours
 from solvers.meta import EAHCARP
 
 

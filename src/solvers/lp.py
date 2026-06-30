@@ -25,11 +25,16 @@ The model works in the raw (un-normalised) time/demand units stored in the
 """
 
 import argparse
+import contextlib
+import io
+import os
 from time import time
 
 import numpy as np
 import networkx as nx
 from pyscipopt import Model, quicksum, Conshdlr, SCIP_RESULT
+
+from utils.ops import import_instance, print_route_log
 
 
 # --------------------------------------------------------------------------- #
@@ -500,23 +505,129 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
 
 
 # --------------------------------------------------------------------------- #
+# Route reconstruction from MILP solution variables
+# --------------------------------------------------------------------------- #
+
+def _greedy_order(arc_list, adj, start=0):
+    """Order arc_list by greedy nearest-neighbour from start arc (1-based indices)."""
+    remaining = list(arc_list)
+    ordered = []
+    cur = start
+    while remaining:
+        best_i = min(range(len(remaining)), key=lambda i: adj[cur, remaining[i]])
+        nxt = remaining.pop(best_i)
+        ordered.append(nxt)
+        cur = nxt
+    return ordered
+
+
+def _arc_to_idx_map(req_raw):
+    """Return dict (tail, head) -> 1-based arc index from raw req array."""
+    return {(int(req_raw[i, 0]), int(req_raw[i, 1])): i + 1
+            for i in range(len(req_raw))}
+
+
+def reconstruct_routes_p(model, x_vars, G, req_raw, adj):
+    """Per-vehicle arc sequences for MILP-P (class order, greedy deadhead)."""
+    a2i = _arc_to_idx_map(req_raw)
+    routes = []
+    for m in range(G['M']):
+        route_arcs, prev = [], 0
+        for k in range(1, G['P'] + 1):
+            arcs_k = [a2i[a] for a in G['req_arcs']
+                      if G['cls'][a] == k and model.getVal(x_vars[(m, a)]) > 0.5]
+            if arcs_k:
+                ordered = _greedy_order(arcs_k, adj, prev)
+                route_arcs.extend(ordered)
+                prev = route_arcs[-1]
+        routes.append(np.array([0] + route_arcs + [0], dtype=np.int32))
+    return routes
+
+
+def reconstruct_routes_u(model, x_vars, G, req_raw, adj):
+    """Per-vehicle arc sequences for MILP-U (level order, greedy deadhead)."""
+    a2i = _arc_to_idx_map(req_raw)
+    routes = []
+    for m in range(G['M']):
+        route_arcs, prev = [], 0
+        for h in range(1, G['P'] + 1):
+            arcs_h = [a2i[a] for a in G['req_arcs']
+                      if model.getVal(x_vars[(m, a, h)]) > 0.5]
+            if arcs_h:
+                ordered = _greedy_order(arcs_h, adj, prev)
+                route_arcs.extend(ordered)
+                prev = route_arcs[-1]
+        routes.append(np.array([0] + route_arcs + [0], dtype=np.int32))
+    return routes
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+
 def parse_args():
     p = argparse.ArgumentParser(description='MILP solver for HDCARP-P / HDCARP-U')
-    p.add_argument('--variant', type=str, default='P', choices=['P', 'U'])
-    p.add_argument('--path', type=str, required=True, help='path to a .npz instance')
+    p.add_argument('--path', required=True, help='path to a .npz instance')
+    p.add_argument('--variant', default='P', choices=['P', 'U'])
     p.add_argument('--time_limit', type=float, default=3600)
     p.add_argument('--threads', type=int, default=8)
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--log', default=None, help='write route log to this file (in addition to stdout)')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
-    solve = solve_milp_p if args.variant == 'P' else solve_milp_u
-    t0 = time()
-    T = solve(args.path, time_limit=args.time_limit, threads=args.threads,
-              verbose=args.verbose)
-    dt = time() - t0
-    print(f'{args.path} ::: variant={args.variant} ::: T={T} ::: {dt:.2f}s')
+
+    if args.log:
+        # ── single-instance route log mode ────────────────────────────────
+        es = np.load(args.path)
+        req_raw = np.asarray(es['req'])
+        M_n, P_n = int(es['M']), int(es['P'])
+        dms, _, _, demands, _, _, _, _ = import_instance(args.path)
+
+        print(f"MILP-{args.variant} solver")
+        print(f"Instance : {args.path}")
+        print(f"P={P_n} classes | M={M_n} vehicles | {len(req_raw)} required arcs")
+        print(f"Time limit: {args.time_limit}s | Threads: {args.threads}")
+        print("Solving...", flush=True)
+
+        solver_fn = solve_milp_p if args.variant == "P" else solve_milp_u
+        t0 = time()
+        Tvec, model, vars_dict = solver_fn(
+            es, time_limit=args.time_limit, threads=args.threads,
+            verbose=False, return_model=True,
+        )
+        elapsed = time() - t0
+
+        if Tvec is None:
+            print(f"\nNo feasible solution found within {elapsed:.1f}s.")
+            raise SystemExit(1)
+
+        print(f"Solved in {elapsed:.3f}s\n")
+        G = vars_dict['G']
+        x = vars_dict['x']
+        routes = (reconstruct_routes_p if args.variant == "P" else reconstruct_routes_u)(
+            model, x, G, req_raw, dms
+        )
+        header = (f"MILP-{args.variant} solver\nInstance : {args.path}\n"
+                  f"P={P_n} classes | M={M_n} vehicles | {len(req_raw)} required arcs"
+                  f" | solved in {elapsed:.3f}s\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print(header)
+            print_route_log(routes, req_raw, demands, dms, Tvec)
+        out = buf.getvalue()
+        print(out)
+        os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
+        with open(args.log, "w") as f:
+            f.write(out)
+        print(f"Log written to {args.log}")
+    else:
+        # ── fast T-only mode ──────────────────────────────────────────────
+        solve = solve_milp_p if args.variant == 'P' else solve_milp_u
+        t0 = time()
+        T = solve(args.path, time_limit=args.time_limit, threads=args.threads,
+                  verbose=args.verbose)
+        dt = time() - t0
+        print(f'{args.path} ::: variant={args.variant} ::: T={T} ::: {dt:.2f}s')

@@ -18,7 +18,7 @@ from utils.local_search import (
     ls,
     lsRL,
 )
-from utils.nb_utils import gen_tours, deserialize_tours
+from utils.ops import gen_tours, deserialize_tours
 
 
 def make_symmetric_adj(n, seed=0):

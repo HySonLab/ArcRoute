@@ -103,7 +103,7 @@ if [ -n "$RESUME_FROM" ]; then
 fi
 
 # Run in the background via nohup so training survives a terminal close.
-nohup env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python scripts/train.py \
+nohup env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run python src/train.py \
     --seed "$SEED" \
     --max_epoch "$MAX_EPOCH" \
     --batch_size "$BATCH_SIZE" \

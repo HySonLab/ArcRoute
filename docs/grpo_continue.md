@@ -105,7 +105,7 @@ DAPO: nhóm all-tied → advantage=0 → bị lọc ra khỏi gradient update.
 
 | Fix | File | Chi tiết |
 |---|---|---|
-| **Fix 1** float32_matmul_precision | `scripts/train.py` | `torch.set_float32_matmul_precision('medium')` — Tensor Cores RTX 4090, ~20-40% GPU speedup |
+| **Fix 1** float32_matmul_precision | `src/train.py` | `torch.set_float32_matmul_precision('medium')` — Tensor Cores RTX 4090, ~20-40% GPU speedup |
 | **Fix 2** data reload bug | `src/trainers/base.py` | Chỉ xóa cache nếu `path.startswith("data/")` — tránh xóa external data như `outputs/bm_*/data/` |
 | **Fix 3** DataLoader workers | `src/env/env.py` | `effective_workers = min(num_workers, max(0, data_size // 2000))`, `pin_memory=True`, `persistent_workers=True` |
 | **Fix 4** vectorize advantage | `src/trainers/grpo.py` | `_centered_lex_rank_batch` (B,K,P) numpy thay vì loop over B |
@@ -290,7 +290,7 @@ hoặc ppo_epochs=2.
   - `src/trainers/grpo.py` — xóa `shuffle_train_dataloader` param
   - `src/env/generator.py` — xóa `num_workers` param từ `MultiSizeCARPGenerator`
   - `src/env/env.py` — xóa kwarg `num_workers` tại call site
-  - `scripts/train.py` — xóa `reload_dataloaders_every_n_epochs` khỏi Trainer
+  - `src/train.py` — xóa `reload_dataloaders_every_n_epochs` khỏi Trainer
 - Session 4 committed:
   - `4d07cca` — feat: add MILP solution verifier for HDCARP-P and HDCARP-U
   - `748be1d` — fix: LP inter-level constraints, FD leak in generator, and dataloader reload wiring

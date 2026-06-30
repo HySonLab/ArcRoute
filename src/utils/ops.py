@@ -143,77 +143,6 @@ def unbatchify_and_gather(x, idx, n):
     x = unbatchify(x, n)
     return gather_by_index(x, idx, dim=idx.dim())
 
-def prob_idxs(a1, a2, **kwargs):
-    idx = []
-    i,j = 0,0
-    while j < len(a2) and i < len(a1):
-        if a2[j] == a1[i]:
-            idx.append(i)
-            j += 1
-        i += 1
-    while len(idx) < kwargs['npad']:
-        idx.append(0)
-    if kwargs.get("return_numpy", False):
-        idx = np.array(idx, dtype=np.int64)
-    else:
-        idx = torch.tensor(idx, dtype=torch.int64)
-    # print("---> prob_idxs", idx.shape)
-    return idx
-        
-def refine_routes(actions, demands, max_vehicles=3, **kwargs):
-    actions = actions.tolist()
-    # Khởi tạo danh sách các route và sức chứa
-    routes = [[] for _ in range(max_vehicles)]  # Danh sách các route cho mỗi vehicle
-    capacities = [0.0] * max_vehicles  # Tổng demand của mỗi vehicle
-    
-    # Chỉ số vehicle hiện tại
-    vehicle_idx = 0
-    
-    for arc in actions:
-        if arc == 0:
-            # Chuyển sang vehicle tiếp theo nếu còn chỗ
-            if vehicle_idx + 1 < max_vehicles:
-                vehicle_idx += 1
-            continue
-        
-        demand = demands[arc]
-        
-        # Kiểm tra xem vehicle hiện tại có thể chứa arc không
-        if capacities[vehicle_idx] + demand <= 1.0:
-            routes[vehicle_idx].append(arc)
-            capacities[vehicle_idx] += demand
-        else:
-            # Thử đặt arc vào các vehicle tiếp theo
-            placed = False
-            for i in range(vehicle_idx + 1, max_vehicles):
-                if capacities[i] + demand <= 1.0:
-                    routes[i].append(arc)
-                    capacities[i] += demand
-                    placed = True
-                    break
-            # Nếu không tìm được vehicle nào, đặt vào vehicle hiện tại (có thể vượt quá sức chứa)
-            if not placed and vehicle_idx == max_vehicles - 1:
-                routes[vehicle_idx].append(arc)
-                capacities[vehicle_idx] += demand
-    ret = []
-    for route in routes:
-        if len(route) > 0:
-            ret.extend([0] + route)
-
-    ret += [0]*(max_vehicles + len(demands) - len(ret))
-    if kwargs.get("return_numpy", False):
-        ret = np.array(ret[1:], dtype=np.int64)
-    else:
-        ret = torch.tensor(ret[1:])
-
-    # print("---> refine_routes", ret.shape)
-    return ret
-
-def convert_prob(x):
-    a = np.logaddexp.reduce(x)
-    return np.exp(x - a)
-
-
 def convert_adjacency_matrix(n1, n2, d):
     n1, n2 = n1.astype(int), n2.astype(int)
     n = len(np.unique([n1, n2]))
@@ -266,12 +195,191 @@ def import_instance(es, M=None):
     d = np.float32(es_req[:, 5])
     return dms, P, M, demands, clss, s, d, edge_indxs
 
-def softmax(x):
-    x = np.array(x)
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum(axis=0) # only difference
-
-
 def run_parallel2(func, items, **kwargs):
     """Map func(item, **kwargs) over items, return list of results."""
     return [func(item, **kwargs) for item in items]
+
+
+def gen_tours(actions):
+    """Flat action array [a1, a2, 0, a3, ...] -> list of routes.
+
+    Each returned route is a numpy int32 array with sentinel depot 0s at the
+    start and end, e.g. [0, a_i, ..., 0]. Empty segments (consecutive 0s) are
+    skipped.
+    """
+    routes = []
+    current = [0]
+    for a in actions:
+        if a == 0:
+            if len(current) > 1:
+                current.append(0)
+                routes.append(np.array(current, dtype=np.int32))
+                current = [0]
+        else:
+            current.append(int(a))
+    if len(current) > 1:
+        current.append(0)
+        routes.append(np.array(current, dtype=np.int32))
+    return routes
+
+
+def deserialize_tours(tours, max_len):
+    """List of routes (each [0, a_i, ..., 0]) -> flat actions array of length max_len.
+
+    Sentinels are stripped from each route, routes are joined with single 0
+    separators, and the result is zero-padded (or truncated) to ``max_len``.
+    """
+    flat = []
+    for r in tours:
+        r = np.asarray(r)
+        flat.extend(r[1:-1].tolist())  # strip sentinels
+        flat.append(0)                 # add separator
+    # strip trailing separator
+    flat = flat[:-1] if flat and flat[-1] == 0 else flat
+    arr = np.zeros(max_len, dtype=np.int32)
+    n = min(len(flat), max_len)
+    arr[:n] = flat[:n]
+    return arr
+
+
+def deserialize_tours_batch(tours_list, nseq):
+    """List of route-lists -> 2D flat action array, shape (batch, actual_max).
+
+    Each input element is a list of routes (as produced by ``gen_tours``).
+    """
+    rows = [deserialize_tours(t, nseq + 10) for t in tours_list]
+    actual_max = max((len(r) for r in rows), default=0)
+    out = np.zeros((len(rows), actual_max), dtype=np.int32)
+    for i, r in enumerate(rows):
+        out[i, :len(r)] = r[:actual_max]
+    return out
+
+
+def convert_prob(x):
+    """Softmax via log-sum-exp normalisation."""
+    x = np.asarray(x, dtype=np.float64)
+    a = np.logaddexp.reduce(x)
+    return np.exp(x - a)
+
+
+def print_route_log(routes, req, demands, adj, Ts):
+    """Print a formatted route log to stdout.
+
+    Args:
+        routes:  list of int32 arrays, each [0, arc, ..., 0].
+        req:     raw required-arc array, shape (nseq, 6) — columns
+                 [tail, head, demand, clss, service, traversal].
+        demands: 1-D float array indexed by arc (0 = depot).
+        adj:     arc-to-arc dead-heading cost matrix.
+        Ts:      sequence of objective values (T1, T2, T3).
+    """
+    P = int(req[:, 3].max())
+    arc_info = {
+        i + 1: dict(
+            tail=int(req[i, 0]),
+            head=int(req[i, 1]),
+            clss=int(req[i, 3]),
+            service=float(req[i, 4]),
+            demand=float(demands[i + 1]),
+        )
+        for i in range(len(req))
+    }
+
+    T_str = "  ".join(f"T{k + 1}={v:.4f}" for k, v in enumerate(Ts))
+    print(f"\n{T_str}\n")
+
+    for vid, route in enumerate(routes):
+        arcs = route[1:-1]
+        total_load = float(demands[arcs].sum()) if len(arcs) > 0 else 0.0
+        bar = "=" * 60
+        print(bar)
+        print(f"  VEHICLE {vid + 1}   load={total_load:.4f}/1.0000")
+        print(bar)
+
+        chain = ["depot"]
+        prev_head = None
+        for arc_idx in arcs:
+            info = arc_info[arc_idx]
+            t, h = info["tail"], info["head"]
+            if prev_head is not None and prev_head != t:
+                chain.append(f"~~{prev_head}->{t}~~")
+            chain.append(f"{t}->{h}")
+            prev_head = h
+        chain.append("depot")
+
+        line, indent = "  ", "    "
+        for k, part in enumerate(chain):
+            sep = " -> " if k > 0 else ""
+            if len(line) + len(sep) + len(part) > 70:
+                print(line)
+                line = indent + part
+            else:
+                line += sep + part
+        print(line)
+        print()
+
+        hdr = (f"  {'seq':>3}  {'arc':>3}  {'edge':>7}  {'cls'}"
+               f"  {'demand':>7}  {'service':>7}  {'dead':>7}  {'cum_load':>8}")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        cum = 0.0
+        for pos, arc_idx in enumerate(arcs):
+            info = arc_info[arc_idx]
+            prev_arc = arcs[pos - 1] if pos > 0 else 0
+            dead = float(adj[prev_arc, arc_idx])
+            cum += info["demand"]
+            print(
+                f"  {pos + 1:>3}  {arc_idx:>3}  "
+                f"{info['tail']:>2}->{info['head']:>2}  "
+                f"  {info['clss']}  "
+                f"{info['demand']:>7.4f}  "
+                f"{info['service']:>7.4f}  "
+                f"{dead:>7.4f}  "
+                f"{cum:>8.4f}"
+            )
+        print()
+
+        for p in range(1, P + 1):
+            class_arcs = [(pos, a) for pos, a in enumerate(arcs) if arc_info[a]["clss"] == p]
+            if not class_arcs:
+                continue
+            class_load = sum(arc_info[a]["demand"] for _, a in class_arcs)
+            print(f"  Class {p}  ({len(class_arcs)} arcs, load={class_load:.4f})")
+            for pos, arc_idx in class_arcs:
+                info = arc_info[arc_idx]
+                prev_arc = arcs[pos - 1] if pos > 0 else 0
+                dead = float(adj[prev_arc, arc_idx])
+                print(
+                    f"    [seq {pos + 1:2d}] arc {arc_idx:2d}  "
+                    f"{info['tail']:2d} -> {info['head']:2d}   "
+                    f"demand={info['demand']:.4f}  "
+                    f"service={info['service']:.4f}  "
+                    f"dead={dead:.4f}"
+                )
+            print()
+    print("=" * 60)
+
+
+def check_feasibility(demands, nv):
+    """Return True if fleet can cover total demand; print error and return False otherwise."""
+    total = float(demands[1:].sum())
+    if total > nv * 1.0 + 1e-6:
+        print(f"ERROR: No feasible solution found with {nv} vehicle(s).")
+        print(f"  Total demand = {total:.4f}  >  fleet capacity = {nv:.1f}")
+        print(f"  Minimum vehicles required: {int(np.ceil(total - 1e-6))}")
+        return False
+    return True
+
+
+def save_sol(sol_path, routes, Ts, **meta):
+    """Write a human-readable .sol file.
+
+    Keyword args in ``meta`` are written as ``key: value`` lines before the
+    T-vector and route list (order is preserved in Python 3.7+).
+    """
+    with open(sol_path, "w") as fh:
+        for k, v in meta.items():
+            fh.write(f"{k}: {v}\n")
+        fh.write(f"T1: {Ts[0]:.6f}  T2: {Ts[1]:.6f}  T3: {Ts[2]:.6f}\n")
+        for i, r in enumerate(routes):
+            fh.write(f"route {i + 1}: {' '.join(str(a) for a in r)}\n")

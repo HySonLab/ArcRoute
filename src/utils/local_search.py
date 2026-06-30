@@ -266,7 +266,7 @@ def ls(vars, variant='P', actions=None):
       2. intra-route optimisation per priority class (P) / globally (U)
       3. inter-route optimisation across all routes
     """
-    from utils.nb_utils import gen_tours
+    from utils.ops import gen_tours
 
     adj = vars['adj']
     adj = adj.numpy() if hasattr(adj, 'numpy') else np.asarray(adj)

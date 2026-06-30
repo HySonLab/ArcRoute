@@ -29,5 +29,5 @@ echo ">> Done. Activate the environment with:"
 echo "     source .venv/bin/activate"
 echo
 echo ">> Or run commands directly via uv, e.g.:"
-echo "     uv run python scripts/train.py --help"
+echo "     uv run python src/train.py --help"
 echo "     uv run python -m solvers.ils --data_path \"data/instances/30/61_20.npz\""

@@ -169,7 +169,7 @@ uv run python scripts/measure_scheduler_gap.py \
 1. Fix `src/policy/encoder.py`: adj multiplicative → additive negative bias
 2. Fix `src/policy/decoder.py`: extend `ARPContext` to 7-scalar state
 3. Fix `src/env/env.py`: track `clss_served`, `clss_total` in reset/step
-4. Update `scripts/train.py`: pass new hyperparameters if needed
+4. Update `src/train.py`: pass new hyperparameters if needed
 
 ### Phase 2 — Ablation (after v1 finishes, before full v2 retrain)
 
@@ -245,7 +245,7 @@ v2 full done      Full benchmark: OOD + bench_small/medium/large val data
 | `src/policy/encoder.py:197` | adj multiply → additive negative bias |
 | `src/policy/decoder.py:18,25` | Linear(embed+1) → Linear(embed+7); state_embedding returns 7 scalars |
 | `src/env/env.py:60,115` | step: update clss_served; reset: add clss_total, clss_served |
-| `scripts/train.py` | expose new hyperparams if needed |
+| `src/train.py` | expose new hyperparams if needed |
 | `scripts/train_curriculum.sh` | no change needed |
 
 ---

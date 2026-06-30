@@ -1,7 +1,7 @@
 """Iterated Local Search (ILS) operators for HDCARP.
 
 Pure, self-contained utilities — they import only from ``numpy`` and
-``utils.nb_utils`` (no dependency on ``solvers/``). Three independent pieces:
+``utils.ops`` (no dependency on ``solvers/``). Three independent pieces:
 
   * :func:`perturbate` — a feasibility-preserving *random relocate* kick that
     moves ``strength`` arcs between routes (capacity- and, for variant ``'P'``,
@@ -19,7 +19,7 @@ by Q in the data).
 
 import numpy as np
 
-from utils.nb_utils import deserialize_tours
+from utils.ops import deserialize_tours
 
 EPS = 1e-9
 
@@ -150,7 +150,7 @@ def accept(current_obj, candidate_obj, iteration, max_iter,
 def routes_to_action(routes, nseq):
     """Flatten a route-list into a 0-separated action array of length ``nseq``.
 
-    Thin, explicit re-export of ``utils.nb_utils.deserialize_tours`` for use from
+    Thin, explicit re-export of ``utils.ops.deserialize_tours`` for use from
     the ILS solver.
     """
     return deserialize_tours(routes, nseq)

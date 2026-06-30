@@ -74,9 +74,9 @@ ArcRoute/
 This installs uv (if missing), creates a `.venv`, and installs all dependencies from `pyproject.toml`. Then either activate the env or prefix commands with `uv run`:
 
 ```bash
-source .venv/bin/activate        # then: python scripts/train.py ...
+source .venv/bin/activate        # then: python src/train.py ...
 # or
-uv run python scripts/train.py --help
+uv run python src/train.py --help
 ```
 
 `uv sync` builds the project as an editable package, so the `src/` modules import directly
@@ -152,7 +152,7 @@ Use the launcher (`scripts/train.sh`, runs in the background via `nohup`):
 Or call the entry point directly. `--algo {ppo,grpo}` selects the trainer (GRPO auto-uses the
 vector reward + the `val/lex_best` checkpoint monitor; `--group_size K` sets the group size):
 ```bash
-    uv run python scripts/train.py \
+    uv run python src/train.py \
     --algo grpo --group_size 8 \
     --seed 6868 \
     --max_epoch 1000 \

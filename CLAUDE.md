@@ -12,7 +12,7 @@ and classical heuristics. Paper: arXiv:2501.00852.
 `scripts/`, generated artifacts in `data/` (inputs) and `outputs/` (checkpoints, lightning_logs).
 Three solver families live here:
 - **RL** — attention encoder/decoder policy trained with PPO or GRPO (`src/policy/`,
-  `src/trainers/` = `base.py`+`ppo.py`+`grpo.py`, `scripts/train.py`).
+  `src/trainers/` = `base.py`+`ppo.py`+`grpo.py`, `src/train.py`).
 - **Metaheuristics** — EA, ACO, ILS (`src/solvers/`, `src/utils/`).
 - **Exact** — LP/MIP via gurobi (`src/solvers/lp.py`).
 - **Hybrid (HRDA)** — RL policy + local search at inference (`src/solvers/rl_hyb.py`).
@@ -27,7 +27,7 @@ routes + (T₁,T₂,T₃). The Scheduler/policy/env machinery is adapted from rl
 **Imports** resolve via the installed package (`uv sync` builds it editable), e.g.
 `from trainers.grpo import GRPO`, `from solvers.scheduler import Scheduler`, `from utils.ops import ...`.
 
-**Training runs go through `scripts/train.sh`** — it launches `scripts/train.py` via `nohup`
+**Training runs go through `scripts/train.sh`** — it launches `src/train.py` via `nohup`
 (in the background) and writes the log to `logs/train_<timestamp>.out`. To check on a run, read that file
 (e.g. `tail -f logs/...`); do **not** redirect to ad-hoc paths like `/tmp/train_test.log`.
 
