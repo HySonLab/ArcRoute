@@ -120,7 +120,7 @@ class RLSolver:
         t0 = time.time()
         with torch.inference_mode():
             out = self.policy(td, env=self.env, decode_type="sampling")
-            obj = np.asarray(self.env.get_objective(td, out["actions"]))
+            obj = self.env.get_reward(td, out["actions"]).cpu().numpy()
         # lexicographic best over (T_1,T_2,T_3): T_1 primary, then T_2, then T_3
         # (np.lexsort uses the LAST key as primary). Ties on T_1 -> break by T_2/T_3.
         best = obj[np.lexsort((obj[:, 2], obj[:, 1], obj[:, 0]))[0]]

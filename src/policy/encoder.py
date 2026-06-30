@@ -139,9 +139,6 @@ class MLP(nn.Module):
             )
         return in_norm
 
-    def _get_act(self, is_last):
-        return self.out_act if is_last else self.hidden_act
-
 
 class MultiHeadAttention(nn.Module):
     def __init__(
@@ -224,7 +221,6 @@ class MultiHeadAttentionLayer(nn.Sequential):
         normalization: Optional[str] = "batch",
         bias: bool = True,
         sdpa_fn: Optional[Callable] = None,
-        moe_kwargs: Optional[dict] = None,
     ):
 
         super(MultiHeadAttentionLayer, self).__init__()
@@ -280,7 +276,6 @@ class GraphAttentionNetwork(nn.Module):
         normalization: str = "instance",
         feedforward_hidden: int = 512,
         sdpa_fn: Optional[Callable] = None,
-        moe_kwargs: Optional[dict] = None,
     ):
         super(GraphAttentionNetwork, self).__init__()
 
@@ -292,7 +287,6 @@ class GraphAttentionNetwork(nn.Module):
                     feedforward_hidden=feedforward_hidden,
                     normalization=normalization,
                     sdpa_fn=sdpa_fn,
-                    moe_kwargs=moe_kwargs,
                 )
                 for _ in range(num_layers)
             ]
@@ -316,7 +310,6 @@ class Encoder(nn.Module):
         feedforward_hidden: int = 512,
         net: nn.Module = None,
         sdpa_fn=None,
-        moe_kwargs: dict = None,
     ):
         super(Encoder, self).__init__()
 
@@ -332,7 +325,6 @@ class Encoder(nn.Module):
                 normalization,
                 feedforward_hidden,
                 sdpa_fn=sdpa_fn,
-                moe_kwargs=moe_kwargs,
             )
             if net is None
             else net

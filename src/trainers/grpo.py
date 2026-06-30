@@ -127,7 +127,6 @@ class GRPO(BaseRL):
         metrics: dict = None,
         log_on_step: bool = True,
         train_buckets: list = None,
-        **_ignored,   # absorb legacy params from old checkpoints/callers
     ):
         super().__init__(
             env, policy, path_train_data, path_val_data, path_test_data,

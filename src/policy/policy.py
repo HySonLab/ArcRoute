@@ -17,7 +17,6 @@ class AttentionModelPolicy(nn.Module):
         train_decode_type: str = "sampling",
         val_decode_type: str = "greedy",
         test_decode_type: str = "greedy",
-        **unused_kw,
     ):
         super(AttentionModelPolicy, self).__init__()
 

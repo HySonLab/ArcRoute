@@ -9,56 +9,6 @@ from tensordict import TensorDict
 from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention
 
-from utils.ops import gather_by_index
-
-
-class ARPContext(nn.Module):
-    # Context dim breakdown (7 scalars appended to current-node embedding):
-    #   remaining_cap       (1) — vehicle_capacity - used_capacity
-    #   frac_served_cls1/2/3(3) — clss_served / clss_total per class
-    #   dist_to_depot       (1) — adj[current_node, depot=0]
-    #   M_norm              (1) — num_vehicle / 10.0
-    #   frac_cap_used       (1) — used_capacity / vehicle_capacity
-    _STATE_DIM = 7
-
-    def __init__(self, embed_dim, linear_bias=False):
-        super(ARPContext, self).__init__()
-        self.project_context = nn.Linear(
-            embed_dim + self._STATE_DIM, embed_dim, bias=linear_bias
-        )
-
-    def _cur_node_embedding(self, embeddings, td):
-        return gather_by_index(embeddings, td["current_node"])
-
-    def _state_embedding(self, embeddings, td):
-        B = td["used_capacity"].shape[0]
-        dev = td["used_capacity"].device
-
-        remaining_cap = td["vehicle_capacity"] - td["used_capacity"]       # (B,1)
-
-        total = td["clss_total"].clamp(min=1.0)                            # (B,3)
-        frac_served = td["clss_served"] / total                            # (B,3)
-
-        adj = td["adj"]                                                    # (B,N+1,N+1)
-        cn  = td["current_node"].view(B)                                   # (B,)
-        dist_to_depot = adj[torch.arange(B, device=dev), cn, 0].unsqueeze(-1)  # (B,1)
-
-        M_norm = td["num_vehicle"].float().view(B, 1) / 10.0              # (B,1)
-
-        frac_cap_used = td["used_capacity"] / td["vehicle_capacity"].clamp(min=1e-6)  # (B,1)
-
-        return torch.cat(
-            [remaining_cap, frac_served, dist_to_depot, M_norm, frac_cap_used], dim=-1
-        )  # (B, 7)
-
-    def forward(self, embeddings, td):
-        cur_node_embedding = self._cur_node_embedding(embeddings, td)
-        state_embedding = self._state_embedding(embeddings, td)
-        if cur_node_embedding.ndim == 1:
-            cur_node_embedding = cur_node_embedding[None, :]
-        context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
-        return self.project_context(context_embedding)
-
 
 class JointMVContext(nn.Module):
     """Vehicle state embedding for the Joint M×N decode (GRPO v3).
@@ -200,23 +150,16 @@ class Decoder(nn.Module):
         check_nan: bool = True,
         sdpa_fn: callable = None,
         pointer: nn.Module = None,
-        moe_kwargs: dict = None,
     ):
         super().__init__()
 
-        self.env_name = "tsp"
         self.embed_dim = embed_dim
         self.num_heads = num_heads
 
         assert embed_dim % num_heads == 0
 
-        # ARPContext (single virtual vehicle, v2) is kept for backward compat but
-        # is NOT used by the Joint M×N decode path. The joint path uses
-        # JointMVContext to build one query per vehicle -> (B, M, D).
-        self.context_embedding = ARPContext(embed_dim)
         self.joint_mv_context = JointMVContext(embed_dim)
         self.dynamic_embedding = StaticEmbedding(embed_dim)
-        self.is_dynamic_embedding = False
 
         self.pointer = PointerAttention(
             embed_dim,
@@ -225,7 +168,6 @@ class Decoder(nn.Module):
             out_bias=out_bias_pointer_attn,
             check_nan=check_nan,
             sdpa_fn=sdpa_fn,
-            moe_kwargs=moe_kwargs,
         )
 
         # For each node we compute (glimpse key, glimpse value, logit key) so 3 * embed_dim
@@ -234,20 +176,6 @@ class Decoder(nn.Module):
         )
         self.project_fixed_context = nn.Linear(embed_dim, embed_dim, bias=linear_bias)
         self.use_graph_context = use_graph_context
-
-    def _compute_q(self, cached: PrecomputedCache, td: TensorDict):
-        node_embeds_cache = cached.node_embeddings
-        graph_context_cache = cached.graph_context
-
-        if td.dim() == 2 and isinstance(graph_context_cache, Tensor):
-            graph_context_cache = graph_context_cache.unsqueeze(1)
-
-        step_context = self.context_embedding(node_embeds_cache, td)
-        glimpse_q = step_context + graph_context_cache
-        # add seq_len dim if not present
-        glimpse_q = glimpse_q.unsqueeze(1) if glimpse_q.ndim == 2 else glimpse_q
-
-        return glimpse_q
 
     def _compute_kvl(self, cached: PrecomputedCache, td: TensorDict):
         glimpse_k_stat, glimpse_v_stat, logit_k_stat = (
@@ -294,11 +222,6 @@ class Decoder(nn.Module):
     def pre_decoder_hook(self, td, env, embeddings):
         """Precompute the embeddings cache before the decoder is called"""
         return td, env, self._precompute_cache(embeddings)
-
-    def post_decoder_hook(self, td, env):
-        logprobs = torch.stack(self.logprobs, 1)
-        actions = torch.stack(self.actions, 1)
-        return logprobs, actions, td, env
 
     def _precompute_cache(self, embeddings: torch.Tensor) -> PrecomputedCache:
         """Compute the cached embeddings for the pointer attention.

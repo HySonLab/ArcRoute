@@ -14,7 +14,6 @@ class CARPEnv:
         obj_weights=None,
         reward_mode='scalar',
         P=3,
-        **_ignored,   # absorb legacy num_loc/num_arc/sizes from old checkpoints/tests
     ):
         self.num_vehicle = num_vehicle
         self.variant = variant
@@ -74,14 +73,6 @@ class CARPEnv:
         all_served = (visited[..., 0, 1:] != 0).all(dim=-1)   # (B,)
         done = all_served.view(B, 1)
 
-        # Class-level served counters (kept for compatibility; unused by the joint
-        # decoder). Depot (j_star==0) contributes nothing.
-        cls_action = gather_by_index(td["clss"], j_star[:, None], squeeze=True)  # (B,)
-        cls_idx = (cls_action - 1).clamp(0, 2)
-        update = torch.zeros(B, 3, device=dev)
-        update.scatter_(1, cls_idx.unsqueeze(1), (~is_depot).float().unsqueeze(1))
-        clss_served = td["clss_served"] + update
-
         td.update(
             {
                 "current_node": new_cn,
@@ -90,7 +81,6 @@ class CARPEnv:
                 "completion_at_arc": new_comp_at_arc,
                 "visited": visited,
                 "done": done,
-                "clss_served": clss_served,
             }
         )
         td.set("action_mask", self.get_action_mask(td))
@@ -160,13 +150,6 @@ class CARPEnv:
         nv = torch.as_tensor(td["num_vehicle"], device=dev).reshape(batch_size).long()
         M_max = int(nv.max().item())
 
-        # Count arcs per priority class (clss[:,1:] — exclude depot at index 0)
-        clss_arc = td["clss"][:, 1:]                                   # (B, N_arc)
-        clss_total = torch.stack(
-            [(clss_arc == c).sum(dim=-1).float() for c in range(1, 4)],
-            dim=-1,
-        ).to(dev)                                                       # (B, 3)
-
         N1 = td["service_times"].shape[1]  # N+1 (depot + N arcs)
         td_reset = TensorDict(
             {
@@ -191,9 +174,6 @@ class CARPEnv:
                 'adj': td["adj"],
                 "num_vehicle": nv.reshape(batch_size, 1),
                 "done": torch.zeros(batch_size, 1, dtype=torch.bool, device=dev),
-                # Class-level arc counters (kept for compatibility; updated in step).
-                "clss_total":  clss_total,
-                "clss_served": torch.zeros(batch_size, 3, device=dev),
             },
             batch_size=batch_size,
         ).to(dev)

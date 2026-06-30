@@ -29,14 +29,14 @@ def _rollout(env, B=12, n=15, M=3, seed=0):
 
 class TestVectorReward(unittest.TestCase):
     def test_shape_scalar(self):
-        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P",
+        env = CARPEnv(num_vehicle=3, variant="P",
                       reward_mode="scalar")
         td, actions, _ = _rollout(env)
         r = env.get_reward(td, actions)
         self.assertEqual(tuple(r.shape), (12, 1))
 
     def test_shape_vector(self):
-        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P",
+        env = CARPEnv(num_vehicle=3, variant="P",
                       reward_mode="vector")
         td, actions, _ = _rollout(env)
         r = env.get_reward(td, actions)
@@ -47,10 +47,10 @@ class TestVectorReward(unittest.TestCase):
         exposes more. Same actions/td feed both modes."""
         w = [1.0, 1e-2, 1e-4]
         td, actions, _ = _rollout(
-            CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P"))
-        env_s = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P",
+            CARPEnv(num_vehicle=3, variant="P"))
+        env_s = CARPEnv(num_vehicle=3, variant="P",
                         obj_weights=w, reward_mode="scalar")
-        env_v = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P",
+        env_v = CARPEnv(num_vehicle=3, variant="P",
                         obj_weights=w, reward_mode="vector")
         scalar = env_s.get_reward(td, actions).detach().cpu().numpy().reshape(-1)
         vector = env_v.get_reward(td, actions).detach().cpu().numpy()
@@ -59,7 +59,7 @@ class TestVectorReward(unittest.TestCase):
 
     def test_vector_finite_and_nonneg(self):
         """⭐ every (B,3) entry finite and >= 0 (completion times)."""
-        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P",
+        env = CARPEnv(num_vehicle=3, variant="P",
                       reward_mode="vector")
         td, actions, _ = _rollout(env)
         r = env.get_reward(td, actions)
@@ -68,7 +68,7 @@ class TestVectorReward(unittest.TestCase):
 
     def test_default_is_scalar(self):
         """No reward_mode kwarg -> scalar (B,1): safe rollback."""
-        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant="P")
+        env = CARPEnv(num_vehicle=3, variant="P")
         self.assertEqual(env.reward_mode, "scalar")
         td, actions, _ = _rollout(env)
         self.assertEqual(tuple(env.get_reward(td, actions).shape), (12, 1))
@@ -80,7 +80,7 @@ class TestRolloutSmokeScalar(unittest.TestCase):
 
     def _run(self, variant):
         torch.manual_seed(0)
-        env = CARPEnv(num_loc=15, num_arc=15, num_vehicle=3, variant=variant)
+        env = CARPEnv(num_vehicle=3, variant=variant)
         batch = generate_dataset(12, 15, 15, 3, num_workers=0)
         td = env.reset(batch)
         policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
