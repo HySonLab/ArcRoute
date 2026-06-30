@@ -1,7 +1,7 @@
 import torch
 import abc
 import torch.nn.functional as F
-from utils.ops import batchify, gather_by_index, unbatchify_and_gather, unbatchify
+from utils.ops import gather_by_index
 
 def modify_logits_for_top_k_filtering(logits, top_k):
     """Set the logits for none top-k values to -inf. Done out-of-place.
@@ -94,20 +94,7 @@ def calculate_entropy(logprobs):
     return entropy
 
 class DecodingStrategy(metaclass=abc.ABCMeta):
-    """Base class for decoding strategies. Subclasses should implement the :meth:`_step` method.
-    Includes hooks for pre and post main decoding operations.
-
-    Args:
-        temperature: Temperature scaling. Higher values make the distribution more uniform (exploration),
-            lower values make it more peaky (exploitation). Defaults to 1.0.
-        top_p: Top-p sampling, a.k.a. Nucleus Sampling (https://arxiv.org/abs/1904.09751). Defaults to 0.0.
-        top_k: Top-k sampling, i.e. restrict sampling to the top k logits. If 0, do not perform. Defaults to 0.
-        mask_logits: Whether to mask logits of infeasible actions. Defaults to True.
-        tanh_clipping: Tanh clipping (https://arxiv.org/abs/1611.09940). Defaults to 0.
-        multistart: Whether to use multistart decoding. Defaults to False.
-        multisample: Whether to use sampling decoding. Defaults to False.
-        num_starts: Number of starts for multistart decoding. Defaults to None.
-    """
+    """Base class for decoding strategies."""
 
     name = "base"
 
@@ -118,12 +105,6 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         top_k: int = 0,
         mask_logits: bool = True,
         tanh_clipping: float = 0,
-        multistart: bool = False,
-        multisample: bool = False,
-        num_starts = None,
-        select_start_nodes_fn = None,
-        improvement_method_mode: bool = False,
-        select_best: bool = False,
         store_all_logp: bool = True,
         **kwargs,
     ) -> None:
@@ -132,14 +113,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         self.top_k = top_k
         self.mask_logits = mask_logits
         self.tanh_clipping = tanh_clipping
-        self.multistart = multistart
-        self.multisample = multisample
-        self.num_starts = num_starts
-        self.select_start_nodes_fn = select_start_nodes_fn
-        self.improvement_method_mode = improvement_method_mode
-        self.select_best = select_best
         self.store_all_logp = store_all_logp
-        # initialize buffers
         self.actions = []
         self.logprobs = []
 
@@ -187,10 +161,6 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
             logprobs, mask, td, action=action, **kwargs
         )
 
-        # directly return for improvement methods, since the action for improvement methods is finalized in its own policy
-        if self.improvement_method_mode:
-            return logprobs, selected_action
-        # for others
         if not self.store_all_logp:
             logprobs = gather_by_index(logprobs, selected_action, dim=1)
         td.set("action", selected_action)
@@ -218,16 +188,6 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         probs = logprobs.exp()
         return torch.multinomial(probs, 1).squeeze(1)
 
-    def _select_best(self, logprobs, actions, td, env):
-        rewards = env.get_reward(td, actions)
-        _, max_idxs = unbatchify(rewards, self.num_starts).max(dim=-1)
-
-        actions = unbatchify_and_gather(actions, max_idxs, self.num_starts)
-        logprobs = unbatchify_and_gather(logprobs, max_idxs, self.num_starts)
-        td = unbatchify_and_gather(td, max_idxs, self.num_starts)
-
-        return logprobs, actions, td, env
-    
 class Greedy(DecodingStrategy):
     name = "greedy"
 

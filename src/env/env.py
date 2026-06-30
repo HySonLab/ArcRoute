@@ -189,7 +189,6 @@ class CARPEnv:
                 'service_times': td["service_times"],
                 'traversal_times': td["traversal_times"],
                 'adj': td["adj"],
-                # Per-instance M as (B,1) so run_parallel (reward) slices it right.
                 "num_vehicle": nv.reshape(batch_size, 1),
                 "done": torch.zeros(batch_size, 1, dtype=torch.bool, device=dev),
                 # Class-level arc counters (kept for compatibility; updated in step).
