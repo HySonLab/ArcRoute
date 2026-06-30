@@ -60,6 +60,48 @@ class ARPContext(nn.Module):
         return self.project_context(context_embedding)
 
 
+class JointMVContext(nn.Module):
+    """Vehicle state embedding for the Joint M×N decode (GRPO v3).
+
+    For each of the M vehicles, build a query from
+        [H[current_node_m], remaining_cap_m, completion_m_norm, dist_to_depot_m]
+    and project it to the embedding dim. Produces (B, M, D) vehicle queries that
+    the PointerAttention scores against the N+1 arc keys to give (B, M, N+1)
+    logits — so the policy chooses (vehicle, arc) jointly at each step.
+    """
+
+    _VEH_STATE_DIM = 3  # remaining_cap, completion_norm, dist_to_depot
+
+    def __init__(self, embed_dim, linear_bias=False):
+        super().__init__()
+        self.project_vehicle = nn.Linear(
+            embed_dim + self._VEH_STATE_DIM, embed_dim, bias=linear_bias
+        )
+
+    def forward(self, node_embeddings, td):
+        """node_embeddings: (B, N+1, D); td has per-vehicle current_node (B,M),
+        used_capacity (B,M), completion (B,M) and adj (B,N+1,N+1).
+        Returns (B, M, D) vehicle queries."""
+        B, M = td["current_node"].shape
+        dev = node_embeddings.device
+        ar = torch.arange(B, device=dev)
+
+        # Relative completion across this instance's vehicles (scale-invariant).
+        comp_norm = td["completion"].amax(dim=-1, keepdim=True).clamp(min=1e-6)  # (B,1)
+
+        veh_embeds = []
+        for m in range(M):
+            cn_m = td["current_node"][:, m]                  # (B,)
+            h_m = node_embeddings[ar, cn_m]                  # (B, D)
+            rem_m = (1.0 - td["used_capacity"][:, m]).unsqueeze(-1)            # (B,1)
+            comp_m = (td["completion"][:, m:m + 1] / comp_norm)               # (B,1)
+            dist_m = td["adj"][ar, cn_m, 0].unsqueeze(-1)                      # (B,1)
+            veh_embeds.append(torch.cat([h_m, rem_m, comp_m, dist_m], dim=-1))  # (B,D+3)
+
+        veh_stack = torch.stack(veh_embeds, dim=1)           # (B, M, D+3)
+        return self.project_vehicle(veh_stack)               # (B, M, D)
+
+
 class StaticEmbedding(nn.Module):
     """Static embedding for general problems.
     This is used for problems that do not have any dynamic information, except for the
@@ -95,13 +137,14 @@ class PointerAttention(nn.Module):
 
     def forward(self, query, key, value, logit_key, attn_mask=None):
         # Compute inner multi-head attention with no projections.
-        heads = self._inner_mha(query, key, value, attn_mask)
-        glimpse = self._project_out(heads, attn_mask)
+        heads = self._inner_mha(query, key, value, attn_mask)   # (B, M, D)
+        glimpse = self._project_out(heads, attn_mask)           # (B, M, D)
 
-        # Batch matrix multiplication to compute logits (batch_size, num_steps, graph_size)
-        # bmm is slightly faster than einsum and matmul
-        logits = (torch.bmm(glimpse, logit_key.squeeze(-2).transpose(-2, -1))).squeeze(
-            -2
+        # Logits per (query m, arc j): (B, M, D) x (B, D, N+1) -> (B, M, N+1).
+        # The M (query) dimension is preserved so the Joint M×N decoder gets one
+        # row of arc-logits per vehicle. With M==1 this is (B, 1, N+1).
+        logits = torch.bmm(
+            glimpse, logit_key.transpose(-2, -1)
         ) / math.sqrt(glimpse.size(-1))
 
         if self.check_nan:
@@ -165,7 +208,11 @@ class Decoder(nn.Module):
 
         assert embed_dim % num_heads == 0
 
+        # ARPContext (single virtual vehicle, v2) is kept for backward compat but
+        # is NOT used by the Joint M×N decode path. The joint path uses
+        # JointMVContext to build one query per vehicle -> (B, M, D).
         self.context_embedding = ARPContext(embed_dim)
+        self.joint_mv_context = JointMVContext(embed_dim)
         self.dynamic_embedding = StaticEmbedding(embed_dim)
         self.is_dynamic_embedding = False
 
@@ -219,14 +266,27 @@ class Decoder(nn.Module):
         td: TensorDict,
         cached: PrecomputedCache,
     ) -> Tuple[Tensor, Tensor]:
+        """Joint M×N decode step.
 
-        glimpse_q = self._compute_q(cached, td)
+        Returns:
+            logits: (B, M, N+1) — arc logits per vehicle.
+            mask:   (B, M, N+1) bool feasibility mask (True == feasible).
+        """
+        # Vehicle queries: (B, M, D).
+        veh_q = self.joint_mv_context(cached.node_embeddings, td)
+        graph_ctx = cached.graph_context                     # (B, D) or 0
+        if isinstance(graph_ctx, Tensor):
+            veh_q = veh_q + graph_ctx.unsqueeze(1)           # broadcast over M
+
         glimpse_k, glimpse_v, logit_k = self._compute_kvl(cached, td)
 
-        # Compute logits
-        mask = td["action_mask"]
-        logits = self.pointer(glimpse_q, glimpse_k, glimpse_v, logit_k, mask)
+        # Un-flatten the stored flat action_mask (B, M*(N+1)) -> (B, M, N+1).
+        B = veh_q.shape[0]
+        M = veh_q.shape[1]
+        N1 = cached.node_embeddings.shape[1]
+        mask = td["action_mask"].reshape(B, M, N1)           # True == feasible
 
+        logits = self.pointer(veh_q, glimpse_k, glimpse_v, logit_k, mask)
         return logits, mask
 
     def pre_decoder_hook(self, td, env, embeddings):

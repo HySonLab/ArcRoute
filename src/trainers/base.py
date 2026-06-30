@@ -1,14 +1,12 @@
 """Shared Lightning scaffolding for GRPO.
 
-`BaseRL` provides data config, dataloaders, metric logging, the train/val/test
-step dispatch, and the per-epoch data reload. Subclasses implement only the
-algorithm-specific parts:
+`BaseRL` provides data config, dataloaders, metric logging, and the
+train/val/test step dispatch. Subclasses implement only the algorithm-specific
+parts:
 
     * configure_optimizers   (which params to train)
     * shared_step            (the loss / update rule)
 """
-import os
-
 import torch
 from torch import nn
 from lightning import LightningModule
@@ -23,37 +21,22 @@ class BaseRL(LightningModule):
         path_val_data: str,
         path_test_data: str,
         batch_size: int = 1024,
-        train_data_size: int = 100000,
-        val_data_size: int = 10000,
-        test_data_size: int = 1000,
         metrics: dict = None,
         log_on_step: bool = True,
-        dataloader_num_workers: int = 24,
-        reload_train_dataloader: int = 4,
+        train_buckets: list = None,
     ):
         super().__init__()
         self.env = env
         self.policy = policy
-
-        if batch_size > train_data_size or batch_size > val_data_size:
-            print("batch_size should be less than or equal to train_data_size.")
-            batch_size = min(train_data_size, val_data_size)
-
         self.data_cfg = {
             "batch_size": batch_size,
-            "val_batch_size": batch_size,
-            "test_batch_size": batch_size,
-            "train_data_size": train_data_size,
-            "val_data_size": val_data_size,
-            "test_data_size": test_data_size,
             "path_train_data": path_train_data,
             "path_val_data": path_val_data,
             "path_test_data": path_test_data,
+            "train_buckets": train_buckets,   # None = all buckets
         }
         self.instantiate_metrics(metrics or {})
         self.log_on_step = log_on_step
-        self.dataloader_num_workers = dataloader_num_workers
-        self.reload_train_dataloader = reload_train_dataloader
 
     # ---- algorithm-specific (subclass must implement) ----------------------
     def shared_step(self, batch, batch_idx, phase, dataloader_idx=None):
@@ -69,7 +52,6 @@ class BaseRL(LightningModule):
         self.test_metrics = metrics.get("test", ["reward"])
 
     def log_metrics(self, metric_dict: dict, phase: str, dataloader_idx=None):
-        """Log metrics to logger and progress bar."""
         names = getattr(self, f"{phase}_metrics")
         dataloader_name = ""
         if dataloader_idx is not None and self.dataloader_names is not None:
@@ -80,38 +62,31 @@ class BaseRL(LightningModule):
         }
         log_on_step = self.log_on_step if phase == "train" else False
         on_epoch = False if phase == "train" else True
-        self.log_dict(metrics, on_step=log_on_step, on_epoch=on_epoch, prog_bar=True,
-                      sync_dist=True, add_dataloader_idx=False)
+        if self.trainer is not None:
+            self.log_dict(metrics, on_step=log_on_step, on_epoch=on_epoch, prog_bar=True,
+                          sync_dist=True, add_dataloader_idx=False)
         return metrics
 
     # ---- data ---------------------------------------------------------------
-    def _make_train_dataloader(self):
-        self.train_dataset = self.env.dataset(self.data_cfg["train_data_size"],
-                                              batch_size=self.data_cfg["batch_size"], shuffle=True,
-                                              data=self.data_cfg["path_train_data"],
-                                              num_workers=self.dataloader_num_workers)
-
     def load_dataloader(self):
-        self._make_train_dataloader()
-        self.val_dataset = self.env.dataset(self.data_cfg["val_data_size"],
-                                            batch_size=self.data_cfg["batch_size"], shuffle=False,
-                                            data=self.data_cfg["path_val_data"],
-                                            num_workers=self.dataloader_num_workers)
-        self.test_dataset = self.env.dataset(self.data_cfg["test_data_size"],
-                                             batch_size=self.data_cfg["batch_size"], shuffle=False,
-                                             data=self.data_cfg["path_test_data"],
-                                             num_workers=self.dataloader_num_workers)
+        bs = self.data_cfg["batch_size"]
+        buckets = self.data_cfg["train_buckets"]
+        self.train_dataset = self.env.dataset(self.data_cfg["path_train_data"],
+                                              batch_size=bs, shuffle=True,
+                                              buckets=buckets)
+        self.val_dataset   = self.env.dataset(self.data_cfg["path_val_data"],
+                                              batch_size=bs, shuffle=False,
+                                              buckets=buckets)
+        self.test_dataset  = self.env.dataset(self.data_cfg["path_test_data"],
+                                              batch_size=bs, shuffle=False,
+                                              buckets=buckets)
 
     def setup(self, stage="fit"):
-        print(f"train_data_size={self.data_cfg['train_data_size']}   bs={self.data_cfg['batch_size']}")
-        print(f"val_data_size={self.data_cfg['val_data_size']}   bs={self.data_cfg['batch_size']}")
-        print(f"test_data_size={self.data_cfg['test_data_size']}   bs={self.data_cfg['batch_size']}")
         self.load_dataloader()
         self.dataloader_names = None
         self.setup_loggers()
 
     def setup_loggers(self):
-        """Log all hyperparameters except those in `nn.Module`."""
         if self.loggers:
             hparams_save = {k: v for k, v in self.hparams.items()
                             if not isinstance(v, nn.Module)}
@@ -140,15 +115,6 @@ class BaseRL(LightningModule):
         return self.shared_step(batch, batch_idx, phase="test", dataloader_idx=dataloader_idx)
 
     def on_train_epoch_end(self):
-        # Step a MultiStepLR scheduler if one is configured.
         sch = self.lr_schedulers()
         if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
             sch.step()
-        if (self.current_epoch + 1) % self.reload_train_dataloader == 0:
-            path = self.data_cfg["path_train_data"]
-            if path.startswith("data/") and os.path.exists(path):
-                os.remove(path)
-            self._make_train_dataloader()
-            # Lightning 2.x removed Trainer.reset_train_dataloader; dropping the
-            # cached loader makes the next epoch's setup_data() re-call train_dataloader().
-            self.trainer.fit_loop._combined_loader = None

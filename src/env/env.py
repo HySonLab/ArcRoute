@@ -1,8 +1,7 @@
 from tensordict.tensordict import TensorDict
 import torch
 import numpy as np
-from env.generator import (CARPGenerator, MultiSizeCARPGenerator,
-                           SizeBucketBatchSampler)
+from env.generator import SizeBucketBatchSampler
 from solvers.cal_reward import calc_reward
 from utils.ops import gather_by_index, run_parallel
 from torch.utils.data import DataLoader
@@ -21,69 +20,73 @@ def reward_num_workers(n):
 class CARPEnv:
     def __init__(
         self,
-        num_loc=60,
-        num_arc=60,
         num_vehicle=3,
-        variant= 'P',
-        sizes=None,
+        variant='P',
         obj_weights=None,
         reward_mode='scalar',
         P=3,
-        **kwargs,
+        **_ignored,   # absorb legacy num_loc/num_arc/sizes from old checkpoints/tests
     ):
-        super().__init__(**kwargs)
-        self.generator = CARPGenerator
-        self.num_loc = num_loc
-        self.num_arc = num_arc
         self.num_vehicle = num_vehicle
         self.variant = variant
-        # Number of priority classes (objective is lexicographic T_1 <= ... <= T_P).
-        # Default 3 = the paper's setting. P flows to the generator (class sampling)
-        # and to the reward (Scheduler pos_val = 1..P -> a (B,P) T-vector).
         self.P = P
-        # D2 Phase 2: 'scalar' (default) keeps the old -(T . w) reward byte-identical;
-        # 'vector' returns the raw (B,3) T-vector so the GRPO path (Phase 3) can rank
-        # the K samples lexicographically instead of scalarizing.
         self.reward_mode = reward_mode
-        # Phase 6: if `sizes` (list of (num_loc, num_arc)) is given, train over a
-        # size LADDER (bucketed so each batch stays single-size). Else single-size.
-        self.sizes = sizes
-        # Weighted-sum weights (T_1, T_2, T_3) for scalar reward mode — geometrically
-        # separated (100x) so T_1 dominates. Default generalizes [1.0,1e-2,1e-4]
-        # to any P; P=3 reproduces the paper's values exactly.
         self.obj_weights = obj_weights if obj_weights is not None else [100.0 ** (-i) for i in range(self.P)]
 
     def step(self, td: TensorDict):
-        current_node = td["action"][:, None]  # Add dimension for step
+        """Joint M×N step. `td["action"]` is a flat joint index in [0, M_max*(N+1)):
+        action = m_star * (N+1) + j_star, splitting into the chosen vehicle m_star
+        and the chosen arc/node j_star."""
+        dev = td.device
+        B = td["used_capacity"].shape[0]
+        N1 = td["visited"].shape[-1]                          # N+1
+        ar = torch.arange(B, device=dev)
 
-        # Not selected_demand is demand of first node (by clamp) so incorrect for nodes that visit depot!
-        selected_demand = gather_by_index(
-            td["demand"], current_node, squeeze=False)
+        action_flat = td["action"].long()
+        m_star = action_flat // N1                            # (B,)
+        j_star = action_flat % N1                             # (B,)
+        is_depot = (j_star == 0)                              # (B,)
 
-        # Increase capacity if depot is not visited, otherwise set to 0
-        used_capacity = (td["used_capacity"] + selected_demand) * (
-            current_node != 0
-        ).float()
+        dem_j = gather_by_index(td["demand"], j_star[:, None], squeeze=True)  # (B,)
 
-        # Note: here we do not subtract one as we have to scatter so the first column allows scattering depot
-        visited = td["visited"].scatter(-1, current_node[..., None], 1)
-        # SECTION: get done
-        done = visited.sum(-1) == visited.size(-1)
+        # step cost of vehicle m_star MUST use its OLD current_node (before update).
+        old_cn_m = td["current_node"][ar, m_star]            # (B,)
+        svc_j = gather_by_index(td["service_times"], j_star[:, None], squeeze=True)  # (B,)
+        step_cost = td["adj"][ar, old_cn_m, j_star] + svc_j  # (B,)
 
-        # Track arcs served per priority class (depot=0 excluded)
-        not_depot = (current_node.squeeze(-1) != 0)                   # (B,)
-        cls_action = gather_by_index(td["clss"], current_node, squeeze=True)  # (B,)
-        cls_idx = (cls_action - 1).clamp(0, 2)                        # (B,) in [0,1,2]
-        update = torch.zeros(
-            current_node.shape[0], 3, device=current_node.device
-        )
-        update.scatter_(1, cls_idx.unsqueeze(1), not_depot.float().unsqueeze(1))
+        # Capacity of vehicle m_star: add demand, reset to 0 on depot return.
+        new_cap = td["used_capacity"].clone()
+        new_cap[ar, m_star] = (td["used_capacity"][ar, m_star] + dem_j) * (~is_depot).float()
+
+        # Completion time of vehicle m_star (travel + service of this leg).
+        new_comp = td["completion"].clone()
+        new_comp[ar, m_star] = td["completion"][ar, m_star] + step_cost
+
+        # Current node of vehicle m_star.
+        new_cn = td["current_node"].clone()
+        new_cn[ar, m_star] = j_star
+
+        # Global served mask (depot is never marked served).
+        visited = td["visited"].scatter(-1, j_star[:, None, None], 1)
+        visited = torch.where(is_depot.view(B, 1, 1), td["visited"], visited)
+
+        # done = all N non-depot arcs served.
+        all_served = (visited[..., 0, 1:] != 0).all(dim=-1)   # (B,)
+        done = all_served.view(B, 1)
+
+        # Class-level served counters (kept for compatibility; unused by the joint
+        # decoder). Depot (j_star==0) contributes nothing.
+        cls_action = gather_by_index(td["clss"], j_star[:, None], squeeze=True)  # (B,)
+        cls_idx = (cls_action - 1).clamp(0, 2)
+        update = torch.zeros(B, 3, device=dev)
+        update.scatter_(1, cls_idx.unsqueeze(1), (~is_depot).float().unsqueeze(1))
         clss_served = td["clss_served"] + update
 
         td.update(
             {
-                "current_node": current_node,
-                "used_capacity": used_capacity,
+                "current_node": new_cn,
+                "used_capacity": new_cap,
+                "completion": new_comp,
                 "visited": visited,
                 "done": done,
                 "clss_served": clss_served,
@@ -93,31 +96,68 @@ class CARPEnv:
         return td
 
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
-        # For demand steps_dim is inserted by indexing with id, for used_capacity insert node dim for broadcasting
-        exceeds_cap = (
-            td["demand"][..., 1:][:, None, :] + td["used_capacity"][..., None] > td["vehicle_capacity"][..., None]
-        )
-        # Nodes that cannot be visited are already visited or too much demand to be served now
-        mask_loc = td["visited"][..., 1:].to(exceeds_cap.dtype) | exceeds_cap
-        # Cannot visit the depot if just visited and still unserved nodes
-        mask_depot = (td["current_node"] == 0) & ((mask_loc == 0).int().sum(-1) > 0)
+        """Return a flat joint feasibility mask (B, M_max*(N+1)). True == FEASIBLE.
+        The 3-layer mask (served | capacity(m,j) | precedence) plus the depot
+        idle-guard and the nonexistent-vehicle guard are built on (B, M_max, N+1)
+        and flattened."""
+        dev = td.device
+        B, _, N1 = td["visited"].shape                       # N1 = N+1
+        M_max = td["used_capacity"].shape[-1]
+        cap = 1.0
+
+        served = td["visited"][..., 0, :]                    # (B, N+1) global served
+        served_arcs = served[:, 1:] != 0                     # (B, N) bool
+        all_served = served_arcs.all(dim=-1)                 # (B,) instance done
+
+        # Layer 1 — served arcs (broadcast over M); depot col never served.
+        served_col = (served != 0).clone()                   # (B, N+1) bool
+        served_col[:, 0] = False
+
+        # Layer 3 — precedence (variant P): block arcs of class > current min class.
+        wrong_class = torch.zeros(B, N1, dtype=torch.bool, device=dev)
         if self.variant == 'P':
-            # GLOBAL precedence (B+): serve ALL of the lowest unserved class before
-            # any higher class -> the policy emits one coherent tour per class, and
-            # the Scheduler spreads each class across the M vehicles. (The previous
-            # floor was the CURRENT node's class, which reset to 0 at every depot
-            # return -> only per-route ordering, which the capacity re-split then
-            # broke; see common/scheduler.py.)
-            clss_cust = td['clss'][..., 1:]                              # (B, n)
-            unserved = td['visited'][..., 1:].squeeze(1) == 0           # (B, n) bool
-            masked = clss_cust.masked_fill(~unserved, 1 << 30)
-            c_min = masked.min(dim=-1, keepdim=True).values            # (B,1) lowest unserved class
-            mask_loc = mask_loc | ((clss_cust > c_min).unsqueeze(1))
-        return ~torch.cat((mask_depot[..., None], mask_loc), -1).squeeze(-2)
+            clss_cust = td['clss'][..., 1:]                   # (B, N)
+            unserved = ~served_arcs                           # (B, N) bool
+            masked_cls = clss_cust.masked_fill(~unserved, 1 << 30)
+            c_min = masked_cls.min(dim=-1, keepdim=True).values   # (B,1)
+            wrong_class[:, 1:] = (clss_cust > c_min)
+
+        # arc-level mask broadcast over vehicles: (B, 1, N+1)
+        arc_mask = (served_col | wrong_class)[:, None, :]
+
+        # Layer 2 — capacity per (m, j): demand[j] + used_cap[m] > cap.
+        dem = td["demand"]                                   # (B, N+1)
+        used = td["used_capacity"]                           # (B, M_max)
+        exceeds_cap = (dem[:, None, :] + used[:, :, None]) > (cap + 1e-9)  # (B,M,N+1)
+        exceeds_cap = exceeds_cap.clone()
+        exceeds_cap[:, :, 0] = False                          # depot demand 0
+
+        # Depot idle-guard: a vehicle AT the depot with EMPTY load cannot pick depot
+        # again (prevents standing still). When the instance is done, never block
+        # depot so done rows always keep ≥1 feasible cell (a vehicle can park).
+        at_depot = (td["current_node"] == 0)                 # (B, M_max)
+        is_empty = (td["used_capacity"] == 0)                # (B, M_max)
+        block_depot = at_depot & is_empty & (~all_served[:, None])  # (B, M_max)
+        depot_mask = torch.zeros(B, M_max, N1, dtype=torch.bool, device=dev)
+        depot_mask[:, :, 0] = block_depot
+
+        # Nonexistent-vehicle guard: vehicle m >= M_i does not exist -> fully masked.
+        M_per_inst = td["num_vehicle"].reshape(B).to(dev)
+        veh_range = torch.arange(M_max, device=dev).view(1, M_max)
+        nonexistent = (veh_range >= M_per_inst.view(B, 1))    # (B, M_max)
+        nonexistent_mask = nonexistent[:, :, None].expand(B, M_max, N1)
+
+        full_mask = arc_mask | exceeds_cap | depot_mask | nonexistent_mask  # (B,M,N+1)
+        flat_mask = full_mask.reshape(B, M_max * N1)
+        return ~flat_mask                                    # True == feasible
 
     def reset(self, td):
         batch_size = td.batch_size[0]
         dev = td.device
+
+        # Per-instance fleet size M_i and the padded fleet dim M_max.
+        nv = torch.as_tensor(td["num_vehicle"], device=dev).reshape(batch_size).long()
+        M_max = int(nv.max().item())
 
         # Count arcs per priority class (clss[:,1:] — exclude depot at index 0)
         clss_arc = td["clss"][:, 1:]                                   # (B, N_arc)
@@ -129,9 +169,11 @@ class CARPEnv:
         td_reset = TensorDict(
             {
                 "demand": td["demands"],
+                # Per-vehicle state: (B, M_max).
                 "current_node": torch.zeros(
-                    batch_size, 1, dtype=torch.long, device=dev),
-                "used_capacity": torch.zeros(batch_size, 1, device=dev),
+                    batch_size, M_max, dtype=torch.long, device=dev),
+                "used_capacity": torch.zeros(batch_size, M_max, device=dev),
+                "completion": torch.zeros(batch_size, M_max, device=dev),
                 "vehicle_capacity": torch.ones(batch_size, 1, device=dev),
                 "visited": torch.zeros(
                     batch_size, 1, td["service_times"].shape[1],
@@ -141,16 +183,10 @@ class CARPEnv:
                 'service_times': td["service_times"],
                 'traversal_times': td["traversal_times"],
                 'adj': td["adj"],
-                # M-agnostic policy doesn't read this; the Scheduler (calc_reward)
-                # does. Carry per-instance M as (B,1) so run_parallel slices it right.
-                "num_vehicle": torch.as_tensor(
-                    td["num_vehicle"], device=dev
-                ).reshape(batch_size, 1),
-                "done": torch.zeros(
-                    batch_size, td["service_times"].shape[1],
-                    dtype=torch.bool, device=dev,
-                ),
-                # Class-level arc counters for policy context (updated in step).
+                # Per-instance M as (B,1) so run_parallel (reward) slices it right.
+                "num_vehicle": nv.reshape(batch_size, 1),
+                "done": torch.zeros(batch_size, 1, dtype=torch.bool, device=dev),
+                # Class-level arc counters (kept for compatibility; updated in step).
                 "clss_total":  clss_total,
                 "clss_served": torch.zeros(batch_size, 3, device=dev),
             },
@@ -160,33 +196,23 @@ class CARPEnv:
         return td_reset
     
     
-    def dataset(self, data_size,
-                batch_size=128,
-                shuffle=False,
-                num_workers=24,
-                data='carp_data.pt'):
-        # Scale workers to data size: few workers for small datasets (fork overhead
-        # dominates), more for large ones. Cap at the requested num_workers.
-        effective_workers = min(num_workers, max(0, data_size // 2000))
-        pin = effective_workers > 0
-        if self.sizes is not None:
-            # Multi-size: bucket by size, each batch single-size (Phase 6).
-            ds = MultiSizeCARPGenerator(data_size, self.sizes, self.num_vehicle,
-                                        data=data, P=self.P)
-            sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
-            return DataLoader(ds, batch_sampler=sampler, num_workers=effective_workers,
-                              collate_fn=ds.collate_fn, pin_memory=pin,
-                              persistent_workers=effective_workers > 0)
-        return DataLoader(
-            self.generator(data_size, self.num_loc, self.num_arc, self.num_vehicle,
-                           data=data, P=self.P),
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=effective_workers,
-            collate_fn=self.generator.collate_fn,
-            pin_memory=pin,
-            persistent_workers=effective_workers > 0,
-        )
+    def dataset(self, data_dir, batch_size=128, shuffle=False, buckets=None):
+        """Build a DataLoader from an OSM data directory.
+
+        data_dir: directory produced by scripts/gen_data.sh.
+        buckets:  list of bucket keys to load, e.g. ["20_30", "20_40"]
+                  (from utils.data_utils.CURRICULUM). None = all buckets.
+        Cache key includes bucket names so different phases don't share a cache.
+        """
+        from env.osm_dataset import OSMMultiSizeDataset
+        choices = self.num_vehicle if isinstance(self.num_vehicle, list) else [self.num_vehicle]
+        suffix = ("_" + "_".join(sorted(buckets))) if buckets else ""
+        cache = data_dir.rstrip("/") + suffix + ".cache.pt"
+        ds = OSMMultiSizeDataset(data_dir, vehicle_choices=choices,
+                                 cache_path=cache, buckets=buckets)
+        sampler = SizeBucketBatchSampler(ds.bucket_ranges, batch_size, shuffle=shuffle)
+        return DataLoader(ds, batch_sampler=sampler, num_workers=0,
+                          collate_fn=ds.collate_fn, pin_memory=False)
 
     def _pos_val(self):
         """Priority class labels 1..P for the Scheduler/reward (-> a (B,P) T-vector)."""
@@ -198,7 +224,7 @@ class CARPEnv:
         return run_parallel(calc_reward, actions, td,
                             num_workers=reward_num_workers(len(actions)), num_epochs=10,
                             local_search=local_search, variant=self.variant,
-                            pos_val=self._pos_val())
+                            joint=True, pos_val=self._pos_val())
 
     def get_reward(self, td, actions):
         actions = actions.clone().detach().cpu().numpy()
@@ -206,7 +232,7 @@ class CARPEnv:
         rs = run_parallel(calc_reward, actions, td,
                           num_workers=reward_num_workers(len(actions)), num_epochs=10,
                           local_search=False, return_torch=True, variant=self.variant,
-                          pos_val=self._pos_val())  # (B,P) T-vector
+                          joint=True, pos_val=self._pos_val())  # (B,P) T-vector
         if self.reward_mode == 'vector':
             # GRPO path: hand the raw (B,3) T-vector (T positive, lower=better) to
             # the caller, which ranks the K samples lexicographically (Phase 3).

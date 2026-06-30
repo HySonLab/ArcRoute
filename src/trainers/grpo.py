@@ -124,28 +124,21 @@ class GRPO(BaseRL):
         path_val_data: str,
         path_test_data: str,
         group_size: int = 8,
-        lr: float = 1e-4,
-        entropy_lambda: float = 0.0,
-        max_grad_norm: float = 1.0,
+        lr: float = 3e-4,
+        max_grad_norm: float = 2.0,
         clip_range: float = 0.2,
+        entropy_lambda: float = 0.01,
         mini_batch_size: int = 256,
         batch_size: int = 1024,
-        train_data_size: int = 100000,
-        val_data_size: int = 10000,
-        test_data_size: int = 1000,
         metrics: dict = None,
         log_on_step: bool = True,
-        dataloader_num_workers: int = 24,
-        reload_train_dataloader: int = 4,
-        **kwargs,   # swallow any remaining caller-compat args
+        train_buckets: list = None,
+        **_ignored,   # absorb legacy params from old checkpoints/callers
     ):
         super().__init__(
             env, policy, path_train_data, path_val_data, path_test_data,
-            batch_size=batch_size, train_data_size=train_data_size,
-            val_data_size=val_data_size, test_data_size=test_data_size,
-            metrics=metrics, log_on_step=log_on_step,
-            dataloader_num_workers=dataloader_num_workers,
-            reload_train_dataloader=reload_train_dataloader,
+            batch_size=batch_size, metrics=metrics, log_on_step=log_on_step,
+            train_buckets=train_buckets,
         )
         self.save_hyperparameters(ignore=["env", "policy"])
         self.automatic_optimization = False  # one explicit backward + step
@@ -153,9 +146,9 @@ class GRPO(BaseRL):
         assert group_size >= 2, "GRPO needs group_size K >= 2 to form a ranking baseline"
         self.group_size = group_size
         self.lr = lr
-        self.entropy_lambda = entropy_lambda
         self.max_grad_norm = max_grad_norm
         self.clip_range = clip_range
+        self.entropy_lambda = entropy_lambda
         self.mini_batch_size = mini_batch_size
 
     def configure_optimizers(self):
@@ -219,12 +212,15 @@ class GRPO(BaseRL):
 
         # Whole batch inactive (every group tied): nothing to backward. Still log.
         if not bool(active_mask.any()):
-            out_log = {"loss": torch.tensor(0.0), "reward": -Tk[0].reshape(1),
-                       "skipped_frac": skipped_frac}
+            try:
+                self.log("train/skipped_frac", skipped_frac, on_step=True, prog_bar=False,
+                         batch_size=B, sync_dist=True)
+            except Exception:
+                pass
+            out_log = {"loss": torch.tensor(0.0), "reward": -Tk[0].reshape(1)}
             out_log.update({f"T{k+1}_mean": Tk[k] for k in range(P)})
             metrics = self.log_metrics(out_log, "train")
-            metrics["train/skipped_frac"] = skipped_frac
-            return {"loss": 0.0, **metrics}
+            return {"loss": 0.0, "train/skipped_frac": skipped_frac, **metrics}
 
         # Keep only active groups: build (B_a*K,) active row indices in k*B_a+b' order.
         active_idx = torch.nonzero(active_mask, as_tuple=False).flatten()   # (B_a,) CPU
@@ -240,7 +236,8 @@ class GRPO(BaseRL):
         inst_perm = torch.randperm(B_a)   # shuffle instance dimension (CPU)
 
         opt = self.optimizers()
-        loss = entropy = None
+        loss_acc = None
+        n_iters = 0
         for j in range(0, B_a, mb_inst):
             inst_idx = inst_perm[j : j + mb_inst]            # (actual_mb,) CPU
             orig_inst_idx = active_idx[inst_idx]             # (actual_mb,) CPU; B-indices
@@ -265,32 +262,40 @@ class GRPO(BaseRL):
                 actions=sub_td["action"],
                 env=self.env,
                 hidden=sub_hidden_bk,
-                return_entropy=(self.entropy_lambda > 0),
                 calc_reward=False,
                 return_sum_log_likelihood=False,
+                return_entropy=True,
             )
             ll = out_i["log_likelihood"]
-            entropy = out_i.get("entropy", None)
+            entropy = out_i["entropy"]
             ratio = torch.exp(ll.sum(dim=-1) - sub_td["logprobs"]).view(-1, 1)
 
             clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
             surr = -torch.min(ratio * adv, clipped_ratio * adv).mean()
-            loss = surr - self.entropy_lambda * entropy.mean() if entropy is not None else surr
+            loss_i = surr - self.entropy_lambda * entropy.mean()
 
             opt.zero_grad()
-            self.manual_backward(loss)
+            self.manual_backward(loss_i)
             if self.max_grad_norm is not None:
                 self.clip_gradients(opt, gradient_clip_val=self.max_grad_norm,
                                     gradient_clip_algorithm="norm")
             opt.step()
 
-        out_log = {"loss": loss, "reward": -Tk[0].reshape(1),
-                   "entropy": entropy.mean() if entropy is not None else torch.tensor(0.0),
-                   "skipped_frac": skipped_frac}
+            loss_acc = loss_i.detach() if loss_acc is None else loss_acc + loss_i.detach()
+            n_iters += 1
+
+        loss_log = loss_acc / n_iters
+        try:
+            self.log("train/skipped_frac", skipped_frac, on_step=True, prog_bar=False,
+                     batch_size=B, sync_dist=True)
+            self.log("train/entropy", float(entropy.mean()), on_step=True, prog_bar=True,
+                     batch_size=B, sync_dist=True)
+        except Exception:
+            pass
+        out_log = {"loss": loss_log, "reward": -Tk[0].reshape(1)}
         out_log.update({f"T{k+1}_mean": Tk[k] for k in range(P)})
         metrics = self.log_metrics(out_log, "train")
-        metrics["train/skipped_frac"] = skipped_frac
-        return {"loss": loss, **metrics}
+        return {"loss": loss_log, "train/skipped_frac": skipped_frac, **metrics}
 
     def _eval_step(self, batch, phase, dataloader_idx):
         # Deterministic greedy rollout (val/test decode type) on the B instances.

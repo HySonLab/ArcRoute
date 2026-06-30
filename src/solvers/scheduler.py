@@ -53,13 +53,45 @@ class Scheduler:
         self._cls_np = self._np(td["clss"]).reshape(-1).astype(np.int64)
 
     # ------------------------------------------------------------------ public
-    def __call__(self, action, td, M=None):
+    def routes_from_joint_actions(self, actions, M, N1):
+        """Decode a flat Joint M×N action sequence into per-vehicle trips.
+
+        actions : 1D flat joint indices in [0, M*N1) where
+                  action = vehicle_m * N1 + arc_j (j == 0 -> depot return).
+        M       : number of vehicle slots to allocate.
+        N1      : N+1 (the joint stride / number of nodes incl. depot).
+        Returns : list (len M) of lists-of-trips (each trip = 1D arc-index array).
+        """
+        M = max(int(M), 1)
+        vehicles = [[] for _ in range(M)]
+        cur_trip = [[] for _ in range(M)]
+        for a in np.asarray(actions).ravel().tolist():
+            m = int(a) // N1
+            j = int(a) % N1
+            if m >= M:        # defensive: masked / nonexistent vehicle
+                continue
+            if j == 0:        # depot return closes the current trip
+                if cur_trip[m]:
+                    vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
+                    cur_trip[m] = []
+            else:
+                cur_trip[m].append(j)
+        for m in range(M):
+            if cur_trip[m]:
+                vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
+        return vehicles
+
+    def __call__(self, action, td, M=None, joint=False):
         """Return (vehicles, T_vec).
 
-        action : 1D sequence of arc indices (0 = depot). np.ndarray or torch.
+        action : 1D sequence. Either a Joint M×N flat index sequence (GRPO v3,
+                 action = m*N1 + j) or a legacy M-agnostic arc-index sequence
+                 (0 = depot). np.ndarray or torch.
         td     : single-instance mapping with 'service_times', 'adj', 'clss'
                  (1D/2D tensors, depot at index 0). Optional 'num_vehicle'.
         M      : number of vehicles; if None, read from td['num_vehicle'].
+        joint  : force Joint M×N decode. If False, auto-detect (any index >= N1
+                 can only arise when a non-zero vehicle was selected).
         vehicles : list (len M) of lists-of-trips (each trip = 1D arc-index array).
         T_vec  : np.ndarray (len p) of hierarchical completion times.
         """
@@ -71,6 +103,17 @@ class Scheduler:
         # on tiny arrays dominates over compute at that scale. Pure numpy avoids
         # the kernel-launch cost entirely.
         self._cache_td(td)
+
+        # Joint M×N (GRPO v3): per-vehicle routes come straight from the flat
+        # action sequence — no demand-quantile chunking (_build_P). Auto-detect:
+        # a flat index >= N1 can only arise when a non-zero vehicle was selected.
+        a = np.asarray(action).ravel()
+        N1 = self._svc_np.shape[0]                            # N+1
+        is_joint = joint or (a.size > 0 and int(a.max()) >= N1)
+        if is_joint:
+            vehicles = self.routes_from_joint_actions(a, M, N1)
+            T_vec = self._completion_times(vehicles, td)
+            return vehicles, T_vec
 
         if self.variant == "P":
             # HDCARP-P: the env mask makes the order globally class-sorted; split

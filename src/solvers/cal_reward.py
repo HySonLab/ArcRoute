@@ -53,7 +53,11 @@ def calc_reward(action, td, pos_val=[1,2,3], **kwargs):
     M = kwargs.get("M", None)
     if M is None and "num_vehicle" in td:
         M = int(td["num_vehicle"])
-    _, T = sched(action, td, M=M)  # M=None -> Scheduler uses k_min (parallel)
+    # joint=True (GRPO v3): the action is a flat Joint M×N index sequence; the
+    # Scheduler decodes routes directly. Default False keeps legacy arc-order
+    # behaviour (auto-detected by the Scheduler when not forced).
+    joint = kwargs.get("joint", False)
+    _, T = sched(action, td, M=M, joint=joint)  # M=None -> Scheduler uses k_min
     rs = [float(x) for x in T]
     # if kwargs.get("local_search", False):
     #     tours = lsRL(td, tours)

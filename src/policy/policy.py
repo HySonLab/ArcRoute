@@ -67,7 +67,7 @@ class AttentionModelPolicy(nn.Module):
         if actions is not None:
             decode_type = "evaluate"
         elif decode_type is None:
-            decode_type = f"{phase}_decode_type"
+            decode_type = getattr(self, f"{phase}_decode_type")
 
         # Setup decoding strategy
         # we pop arguments that are not part of the decoding strategy
@@ -86,10 +86,17 @@ class AttentionModelPolicy(nn.Module):
         # Main decoding: loop until all sequences are done
         step = 0
         while not td["done"].all():
+            # Joint M×N: decoder returns (B, M, N+1) logits + feasibility mask.
+            # Flatten to a plain (B, M*(N+1)) action space so the decoding strategy
+            # treats it as one categorical; env.step splits the flat index into
+            # (vehicle m*, arc j*).
             logits, mask = self.decoder(td, hidden)
+            B = logits.shape[0]
+            logits_flat = logits.reshape(B, -1)
+            mask_flat = mask.reshape(B, -1)
             td = decode_strategy.step(
-                logits,
-                mask,
+                logits_flat,
+                mask_flat,
                 td,
                 action=actions[..., step] if actions is not None else None,
             )
