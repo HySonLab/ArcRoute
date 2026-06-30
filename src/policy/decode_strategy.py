@@ -212,18 +212,11 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
 
     @staticmethod
     def sampling(logprobs, mask=None):
-        """Sample an action with a multinomial distribution given by the log probabilities."""
+        """Sample an action with a multinomial distribution given by the log probabilities.
+        Infeasible actions are already set to -inf before this call, so multinomial
+        assigns them zero probability — rejection loop and assert are unnecessary syncs."""
         probs = logprobs.exp()
-        selected = torch.multinomial(probs, 1).squeeze(1)
-
-        if mask is not None:
-            while (~mask).gather(1, selected.unsqueeze(-1)).data.any():
-                selected = probs.multinomial(1).squeeze(1)
-            assert (
-                not (~mask).gather(1, selected.unsqueeze(-1)).data.any()
-            ), "infeasible action selected"
-
-        return selected
+        return torch.multinomial(probs, 1).squeeze(1)
 
     def _select_best(self, logprobs, actions, td, env):
         rewards = env.get_reward(td, actions)

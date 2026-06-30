@@ -100,7 +100,7 @@ if __name__ == "__main__":
         from env.env import CARPEnv
         from policy.policy import AttentionModelPolicy
         from solvers.meta import InsertCheapestHCARP
-        from solvers.scheduler import Scheduler
+        from solvers.evaluator import SolutionEvaluator
         from tensordict import TensorDict
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -150,8 +150,8 @@ if __name__ == "__main__":
         best_actions = out["actions"][idx].cpu().numpy().astype(np.int32)
         elapsed = time() - t0
 
-        scheduler = Scheduler(variant=args.variant)
-        vehicles, best_T = scheduler(best_actions, td[0], M=M)
+        evaluator = SolutionEvaluator(variant=args.variant)
+        vehicles, best_T = evaluator(best_actions, td[0], M=M)
         best_routes = []
         for trips in vehicles:
             route = [0]

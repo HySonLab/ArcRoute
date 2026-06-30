@@ -2,19 +2,8 @@ from tensordict.tensordict import TensorDict
 import torch
 import numpy as np
 from env.generator import SizeBucketBatchSampler
-from solvers.cal_reward import calc_reward
-from utils.ops import gather_by_index, run_parallel
+from utils.ops import gather_by_index
 from torch.utils.data import DataLoader
-
-
-def reward_num_workers(n):
-    """Worker count for the reward/objective DataLoader, profiled on the Scheduler
-    (sub-millisecond numpy tasks). The old fixed `num_workers=24` was the WORST
-    choice at every batch size: forking 24 procs + pickling TensorDict slices costs
-    more than the compute. Below ~1k tasks inline (0 workers, main process) wins;
-    above it a modest pool (8) amortizes the fork overhead. Output is identical
-    regardless of worker count (DataLoader keeps order; calc_reward is pure)."""
-    return 0 if n < 1024 else 8
 
 
 class CARPEnv:
@@ -65,6 +54,14 @@ class CARPEnv:
         new_comp = td["completion"] + torch.zeros_like(td["completion"]).scatter_(
             1, m_star[:, None], step_cost[:, None])
 
+        # completion_at_arc[b, j] = new_comp[b, m] after serving arc j.
+        # Depot visits (j_star==0) contribute delta=0 so depot slot stays 0.
+        comp_m = new_comp[ar, m_star]                         # (B,) new vehicle time
+        arc_delta = (comp_m - td["completion_at_arc"][ar, j_star]) * (~is_depot).float()
+        new_comp_at_arc = td["completion_at_arc"] + \
+            torch.zeros_like(td["completion_at_arc"]).scatter_(
+                1, j_star[:, None], arc_delta[:, None])
+
         # current node: update to j_star
         new_cn = td["current_node"] + torch.zeros_like(td["current_node"]).scatter_(
             1, m_star[:, None], (j_star - td["current_node"][ar, m_star])[:, None])
@@ -90,6 +87,7 @@ class CARPEnv:
                 "current_node": new_cn,
                 "used_capacity": new_cap,
                 "completion": new_comp,
+                "completion_at_arc": new_comp_at_arc,
                 "visited": visited,
                 "done": done,
                 "clss_served": clss_served,
@@ -169,6 +167,7 @@ class CARPEnv:
             dim=-1,
         ).to(dev)                                                       # (B, 3)
 
+        N1 = td["service_times"].shape[1]  # N+1 (depot + N arcs)
         td_reset = TensorDict(
             {
                 "demand": td["demands"],
@@ -177,9 +176,13 @@ class CARPEnv:
                     batch_size, M_max, dtype=torch.long, device=dev),
                 "used_capacity": torch.zeros(batch_size, M_max, device=dev),
                 "completion": torch.zeros(batch_size, M_max, device=dev),
+                # completion_at_arc[b, j] = absolute time when arc j was served.
+                # Updated in step(); used by get_reward_gpu() to compute T_k on GPU
+                # (eliminates CPU Scheduler from the training loop).
+                "completion_at_arc": torch.zeros(batch_size, N1, device=dev),
                 "vehicle_capacity": torch.ones(batch_size, 1, device=dev),
                 "visited": torch.zeros(
-                    batch_size, 1, td["service_times"].shape[1],
+                    batch_size, 1, N1,
                     dtype=torch.uint8, device=dev,
                 ),
                 'clss': td["clss"],
@@ -219,30 +222,22 @@ class CARPEnv:
                           persistent_workers=True)
 
     def _pos_val(self):
-        """Priority class labels 1..P for the Scheduler/reward (-> a (B,P) T-vector)."""
         return list(range(1, self.P + 1))
 
-    def get_objective(self, td, actions, local_search=True):
-        actions = actions.clone().detach().cpu().numpy()
-        td = td.clone().detach().cpu()
-        return run_parallel(calc_reward, actions, td,
-                            num_workers=reward_num_workers(len(actions)), num_epochs=10,
-                            local_search=local_search, variant=self.variant,
-                            joint=True, pos_val=self._pos_val())
+    def get_reward(self, td, actions=None):
+        """Compute T_k (B, P) on GPU from completion_at_arc tracked in env.step().
 
-    def get_reward(self, td, actions):
-        actions = actions.clone().detach().cpu().numpy()
-        td = td.clone().detach().cpu()
-        rs = run_parallel(calc_reward, actions, td,
-                          num_workers=reward_num_workers(len(actions)), num_epochs=10,
-                          local_search=False, return_torch=True, variant=self.variant,
-                          joint=True, pos_val=self._pos_val())  # (B,P) T-vector
+        completion_at_arc[b, j] = absolute time when arc j was served by its vehicle.
+        T_k = max over class-k arcs — no CPU Scheduler, no D2H transfer."""
+        comp = td["completion_at_arc"]   # (B, N+1)
+        clss = td["clss"]                # (B, N+1)
+        B = comp.shape[0]
+        dev = comp.device
+        T = torch.zeros(B, self.P, device=dev, dtype=comp.dtype)
+        for ki, k in enumerate(self._pos_val()):
+            mask_k = (clss == k).float()
+            T[:, ki] = (comp * mask_k).max(dim=-1).values
         if self.reward_mode == 'vector':
-            # GRPO path: hand the raw (B,3) T-vector (T positive, lower=better) to
-            # the caller, which ranks the K samples lexicographically (Phase 3).
-            return rs.to(td.device)
-        # Hierarchical scalar reward = -(T . w): optimise T_1 first (w_1 >> w_2 >>
-        # w_3), with T_2/T_3 breaking ties. Full T vector stays in get_objective.
-        w = torch.tensor(self.obj_weights, dtype=rs.dtype, device=rs.device)
-        rs = -(rs * w).sum(-1, keepdim=True).to(td.device)
-        return rs
+            return T
+        w = torch.tensor(self.obj_weights, dtype=T.dtype, device=dev)
+        return -(T * w).sum(-1, keepdim=True)

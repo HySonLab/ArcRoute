@@ -5,7 +5,7 @@ from numpy.random import random, randint, permutation
 
 from utils.ops import import_instance, run_parallel2
 from utils.ops import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
-from solvers.cal_reward import get_Ts
+from solvers.evaluator import evaluate_batch as get_Ts
 from utils.local_search import ls
 from utils.ils_operators import perturbate, accept
 from copy import deepcopy

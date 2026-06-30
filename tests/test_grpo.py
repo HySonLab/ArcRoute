@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from utils.ops import batchify, unbatchify
-from trainers.grpo import GRPO, centered_lex_rank
+from trainers.grpo import GRPO, centered_lex_rank, centered_lex_rank_gpu
 
 
 def _make_env(reward_mode="vector", M=3, n=15):
@@ -136,6 +136,61 @@ class TestRankFunction(unittest.TestCase):
             rank[order] = np.arange(K - 1, -1, -1)
             expected = ((rank - (K - 1) / 2.0) / ((K - 1) / 2.0)).astype(np.float32)
             self.assertTrue(np.array_equal(centered_lex_rank(T), expected))
+
+
+class TestGPURankMatchesCPU(unittest.TestCase):
+    """⭐ centered_lex_rank_gpu must exactly match the CPU reference on all cases."""
+
+    def _cpu_batch(self, T_np):
+        """Run CPU reference for each row and stack -> (B, K) float32."""
+        return np.stack([centered_lex_rank(T_np[b]) for b in range(T_np.shape[0])])
+
+    def test_no_ties(self):
+        """Random T with large spread -> no ties; GPU must match CPU exactly."""
+        rng = np.random.default_rng(42)
+        T_np = rng.random((16, 8, 3)).astype(np.float32) * 1000
+        T_gpu = torch.from_numpy(T_np)
+        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        cpu_out = self._cpu_batch(T_np.astype(np.float64))
+        np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-5,
+                                   err_msg="GPU lex rank diverges from CPU (no-tie case)")
+
+    def test_with_ties(self):
+        """Intentional ties: identical rows in some groups. Tie-averaging must match."""
+        T_np = np.array([
+            [[5., 2., 9.], [5., 1., 1.], [5., 1., 1.], [7., 0., 0.]],
+            [[1., 0., 0.], [1., 0., 0.], [2., 0., 0.], [3., 0., 0.]],
+        ], dtype=np.float32)
+        T_gpu = torch.from_numpy(T_np)
+        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        cpu_out = self._cpu_batch(T_np.astype(np.float64))
+        np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-5,
+                                   err_msg="GPU lex rank diverges from CPU (tie case)")
+
+    def test_all_tied(self):
+        """Whole group tied -> all zeros on GPU (same as CPU reference)."""
+        T_np = np.tile(np.array([3., 1., 2.]), (4, 8, 1)).astype(np.float32)
+        gpu_out = centered_lex_rank_gpu(torch.from_numpy(T_np)).numpy()
+        np.testing.assert_allclose(gpu_out, 0.0, atol=1e-6)
+
+    def test_large_random(self):
+        """Stress: B=64, K=32, P=3 — finite, bounded, zero-mean, matches CPU."""
+        rng = np.random.default_rng(7)
+        T_np = rng.random((64, 32, 3)).astype(np.float32)
+        T_gpu = torch.from_numpy(T_np)
+        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        cpu_out = self._cpu_batch(T_np.astype(np.float64))
+        self.assertTrue(np.isfinite(gpu_out).all())
+        self.assertLessEqual(float(np.abs(gpu_out).max()), 1.0 + 1e-5)
+        np.testing.assert_allclose(gpu_out.mean(axis=1), 0.0, atol=1e-5)
+        np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-4,
+                                   err_msg="GPU/CPU mismatch on large random batch")
+
+    def test_k1_group(self):
+        """K=1 -> all zeros (no ranking possible)."""
+        T = torch.rand(5, 1, 3)
+        out = centered_lex_rank_gpu(T).numpy()
+        np.testing.assert_allclose(out, 0.0, atol=1e-9)
 
 
 class TestBatchifyLayout(unittest.TestCase):
@@ -326,30 +381,6 @@ class TestDynamicGroupFiltering(unittest.TestCase):
         self.assertIn("train/skipped_frac", out)
         self.assertGreaterEqual(out["train/skipped_frac"], 0.0)
         self.assertLessEqual(out["train/skipped_frac"], 1.0)
-
-
-class TestRewardWorkersIdentical(unittest.TestCase):
-    """#1: adaptive worker count must not change reward (DataLoader keeps order,
-    calc_reward is deterministic). The old fixed 24 workers was the slowest choice."""
-
-    def test_threshold(self):
-        from env.env import reward_num_workers
-        self.assertEqual(reward_num_workers(512), 0)      # small -> inline
-        self.assertEqual(reward_num_workers(1023), 0)
-        self.assertEqual(reward_num_workers(1024), 8)     # large -> modest pool
-        self.assertEqual(reward_num_workers(40000), 8)
-
-    def test_reward_identical_across_workers(self):
-        from utils.ops import run_parallel
-        from solvers.cal_reward import calc_reward
-        _, _, td0, out = _tiny_rollout()
-        a = out["actions"].cpu().numpy()
-        td_cpu = batchify(td0, 4).clone().detach().cpu()   # same (B*K) td the actions ran on
-        r0 = run_parallel(calc_reward, a, td_cpu, num_workers=0, num_epochs=10,
-                          local_search=False, variant="P").numpy()
-        r8 = run_parallel(calc_reward, a, td_cpu, num_workers=8, num_epochs=10,
-                          local_search=False, variant="P").numpy()
-        self.assertTrue(np.array_equal(r0, r8), f"workers changed reward:\n{r0}\n{r8}")
 
 
 class TestPriorityCountP(unittest.TestCase):

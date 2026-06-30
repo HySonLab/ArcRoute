@@ -51,20 +51,20 @@ class TestFleetPerInstance(unittest.TestCase):
         self.assertEqual(sorted(set(ds["num_vehicle"].tolist())), [3])
 
     def test_reset_per_instance_M(self):
-        import numpy as np
+        import torch
         from env.env import CARPEnv
-        from solvers.cal_reward import calc_reward
+        from policy.policy import AttentionModelPolicy
 
-        env = CARPEnv(num_vehicle=[2, 3, 7], variant="P")
+        torch.manual_seed(0)
+        env = CARPEnv(num_vehicle=[2, 3, 7], variant="P", reward_mode="vector")
         ds = generate_dataset(12, 30, 30, [2, 3, 7], num_workers=0)
         td = env.reset(ds)
         self.assertEqual(tuple(td["num_vehicle"].shape), (12, 1))
-        n = int((td[0]["demand"] > 0).sum())
-        action = np.arange(1, n + 1)
-        for i in range(12):
-            r = calc_reward(action, td[i], return_numpy=True)
-            self.assertEqual(r.shape, (3,))
-            self.assertTrue(np.all(np.isfinite(r)))
+        policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
+        out = policy(td, env, phase="train")
+        r = out["reward"]
+        self.assertEqual(tuple(r.shape), (12, 3))
+        self.assertTrue(r.isfinite().all())
 
 
 if __name__ == "__main__":

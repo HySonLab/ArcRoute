@@ -114,7 +114,7 @@ class AttentionModelPolicy(nn.Module):
             td.set("reward", env.get_reward(td, actions))
 
         outdict = {
-            "reward": td["reward"],
+            "reward": td.get("reward", None),
             "log_likelihood": get_log_likelihood(
                 logprobs, actions, td.get("mask", None), return_sum_log_likelihood
             ),

@@ -1,0 +1,266 @@
+"""HDCARP solution evaluator: action sequence → per-vehicle routes → T_k.
+
+Two input modes:
+  - Arc-order (metaheuristics): action = arc indices with 0-separators.
+    SolutionEvaluator partitions them into M capacity-feasible trips.
+  - Joint M×N (rl.py inference): action = flat m*(N+1)+j indices.
+    Routes are extracted directly via `routes_from_joint_actions`.
+
+Variants:
+  - 'P' (precedence): `_build_P` spreads each class across M vehicles then
+    inserts capacity reloads. Routes are globally class-sorted.
+  - 'U' (upgrading): `_segment` + greedy LPT `_assign` + `_order_trips`.
+
+T_k = max absolute completion time over class-k arcs (both variants).
+"""
+
+import numpy as np
+import torch
+
+
+class SolutionEvaluator:
+    def __init__(self, variant: str = "P", pos_val=(1, 2, 3)):
+        self.variant = variant
+        self.pos_val = list(pos_val)
+        self._svc_np = self._adj_np = self._cls_np = None
+
+    def _cache_td(self, td):
+        self._adj_np = self._np(td["adj"]).astype(np.float64)
+        self._svc_np = self._np(td["service_times"]).astype(np.float64)
+        self._cls_np = self._np(td["clss"]).reshape(-1).astype(np.int64)
+
+    # ------------------------------------------------------------------ public
+    def routes_from_joint_actions(self, actions, M, N1):
+        """Decode flat Joint M×N action sequence → per-vehicle trips.
+
+        actions : 1D array, action = vehicle_m * N1 + arc_j (j==0 → depot).
+        Returns : list (len M) of lists-of-trips (each trip = 1D arc-index array).
+        """
+        M = max(int(M), 1)
+        vehicles = [[] for _ in range(M)]
+        cur_trip = [[] for _ in range(M)]
+        for a in np.asarray(actions).ravel().tolist():
+            m = int(a) // N1
+            j = int(a) % N1
+            if m >= M:
+                continue
+            if j == 0:
+                if cur_trip[m]:
+                    vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
+                    cur_trip[m] = []
+            else:
+                cur_trip[m].append(j)
+        for m in range(M):
+            if cur_trip[m]:
+                vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
+        return vehicles
+
+    def __call__(self, action, td, M=None, joint=False):
+        """Evaluate one instance. Return (vehicles, T_vec).
+
+        action  : 1D arc-order sequence or Joint M×N flat index sequence.
+        td      : single-instance dict with 'service_times', 'adj', 'clss'.
+        M       : vehicle count; reads td['num_vehicle'] if None.
+        joint   : force Joint M×N decode (else auto-detected).
+        """
+        if M is None and "num_vehicle" in td:
+            M = int(td["num_vehicle"])
+        self._cache_td(td)
+
+        a = np.asarray(action).ravel()
+        N1 = self._svc_np.shape[0]
+        is_joint = joint or (a.size > 0 and int(a.max()) >= N1)
+        if is_joint:
+            vehicles = self.routes_from_joint_actions(a, M, N1)
+            return vehicles, self._completion_times(vehicles, td)
+
+        if self.variant == "P":
+            vehicles = self._build_P(action, td, M)
+        else:
+            trips = self._segment(action, td, M)
+            n_veh = max(len(trips), 1) if trips else 0
+            if M is not None:
+                n_veh = max(int(M), n_veh) if trips else int(M)
+            vehicles = self._assign(trips, td, n_veh)
+        return vehicles, self._completion_times(vehicles, td)
+
+    def reward(self, action, td, M=None):
+        """Scalar reward = -T_1."""
+        _, T = self.__call__(action, td, M)
+        return -float(T[0])
+
+    # ------------------------------------------------------------- internals
+    def _capacity(self, td):
+        if "vehicle_capacity" in td:
+            return float(self._np(td["vehicle_capacity"]).reshape(-1)[0])
+        return 1.0
+
+    @staticmethod
+    def _np(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def _segment(self, action, td, M):
+        """Partition arc-order into K = max(M, k_min) capacity-feasible segments."""
+        a = np.asarray(action).astype(np.int64).ravel()
+        order = a[a != 0]
+        if len(order) == 0:
+            return []
+        demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
+        cap = self._capacity(td)
+        loads = demand[order]
+        total = float(loads.sum())
+        k_min = max(1, int(np.ceil(total / cap - 1e-9)))
+        target = k_min if M is None else max(int(M), k_min)
+        K = min(target, len(order))
+        soft = total / K
+
+        segs, cur, load, closed = [], [], 0.0, 0
+        for arc, d in zip(order.tolist(), loads.tolist()):
+            over_cap = load + d > cap + 1e-9
+            balanced = load >= soft - 1e-9 and closed < K - 1
+            if cur and (over_cap or balanced):
+                segs.append(np.array(cur, dtype=np.int64))
+                cur, load, closed = [], 0.0, closed + 1
+            cur.append(arc)
+            load += d
+        if cur:
+            segs.append(np.array(cur, dtype=np.int64))
+        return segs
+
+    def _build_P(self, action, td, M):
+        """Build M vehicle routes for variant P (global precedence).
+
+        Spreads each class-k block across M vehicles in demand-balanced chunks,
+        then splits by capacity. All routes are non-decreasing in class.
+        """
+        a = np.asarray(action).astype(np.int64).ravel()
+        order = a[a != 0]
+        M = max(int(M), 1)
+        vehicles = [[] for _ in range(M)]
+        if len(order) == 0:
+            return vehicles
+        clss = self._cls_np
+        demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
+        cap = self._capacity(td)
+
+        routes = [[] for _ in range(M)]
+        ocls = clss[order]
+        for ki, k in enumerate(np.unique(ocls)):
+            block = order[ocls == k]
+            for i, chunk in enumerate(self._balanced_chunks(block, demand, M)):
+                routes[(i + ki) % M].extend(chunk.tolist())
+        for m in range(M):
+            vehicles[m] = self._split_by_capacity(
+                np.array(routes[m], dtype=np.int64), demand, cap)
+        return vehicles
+
+    @staticmethod
+    def _balanced_chunks(block, demand, n):
+        """Split block into n demand-balanced contiguous chunks."""
+        chunks = [[] for _ in range(n)]
+        if len(block) == 0:
+            return [np.array([], dtype=np.int64) for _ in range(n)]
+        d = demand[block]
+        target = float(d.sum()) / n
+        cum = 0.0
+        for arc, dd in zip(block.tolist(), d.tolist()):
+            c = min(n - 1, int(cum / target)) if target > 1e-12 else 0
+            chunks[c].append(arc)
+            cum += dd
+        return [np.array(c, dtype=np.int64) for c in chunks]
+
+    @staticmethod
+    def _split_by_capacity(route, demand, cap):
+        """Split route into capacity-feasible trips."""
+        trips, cur, load = [], [], 0.0
+        for arc in route.tolist():
+            d = float(demand[arc])
+            if cur and load + d > cap + 1e-9:
+                trips.append(np.array(cur, dtype=np.int64))
+                cur, load = [], 0.0
+            cur.append(arc)
+            load += d
+        if cur:
+            trips.append(np.array(cur, dtype=np.int64))
+        return trips
+
+    def _assign(self, trips, td, M):
+        """Assign trips to M vehicles. Greedy LPT when #trips > M."""
+        vehicles = [[] for _ in range(M)]
+        if not trips:
+            return vehicles
+        if len(trips) <= M:
+            for i, t in enumerate(trips):
+                vehicles[i].append(t)
+            return vehicles
+        durations = [float(self._trip_profile(t, td)[2]) for t in trips]
+        order = np.argsort(durations)[::-1]
+        loads = np.zeros(M)
+        for idx in order:
+            v = int(np.argmin(loads))
+            vehicles[v].append(trips[idx])
+            loads[v] += durations[idx]
+        return vehicles
+
+    def _order_trips(self, veh_trips, td):
+        """Sort a vehicle's trips: lower class first, then by duration."""
+        if len(veh_trips) <= 1:
+            return veh_trips
+        if self._cls_np is None:
+            self._cache_td(td)
+        clss = self._cls_np
+
+        def key(trip):
+            cs = clss[np.asarray(trip, dtype=np.int64)]
+            return (int(cs.min()), float(self._trip_profile(trip, td)[2]))
+
+        return sorted(veh_trips, key=key)
+
+    def _trip_profile(self, trip, td):
+        """Return (arc_class, arc_completion, duration) for one trip."""
+        if self._svc_np is None:
+            self._cache_td(td)
+        trip = np.asarray(trip, dtype=np.int64)
+        path = np.empty(len(trip) + 2, dtype=np.int64)
+        path[0] = 0
+        path[1:-1] = trip
+        path[-1] = 0
+        t = self._svc_np[path].copy()
+        t[1:] += self._adj_np[path[:-1], path[1:]]
+        cum = np.cumsum(t)
+        n = len(trip)
+        return self._cls_np[trip], cum[1:1 + n], cum[-1]
+
+    def _completion_times(self, vehicles, td):
+        """T_k = max absolute completion time over class-k arcs across all vehicles."""
+        per_class = {p: [0.0] for p in self.pos_val}
+        for veh_trips in vehicles:
+            offset = 0.0
+            for trip in self._order_trips(veh_trips, td):
+                arc_class, arc_comp, duration = self._trip_profile(trip, td)
+                for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
+                    if c in per_class:
+                        per_class[c].append(offset + ac)
+                offset += float(duration)
+        return np.array([max(per_class[p]) for p in self.pos_val], dtype=np.float64)
+
+
+def evaluate_batch(vars, actions, pos_val=(1, 2, 3)):
+    """Compute T_k for a batch of arc-order action sequences (used by metaheuristics).
+
+    vars    : dict with 'adj', 'service_time', 'clss', 'demand', optionally 'nv'.
+    actions : 2D array (batch, n) — arc-index sequences with 0-separators.
+    Returns : np.ndarray shape (batch, len(pos_val)).
+    """
+    td = {
+        "adj":           vars["adj"],
+        "service_times": vars["service_time"],
+        "clss":          vars["clss"],
+        "demand":        vars["demand"],
+    }
+    M = vars.get("nv", None)
+    ev = SolutionEvaluator(pos_val=tuple(pos_val))
+    return np.array([ev(np.asarray(a), td, M=M)[1] for a in actions],
+                    dtype=np.float64)

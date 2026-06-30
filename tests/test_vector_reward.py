@@ -16,15 +16,14 @@ from policy.policy import AttentionModelPolicy
 
 
 def _rollout(env, B=12, n=15, M=3, seed=0):
-    """env.reset -> greedy policy rollout -> (td, actions). B>=10 so the
-    run_parallel(num_epochs=10) split inside get_reward stays non-empty.
-    (calc_reward=True so the policy populates td['reward']; we re-evaluate
-    get_reward on `env` ourselves to probe the mode.)"""
+    """env.reset -> greedy policy rollout -> (td_final, actions).
+    Returns the FINAL td (after all env.step calls) which has completion_at_arc set."""
     torch.manual_seed(seed)
     batch = generate_dataset(B, n, n, M, num_workers=0)
     td = env.reset(batch)
     policy = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1, num_heads=4)
-    out = policy(td.clone(), env, decode_type="greedy")
+    # td is mutated in-place by env.step inside policy.forward
+    out = policy(td, env, phase="train", return_actions=True)
     return td, out["actions"], policy
 
 

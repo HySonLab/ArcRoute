@@ -3,55 +3,6 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import torch
 
-def run_parallel(operation, *param_set, **kwargs):
-    def padding(batch):
-        if kwargs.get("return_numpy", False):
-            max_len = max([len(x) for x in batch])
-            padded = np.array([np.pad(x, (0, max_len - len(x)), 'constant') for x in batch])
-        else:
-            padded = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)
-        return padded
-
-    class WrapDataset(Dataset):
-        def __init__(self, operation, *param_set, **kwargs):
-            self.operation = operation
-            self.param_set = param_set
-            self.kwargs = kwargs
-
-        def __len__(self):
-            return len(self.param_set[0])
-
-        def __getitem__(self, i):
-            sliced_params = [param[i] for param in self.param_set]
-            return self.operation(*sliced_params, **self.kwargs)
-        
-        @classmethod
-        def collate_fn(self, batch):
-            return padding(batch)
-
-        
-    dataloader = DataLoader(
-        WrapDataset(operation, *param_set, **kwargs),
-        batch_size=max(1, len(param_set[0]) // kwargs.get("num_epochs", 24)),
-        shuffle=False,
-        num_workers=kwargs.get("num_workers", 10),
-        collate_fn=WrapDataset.collate_fn if kwargs.get("must_padding", False) else None
-    )
-    
-    is_tqdm=kwargs.get("is_tqdm", False)
-    ts = []
-    for t in tqdm(dataloader) if is_tqdm else dataloader:
-        ts.append(t)
-    
-    # if kwargs.get("ts_padding", False):
-    #     padded = padding(ts)
-    #     return padded
-    if kwargs.get("return_list", False):
-        return ts
-    if kwargs.get("return_numpy", False):
-        return np.concatenate(ts, 0)
-    return torch.cat(ts, 0)
-
 
 def gather_by_index(src, idx, dim=1, squeeze=True):
     """Gather elements from src by index idx along specified dim

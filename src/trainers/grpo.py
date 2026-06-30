@@ -21,34 +21,20 @@ import torch
 from utils.ops import batchify, unbatchify
 from .base import BaseRL
 
-# Lexicographic separation constant for the val/lex_best model-selection scalar
-# (T_1 weight = _LEX_C^2, T_2 = _LEX_C, T_3 = 1). Must dominate the T_2/T_3 range.
-_LEX_C = 1.0e3
-
 
 def centered_lex_rank(T):
-    """Centered lexicographic rank advantage for one group of K solutions.
+    """CPU reference: centered lex-rank advantage for ONE group of K solutions.
 
-    Args:
-        T: (K, P) array of T-vectors (LOWER is better), P = priority classes.
-           Ranked lexicographically: T[:,0] (T_1) primary, then T_2, ..., T_P.
-
-    Returns:
-        (K,) float32 advantage in [-1, +1], mean == 0.
-        Best solution (lowest T lex) → +1, worst → -1.
-        K == 1 → all zeros.
-        TIES: identical T-vectors share the average of the ranks they span →
-        equal advantage, no spurious gradient. Whole group tied → all zeros
-        (zero gradient; the dynamic-filter branch below drops these groups).
+    T   : (K, P) array — T-vectors, LOWER is better.
+    Returns (K,) float32 in [-1, +1], mean==0.
+    Used as ground-truth in unit tests; training uses centered_lex_rank_gpu.
     """
     T = np.asarray(T, dtype=np.float64)
     K = T.shape[0]
     if K < 2:
         return np.zeros(K, dtype=np.float32)
-    # lexsort: last key is primary → T[:,0] (T_1) is primary, T_P is last key.
-    order = np.lexsort(T[:, ::-1].T)       # ascending: best (lowest T_1) first
-    pos = np.arange(K - 1, -1, -1, dtype=np.float64)   # best pos → K-1
-    # Average-rank ties: runs of identical T-vectors share the mean position.
+    order = np.lexsort(T[:, ::-1].T)
+    pos = np.arange(K - 1, -1, -1, dtype=np.float64)
     Ts = T[order]
     rank_sorted = pos.copy()
     i = 0
@@ -61,58 +47,66 @@ def centered_lex_rank(T):
         i = j
     rank = np.empty(K, dtype=np.float64)
     rank[order] = rank_sorted
-    adv = (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)    # → [-1, +1], mean == 0
-    return adv.astype(np.float32)
+    return ((rank - (K - 1) / 2.0) / ((K - 1) / 2.0)).astype(np.float32)
+
+# Lexicographic separation constant for the val/lex_best model-selection scalar
+# (T_1 weight = _LEX_C^2, T_2 = _LEX_C, T_3 = 1). Must dominate the T_2/T_3 range.
+_LEX_C = 1.0e3
 
 
-def _centered_lex_rank_batch(T_np):
-    """Batched version of centered_lex_rank.
+def centered_lex_rank_gpu(T):
+    """Centered lexicographic rank advantage entirely on GPU.
 
-    Args:
-        T_np: (B, K, P) float64 numpy array (LOWER is better).
+    T   : (B, K, P) float32 tensor — T-vectors, LOWER is better.
+    Returns (B, K) float32 advantage in [-1, +1], mean==0 per group.
 
-    Returns:
-        (B, K) float32 advantage in [-1, +1], mean==0 per group.
+    Lexsort via P successive stable argsorts (least-significant column first).
+    Tie averaging: runs of identical sorted rows share the mean position.
+    Rare tied groups fall back to a tiny CPU loop over only those rows.
     """
-    B, K, P = T_np.shape
+    B, K, P = T.shape
+    dev = T.device
     if K < 2:
-        return np.zeros((B, K), dtype=np.float32)
+        return torch.zeros(B, K, device=dev)
 
-    # Step 1: lexsort each group via successive stable argsorts (last->first key).
-    # order[b, i] = index in original group that belongs at sorted position i.
-    order = np.tile(np.arange(K, dtype=np.intp), (B, 1))       # (B, K)
-    Bidx = np.arange(B, dtype=np.intp)[:, None]                 # (B, 1) for fancy index
-    for p in range(P - 1, -1, -1):                             # last key = least significant
-        col = T_np[Bidx, order, p]                            # (B, K) current values
-        sub = np.argsort(col, axis=1, kind='stable')
-        order = order[Bidx, sub]
+    # --- lexsort: P stable argsorts, least-significant first ---
+    order = torch.arange(K, device=dev).unsqueeze(0).expand(B, -1).clone()  # (B, K)
+    idx3 = order.unsqueeze(-1).expand(B, K, P)
+    for p in range(P - 1, -1, -1):
+        col = T.gather(1, idx3)[:, :, p]                    # (B, K) current column
+        order = order.gather(1, col.argsort(dim=1, stable=True))
+        idx3 = order.unsqueeze(-1).expand(B, K, P)
 
-    # Step 2: positions K-1 (best) down to 0 (worst), replicated for B groups.
-    pos = np.arange(K - 1, -1, -1, dtype=np.float64)          # (K,)
-    rank_sorted = np.broadcast_to(pos, (B, K)).copy()          # (B, K) writeable
+    # --- positions: best (rank 0) → K-1, worst → 0 ---
+    pos = torch.arange(K - 1, -1, -1, dtype=T.dtype, device=dev)  # (K,)
+    rank_sorted = pos.unsqueeze(0).expand(B, K).clone()             # (B, K)
 
-    # Step 3: average rank for ties. Ties = consecutive sorted rows equal on ALL P cols.
-    Ts = T_np[Bidx, order, :]                                 # (B, K, P) sorted
-    # eq[b, i] == True if sorted row i+1 equals row i (all P coords).
-    eq = np.all(Ts[:, 1:, :] == Ts[:, :-1, :], axis=2)        # (B, K-1) bool
+    # --- tie averaging ---
+    Ts = T.gather(1, idx3)                                  # (B, K, P) sorted
+    eq = (Ts[:, 1:] == Ts[:, :-1]).all(dim=2)              # (B, K-1) bool
+    if eq.any():
+        # Only process groups that actually have ties (rare path).
+        has_tie = eq.any(dim=1)                             # (B,) bool
+        tied_bs = has_tie.nonzero(as_tuple=True)[0].tolist()
+        rs = rank_sorted.cpu().numpy()
+        eq_np = eq.cpu().numpy()
+        pos_np = pos.cpu().numpy()
+        for b in tied_bs:
+            i = 0
+            while i < K:
+                j = i + 1
+                while j < K and eq_np[b, j - 1]:
+                    j += 1
+                if j - i > 1:
+                    rs[b, i:j] = pos_np[i:j].mean()
+                i = j
+        rank_sorted = torch.from_numpy(rs).to(dev)
 
-    # Process each group's runs. For groups with NO ties (common case), skip.
-    has_tie = eq.any(axis=1)                                   # (B,) bool
-    for b in np.nonzero(has_tie)[0]:
-        i = 0
-        while i < K:
-            j = i + 1
-            while j < K and eq[b, j - 1]:
-                j += 1
-            if j - i > 1:
-                rank_sorted[b, i:j] = pos[i:j].mean()
-            i = j
+    # --- scatter back and normalise ---
+    rank = torch.empty(B, K, dtype=T.dtype, device=dev)
+    rank.scatter_(1, order, rank_sorted)
+    return (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)      # [-1, +1], mean==0
 
-    # Step 4: scatter back to original indices and normalise.
-    rank = np.empty((B, K), dtype=np.float64)
-    rank[Bidx, order] = rank_sorted
-    adv = (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)
-    return adv.astype(np.float32)
 
 
 class GRPO(BaseRL):
@@ -156,9 +150,8 @@ class GRPO(BaseRL):
         return torch.optim.AdamW(self.policy.parameters(), lr=self.lr)
 
     def _group_advantage(self, T_bk3):
-        """(B, K, 3) T-vectors -> (B, K) centered lexicographic-rank advantage."""
-        T = T_bk3.detach().cpu().numpy().astype(np.float64)
-        return torch.from_numpy(_centered_lex_rank_batch(T))
+        """(B, K, P) T-vectors on GPU -> (B, K) centered lex-rank advantage on GPU."""
+        return centered_lex_rank_gpu(T_bk3.detach())
 
     def shared_step(self, batch, batch_idx, phase, dataloader_idx=None):
         if phase == "train":
@@ -202,7 +195,7 @@ class GRPO(BaseRL):
         # DAPO dynamic group filtering: a group whose K rollouts are all tied gives
         # an all-zero advantage (zero gradient). Drop those groups so compute is
         # spent only on groups that produce a signal; log the skipped fraction.
-        active_mask = adv_bk.abs().amax(dim=1) > 1e-6     # (B,) bool
+        active_mask = adv_bk.abs().amax(dim=1) > 1e-6     # (B,) bool, on GPU
         skipped_frac = float((B - int(active_mask.sum())) / B)
 
         # Per-objective means for the learning-curve log; P = #priority classes
@@ -223,9 +216,11 @@ class GRPO(BaseRL):
             return {"loss": 0.0, "train/skipped_frac": skipped_frac, **metrics}
 
         # Keep only active groups: build (B_a*K,) active row indices in k*B_a+b' order.
-        active_idx = torch.nonzero(active_mask, as_tuple=False).flatten()   # (B_a,) CPU
-        keep = (torch.arange(K).view(K, 1) * B + active_idx.view(1, -1)).reshape(-1)
-        td = td[keep.to(reward.device)]   # (B_a*K, ...) k*B_a+b' layout
+        dev = reward.device
+        active_idx = active_mask.nonzero(as_tuple=False).flatten()          # (B_a,) GPU
+        keep = (torch.arange(K, device=dev).view(K, 1) * B
+                + active_idx.view(1, -1)).reshape(-1)
+        td = td[keep]                      # (B_a*K, ...) k*B_a+b' layout
         B_a = len(active_idx)
 
         # (2) Grad-enabled inner loop grouped by instance.
@@ -233,20 +228,20 @@ class GRPO(BaseRL):
         # as before, but the encoder runs only on mb_inst rows (not mb_inst*K rows).
         # Total encoder work: B_a (≈ B) samples vs B_a*K = B*K in the old flat loop.
         mb_inst = max(1, self.mini_batch_size // K)
-        inst_perm = torch.randperm(B_a)   # shuffle instance dimension (CPU)
+        inst_perm = torch.randperm(B_a, device=dev)          # shuffle on GPU
 
         opt = self.optimizers()
         loss_acc = None
         n_iters = 0
         for j in range(0, B_a, mb_inst):
-            inst_idx = inst_perm[j : j + mb_inst]            # (actual_mb,) CPU
-            orig_inst_idx = active_idx[inst_idx]             # (actual_mb,) CPU; B-indices
+            inst_idx = inst_perm[j : j + mb_inst]            # (actual_mb,) GPU
+            orig_inst_idx = active_idx[inst_idx]             # (actual_mb,) GPU; B-indices
 
             # Collect all K rollouts of these instances: k*actual_mb+i layout
             actual_mb = len(inst_idx)
             flat_row_idx = (
-                torch.arange(K, device=reward.device).view(K, 1) * B_a
-                + inst_idx.to(reward.device).view(1, -1)
+                torch.arange(K, device=dev).view(K, 1) * B_a
+                + inst_idx.view(1, -1)
             ).reshape(-1)                                     # (actual_mb*K,)
             sub_td = td[flat_row_idx]
             adv = sub_td["advantage"].view(-1, 1)
@@ -302,18 +297,15 @@ class GRPO(BaseRL):
         with torch.no_grad():
             td0 = self.env.reset(batch)
             out = self.policy(td0.clone(), self.env, phase=phase)
-        reward = out["reward"]                        # (B, P) T-vector
-        T = reward.detach().cpu().numpy()
-        B, P = T.shape[0], T.shape[1]
+        reward = out["reward"]                        # (B, P) T-vector, on GPU
+        B, P = reward.shape
         for j in range(P):
-            self.log(f"{phase}/T{j+1}_best", float(T[:, j].mean()),
+            self.log(f"{phase}/T{j+1}_best", float(reward[:, j].mean()),
                      on_epoch=True, sync_dist=True, batch_size=B)
-        # Lexicographic model-selection scalar (T_1 >> T_2 >> ... >> T_P); higher is
-        # better so ModelCheckpoint(mode='max') picks the best-lexicographic epoch.
-        # Horner over the P columns (P=3 -> (T0*C+T1)*C+T2).
-        lex = T[:, 0].copy()
+        # Lex scalar on GPU via Horner: (T0*C+T1)*C+T2
+        lex = reward[:, 0].clone()
         for j in range(1, P):
-            lex = lex * _LEX_C + T[:, j]
+            lex = lex * _LEX_C + reward[:, j]
         self.log(f"{phase}/lex_best", float(-lex.mean()),
                  on_epoch=True, sync_dist=True, batch_size=B)
         metrics = self.log_metrics({"reward": -reward[:, 0:1]}, phase, dataloader_idx)
