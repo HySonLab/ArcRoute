@@ -10,9 +10,9 @@ cd "$(dirname "$0")/.."
 
 # === Hyperparameters =========================================================
 SEED=6868
-MAX_EPOCH="${MAX_EPOCH:-1000}"
-BATCH_SIZE="${BATCH_SIZE:-4096}"
-MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-2048}"
+MAX_EPOCH="${MAX_EPOCH:-100}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-256}"
 EMBED_DIM=128
 NUM_ENCODER_LAYERS=12
 NUM_HEADS=8

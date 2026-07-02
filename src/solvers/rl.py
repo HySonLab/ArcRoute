@@ -64,7 +64,7 @@ class RLHCARP:
     def __call__(self, num_sample=100):
         td = batchify(self.td, num_sample)
         with torch.inference_mode():
-            out = self.policy(td, env=self.env, phase='test')
+            out = self.policy(td, env=self.env, decode_type='sampling')
         reward = out["reward"].cpu().numpy()          # (num_sample, P)
         idx = int(np.lexsort(reward[:, ::-1].T)[0])  # lex best (lowest T1 primary)
         return reward[idx:idx+1]                      # (1, P)
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         t0 = time()
         td_k = batchify(td, args.num_sample)
         with torch.inference_mode():
-            out = policy(td_k, env=env, phase="test")
+            out = policy(td_k, env=env, decode_type='sampling')
         Ts_all = out["reward"].cpu().numpy()
         idx = int(np.lexsort((Ts_all[:, 2], Ts_all[:, 1], Ts_all[:, 0]))[0])
         best_T = Ts_all[idx]

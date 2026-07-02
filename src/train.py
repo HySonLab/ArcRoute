@@ -67,6 +67,7 @@ if __name__ == "__main__":
         embed_dim=args.embed_dim,
         num_encoder_layers=args.num_encoder_layers,
         num_heads=args.num_heads,
+        tanh_clipping=10,
     )
 
     metrics = {"train": ["reward", "loss", "T1_mean", "T2_mean", "T3_mean"]}

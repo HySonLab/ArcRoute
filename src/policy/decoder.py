@@ -47,8 +47,9 @@ class JointMVContext(nn.Module):
         comp_norm = td["completion"].amax(dim=-1, keepdim=True).clamp(min=1e-6)
         comp = (td["completion"] / comp_norm).unsqueeze(-1)  # (B, M, 1)
 
-        # Distance to depot: adj[:, cn, 0] -> (B, M, 1)
-        dist = td["adj"][:, :, 0].gather(1, cn).unsqueeze(-1)  # (B, M, 1)
+        # Distance to depot: adj[:, cn, 0] -> (B, M, 1), normalised per instance
+        adj_scale = td["adj"].amax(dim=(-2, -1)).clamp(min=1e-6).unsqueeze(1)  # (B, 1)
+        dist = (td["adj"][:, :, 0].gather(1, cn) / adj_scale).unsqueeze(-1)   # (B, M, 1)
 
         feat = torch.cat([h, rem, comp, dist], dim=-1)       # (B, M, D+3)
         return self.project_vehicle(feat)                    # (B, M, D)

@@ -83,13 +83,19 @@ def process_logits(
     # Compute log probabilities
     return F.log_softmax(logits, dim=-1)
 
-def calculate_entropy(logprobs):
-    """Calculate the entropy of the log probabilities distribution
-    logprobs: Tensor of shape [batch, decoder_steps, num_actions]
+def calculate_entropy(logprobs, valid_mask=None):
+    """Calculate the entropy of the log probabilities distribution.
+    logprobs: (batch, decoder_steps, num_actions)
+    valid_mask: (batch, decoder_steps) bool, True where step is a real decision.
+                Post-done junk steps are excluded from the mean.
     """
     logprobs = torch.nan_to_num(logprobs, nan=0.0)
     entropy = -(logprobs.exp() * logprobs).sum(dim=-1)  # [batch, decoder steps]
-    entropy = entropy.mean(dim=1)  # [batch] -- mean over decoding steps (scale-invariant)
+    if valid_mask is not None:
+        vm = valid_mask.float()
+        entropy = (entropy * vm).sum(dim=1) / vm.sum(dim=1).clamp(min=1)
+    else:
+        entropy = entropy.mean(dim=1)
     assert entropy.isfinite().all(), "Entropy is not finite"
     return entropy
 

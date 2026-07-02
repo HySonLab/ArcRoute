@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 from policy.decode_strategy import calculate_entropy, get_decoding_strategy
@@ -84,7 +85,9 @@ class AttentionModelPolicy(nn.Module):
 
         # Main decoding: loop until all sequences are done
         step = 0
+        valid_steps = []
         while not td["done"].all():
+            valid_steps.append(~td["done"].reshape(-1))  # (B,) True where not yet done
             # Joint M×N: decoder returns (B, M, N+1) logits + feasibility mask.
             # Flatten to a plain (B, M*(N+1)) action space so the decoding strategy
             # treats it as one categorical; env.step splits the flat index into
@@ -107,6 +110,8 @@ class AttentionModelPolicy(nn.Module):
 
         # Post-decoding hook: used for the final step(s) of the decoding strategy
         logprobs, actions, td, env = decode_strategy.post_decoder_hook(td, env)
+        # (B, dec_steps) mask: True for real decisions, False for post-done junk steps
+        valid_mask = torch.stack(valid_steps, dim=1) if valid_steps else None
 
         # Output dictionary construction
         if calc_reward:
@@ -115,14 +120,15 @@ class AttentionModelPolicy(nn.Module):
         outdict = {
             "reward": td.get("reward", None),
             "log_likelihood": get_log_likelihood(
-                logprobs, actions, td.get("mask", None), return_sum_log_likelihood
+                logprobs, actions, valid_mask, return_sum_log_likelihood
             ),
+            "valid_mask": valid_mask,
         }
 
         if return_actions:
             outdict["actions"] = actions
         if return_entropy:
-            outdict["entropy"] = calculate_entropy(logprobs)
+            outdict["entropy"] = calculate_entropy(logprobs, valid_mask)
         if return_hidden:
             outdict["hidden"] = hidden
         if return_init_embeds:

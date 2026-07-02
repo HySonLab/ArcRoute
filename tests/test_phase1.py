@@ -210,13 +210,14 @@ class TestLogProbCorrectness(unittest.TestCase):
         step = 0
         with torch.no_grad():
             while not td["done"].all():
+                valid = ~td["done"].reshape(-1)  # (B,) — exclude post-done steps
                 logits, mask = policy.decoder(td, cached)
                 B = logits.shape[0]
                 lf = logits.reshape(B, -1)
                 mf = mask.reshape(B, -1)
                 logp = torch.log_softmax(lf.masked_fill(~mf, float("-inf")), dim=-1)
                 a = actions[..., step]
-                manual = manual + logp.gather(1, a[:, None]).squeeze(1)
+                manual = manual + logp.gather(1, a[:, None]).squeeze(1) * valid.float()
                 td.set("action", a)
                 td = env.step(td)
                 step += 1

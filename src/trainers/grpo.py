@@ -118,10 +118,12 @@ class GRPO(BaseRL):
         path_val_data: str,
         path_test_data: str,
         group_size: int = 8,
-        lr: float = 3e-4,
-        max_grad_norm: float = 2.0,
-        clip_range: float = 0.2,
-        entropy_lambda: float = 0.01,
+        lr: float = 1e-4,
+        lr_min: float = 1e-5,
+        warmup_steps: int = 100,
+        cosine_steps: int = 10000,
+        max_grad_norm: float = 1.0,
+        entropy_lambda: float = 0.02,
         mini_batch_size: int = 256,
         batch_size: int = 1024,
         metrics: dict = None,
@@ -139,14 +141,27 @@ class GRPO(BaseRL):
         assert group_size >= 2, "GRPO needs group_size K >= 2 to form a ranking baseline"
         self.group_size = group_size
         self.lr = lr
+        self.lr_min = lr_min
+        self.warmup_steps = warmup_steps
+        self.cosine_steps = cosine_steps
         self.max_grad_norm = max_grad_norm
-        self.clip_range = clip_range
         self.entropy_lambda = entropy_lambda
         self.mini_batch_size = mini_batch_size
 
     def configure_optimizers(self):
-        # Policy params only — GRPO is critic-free.
-        return torch.optim.AdamW(self.policy.parameters(), lr=self.lr)
+        import math
+        from torch.optim.lr_scheduler import LambdaLR, LinearLR, SequentialLR
+        opt = torch.optim.AdamW(self.policy.parameters(), lr=self.lr)
+        warmup = LinearLR(opt, start_factor=self.lr_min / self.lr, end_factor=1.0,
+                          total_iters=self.warmup_steps)
+        T, r = self.cosine_steps, self.lr_min / self.lr
+        # One-shot cosine that clamps at eta_min after T steps (no oscillation).
+        cosine = LambdaLR(opt, lr_lambda=lambda s: max(
+            r, r + 0.5 * (1 - r) * (1 + math.cos(math.pi * min(s, T) / T))
+        ))
+        self._scheduler = SequentialLR(opt, [warmup, cosine],
+                                       milestones=[self.warmup_steps])
+        return opt
 
     def _group_advantage(self, T_bk3):
         """(B, K, P) T-vectors on GPU -> (B, K) centered lex-rank advantage on GPU."""
@@ -183,11 +198,8 @@ class GRPO(BaseRL):
         # Re-flatten (B,K)->(B*K,) matching td's k*B+b layout (transpose then reshape).
         advantage = adv_bk.permute(1, 0).reshape(B * K).to(reward.device)
 
-        # Stash the rollout's old log-prob, advantage, actions and reward on td so
-        # the inner loop can replay them in mini-batches. reward must be present so
-        # policy.forward can echo td["reward"] when calc_reward=False.
+        # Stash advantage, actions and reward on td for mini-batch replay.
         td.set("reward", reward)                      # (B*K, P) T-vector
-        td.set("logprobs", out["log_likelihood"])     # (B*K,) old sum log-prob
         td.set("advantage", advantage)                # (B*K,) centered rank
         td.set("action", out["actions"])
 
@@ -229,15 +241,21 @@ class GRPO(BaseRL):
         mb_inst = max(1, self.mini_batch_size // K)
         inst_perm = torch.randperm(B_a, device=dev)          # shuffle on GPU
 
+        # (2) Gradient accumulation: single optimizer step over all mini-batches.
+        # zero_grad once before the loop; each chunk accumulates grads; step once
+        # after. Policy stays at θ₀ for all ll evaluations → fully on-policy.
         opt = self.optimizers()
-        loss_acc = None
-        n_iters = 0
+        opt.zero_grad()
+        loss_acc = torch.tensor(0.0, device=dev)
+        entropy_acc = 0.0
+
         for j in range(0, B_a, mb_inst):
             inst_idx = inst_perm[j : j + mb_inst]            # (actual_mb,) GPU
             orig_inst_idx = active_idx[inst_idx]             # (actual_mb,) GPU; B-indices
 
             # Collect all K rollouts of these instances: k*actual_mb+i layout
             actual_mb = len(inst_idx)
+            weight = actual_mb / B_a                         # proportional chunk weight
             flat_row_idx = (
                 torch.arange(K, device=dev).view(K, 1) * B_a
                 + inst_idx.view(1, -1)
@@ -260,29 +278,39 @@ class GRPO(BaseRL):
                 return_sum_log_likelihood=False,
                 return_entropy=True,
             )
-            ll = out_i["log_likelihood"]
+            ll = out_i["log_likelihood"]             # (actual_mb*K, dec_steps), junk=0
             entropy = out_i["entropy"]
-            ratio = torch.exp(ll.sum(dim=-1) - sub_td["logprobs"]).view(-1, 1)
+            vm = out_i.get("valid_mask")             # (actual_mb*K, dec_steps) or None
 
-            clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
-            surr = -torch.min(ratio * adv, clipped_ratio * adv).mean()
+            # Length-normalize: sum over valid steps / valid count (excludes post-done junk).
+            if vm is not None:
+                valid_len = vm.float().sum(dim=-1).clamp(min=1)
+                ll_normed = ll.sum(dim=-1) / valid_len
+            else:
+                ll_normed = ll.mean(dim=-1)
+            surr = -(ll_normed.view(-1, 1) * adv).mean()
             loss_i = surr - self.entropy_lambda * entropy.mean()
 
-            opt.zero_grad()
-            self.manual_backward(loss_i)
-            if self.max_grad_norm is not None:
-                self.clip_gradients(opt, gradient_clip_val=self.max_grad_norm,
-                                    gradient_clip_algorithm="norm")
-            opt.step()
+            # Accumulate scaled gradient (no opt.step here).
+            self.manual_backward(loss_i * weight)
+            loss_acc = loss_acc + loss_i.detach() * weight
+            entropy_acc += float(entropy.mean().detach()) * weight
 
-            loss_acc = loss_i.detach() if loss_acc is None else loss_acc + loss_i.detach()
-            n_iters += 1
+        # Single gradient step after full accumulation.
+        if self.max_grad_norm is not None:
+            self.clip_gradients(opt, gradient_clip_val=self.max_grad_norm,
+                                gradient_clip_algorithm="norm")
+        opt.step()
+        self._scheduler.step()
 
-        loss_log = loss_acc / n_iters
+        loss_log = loss_acc
         try:
             self.log("train/skipped_frac", skipped_frac, on_step=True, prog_bar=False,
                      batch_size=B, sync_dist=True)
-            self.log("train/entropy", float(entropy.mean()), on_step=True, prog_bar=True,
+            self.log("train/entropy", entropy_acc, on_step=True, prog_bar=True,
+                     batch_size=B, sync_dist=True)
+            lr_now = self._scheduler.optimizer.param_groups[0]["lr"]
+            self.log("train/lr", lr_now, on_step=True, prog_bar=False,
                      batch_size=B, sync_dist=True)
         except Exception:
             pass
