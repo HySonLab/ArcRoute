@@ -22,90 +22,81 @@ from utils.ops import batchify, unbatchify
 from .base import BaseRL
 
 
-def centered_lex_rank(T):
-    """CPU reference: centered lex-rank advantage for ONE group of K solutions.
+def centered_lex_rank(T, gamma=0.5):
+    """CPU reference: hierarchical centered midrank advantage for ONE group.
 
-    T   : (K, P) array — T-vectors, LOWER is better.
+    T     : (K, P) array — T-vectors, LOWER is better.
+    gamma : priority decay (default 0.5 → level-p weight ∝ 0.5^(p-1)).
     Returns (K,) float32 in [-1, +1], mean==0.
-    Used as ground-truth in unit tests; training uses centered_lex_rank_gpu.
+    Used as ground-truth in unit tests; training uses centered_hier_rank_gpu.
     """
     T = np.asarray(T, dtype=np.float64)
-    K = T.shape[0]
+    K, P = T.shape
     if K < 2:
         return np.zeros(K, dtype=np.float32)
-    order = np.lexsort(T[:, ::-1].T)
-    pos = np.arange(K - 1, -1, -1, dtype=np.float64)
-    Ts = T[order]
-    rank_sorted = pos.copy()
-    i = 0
-    while i < K:
-        j = i + 1
-        while j < K and np.array_equal(Ts[j], Ts[i]):
-            j += 1
-        if j - i > 1:
-            rank_sorted[i:j] = pos[i:j].mean()
-        i = j
-    rank = np.empty(K, dtype=np.float64)
-    rank[order] = rank_sorted
-    return ((rank - (K - 1) / 2.0) / ((K - 1) / 2.0)).astype(np.float32)
+    w = np.array([gamma ** p for p in range(P)], dtype=np.float64)
+    w /= w.sum()
+    adv = np.zeros(K, dtype=np.float64)
+    for p in range(P):
+        col = T[:, p]
+        order = np.argsort(col, kind='stable')   # ascending: idx of lowest value first
+        rank_sorted = np.arange(K, dtype=np.float64)  # position 0=lowest(best)
+        i = 0
+        while i < K:
+            j = i + 1
+            while j < K and col[order[j]] == col[order[i]]:
+                j += 1
+            if j > i + 1:
+                rank_sorted[i:j] = rank_sorted[i:j].mean()
+            i = j
+        rank = np.empty(K, dtype=np.float64)
+        rank[order] = rank_sorted
+        adv += w[p] * (1.0 - 2.0 * rank / (K - 1))   # +1=best, -1=worst
+    return adv.astype(np.float32)
 
 # Lexicographic separation constant for the val/lex_best model-selection scalar
 # (T_1 weight = _LEX_C^2, T_2 = _LEX_C, T_3 = 1). Must dominate the T_2/T_3 range.
 _LEX_C = 1.0e3
 
 
-def centered_lex_rank_gpu(T):
-    """Centered lexicographic rank advantage entirely on GPU.
+def _centered_midrank(x):
+    """x: (N, K) float32 — returns centered midrank in [-1, +1]; lower value = higher rank.
+    Exactly zero-mean per row (midrank tie-averaging preserves the rank sum).
+    """
+    N, K = x.shape
+    srt, order = x.sort(dim=1)                                    # ascending
+    pos = torch.arange(K, device=x.device, dtype=x.dtype).expand(N, K)
+    change = torch.ones(N, K, dtype=torch.bool, device=x.device)
+    change[:, 1:] = srt[:, 1:] != srt[:, :-1]
+    run_id = change.cumsum(dim=1) - 1                             # tie-run index
+    run_sum = torch.zeros(N, K, dtype=x.dtype, device=x.device)
+    run_cnt = torch.zeros(N, K, dtype=x.dtype, device=x.device)
+    run_sum.scatter_add_(1, run_id, pos)
+    run_cnt.scatter_add_(1, run_id, torch.ones_like(pos))
+    mid_sorted = (run_sum / run_cnt.clamp(min=1)).gather(1, run_id)
+    rank = torch.empty_like(mid_sorted)
+    rank.scatter_(1, order, mid_sorted)                           # 0=best .. K-1=worst
+    return 1.0 - 2.0 * rank / (K - 1)                            # +1=best, -1=worst
 
-    T   : (B, K, P) float32 tensor — T-vectors, LOWER is better.
-    Returns (B, K) float32 advantage in [-1, +1], mean==0 per group.
 
-    Lexsort via P successive stable argsorts (least-significant column first).
-    Tie averaging: runs of identical sorted rows share the mean position.
-    Rare tied groups fall back to a tiny CPU loop over only those rows.
+def centered_hier_rank_gpu(T, gamma=0.5):
+    """Hierarchical soft-lexicographic rank advantage, fully on GPU.
+
+    T : (B, K, P) float32 — T-vectors, LOWER is better.
+    Returns (B, K) float32 in [-1, +1], exactly zero-mean per group.
+
+    A_i = sum_p gamma^(p-1) * r_{p,i} / sum_p gamma^(p-1)
+    where r_p = centered midrank of T[...,p] within the group (independent per level).
+    Adjacent priority levels trade off at a fixed 1/gamma gradient ratio, K-independent.
+    Scales to any P without re-tuning: gradient share of level p = gamma^(p-1)/sum(gamma^q).
     """
     B, K, P = T.shape
-    dev = T.device
     if K < 2:
-        return torch.zeros(B, K, device=dev)
-
-    # --- lexsort: P stable argsorts, least-significant first ---
-    order = torch.arange(K, device=dev).unsqueeze(0).expand(B, -1).clone()  # (B, K)
-    idx3 = order.unsqueeze(-1).expand(B, K, P)
-    for p in range(P - 1, -1, -1):
-        col = T.gather(1, idx3)[:, :, p]                    # (B, K) current column
-        order = order.gather(1, col.argsort(dim=1, stable=True))
-        idx3 = order.unsqueeze(-1).expand(B, K, P)
-
-    # --- positions: best (rank 0) → K-1, worst → 0 ---
-    pos = torch.arange(K - 1, -1, -1, dtype=T.dtype, device=dev)  # (K,)
-    rank_sorted = pos.unsqueeze(0).expand(B, K).clone()             # (B, K)
-
-    # --- tie averaging ---
-    Ts = T.gather(1, idx3)                                  # (B, K, P) sorted
-    eq = (Ts[:, 1:] == Ts[:, :-1]).all(dim=2)              # (B, K-1) bool
-    if eq.any():
-        # Only process groups that actually have ties (rare path).
-        has_tie = eq.any(dim=1)                             # (B,) bool
-        tied_bs = has_tie.nonzero(as_tuple=True)[0].tolist()
-        rs = rank_sorted.cpu().numpy()
-        eq_np = eq.cpu().numpy()
-        pos_np = pos.cpu().numpy()
-        for b in tied_bs:
-            i = 0
-            while i < K:
-                j = i + 1
-                while j < K and eq_np[b, j - 1]:
-                    j += 1
-                if j - i > 1:
-                    rs[b, i:j] = pos_np[i:j].mean()
-                i = j
-        rank_sorted = torch.from_numpy(rs).to(dev)
-
-    # --- scatter back and normalise ---
-    rank = torch.empty(B, K, dtype=T.dtype, device=dev)
-    rank.scatter_(1, order, rank_sorted)
-    return (rank - (K - 1) / 2.0) / ((K - 1) / 2.0)      # [-1, +1], mean==0
+        return torch.zeros(B, K, device=T.device, dtype=T.dtype)
+    # Compute midrank for each level independently: reshape (B,K,P) -> (B*P, K)
+    r = _centered_midrank(T.permute(0, 2, 1).reshape(B * P, K)).view(B, P, K)
+    w = gamma ** torch.arange(P, device=T.device, dtype=T.dtype)
+    return torch.einsum('p,bpk->bk', w / w.sum(), r)
 
 
 
@@ -126,6 +117,7 @@ class GRPO(BaseRL):
         entropy_lambda: float = 0.02,
         mini_batch_size: int = 256,
         batch_size: int = 1024,
+        adv_gamma: float = 0.5,
         metrics: dict = None,
         log_on_step: bool = True,
         train_buckets: list = None,
@@ -147,6 +139,7 @@ class GRPO(BaseRL):
         self.max_grad_norm = max_grad_norm
         self.entropy_lambda = entropy_lambda
         self.mini_batch_size = mini_batch_size
+        self.adv_gamma = adv_gamma
 
     def configure_optimizers(self):
         import math
@@ -164,8 +157,8 @@ class GRPO(BaseRL):
         return opt
 
     def _group_advantage(self, T_bk3):
-        """(B, K, P) T-vectors on GPU -> (B, K) centered lex-rank advantage on GPU."""
-        return centered_lex_rank_gpu(T_bk3.detach())
+        """(B, K, P) T-vectors on GPU -> (B, K) hierarchical rank advantage on GPU."""
+        return centered_hier_rank_gpu(T_bk3.detach(), gamma=self.adv_gamma)
 
     def shared_step(self, batch, batch_idx, phase, dataloader_idx=None):
         if phase == "train":

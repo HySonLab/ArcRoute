@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from utils.ops import batchify, unbatchify
-from trainers.grpo import GRPO, centered_lex_rank, centered_lex_rank_gpu
+from trainers.grpo import GRPO, centered_lex_rank, centered_hier_rank_gpu
 
 
 def _make_env(reward_mode="vector", M=3, n=15):
@@ -58,16 +58,7 @@ def _fit_one_step(model, tag, n=15):
 
 
 class TestRankFunction(unittest.TestCase):
-    def test_hand_example(self):
-        """⭐ [[5,9,9],[5,2,9],[5,2,1],[7,0,0]] (K=4): best lex is [5,2,1] (idx 2)
-        -> adv=+1; worst is [7,0,0] (idx 3) -> adv=-1; mean == 0."""
-        T = np.array([[5, 9, 9], [5, 2, 9], [5, 2, 1], [7, 0, 0]], dtype=float)
-        adv = centered_lex_rank(T)
-        self.assertEqual(int(np.argmax(adv)), 2)              # [5,2,1] best
-        self.assertEqual(int(np.argmin(adv)), 3)              # [7,0,0] worst
-        self.assertAlmostEqual(float(adv[2]),  1.0, places=6) # best → +1
-        self.assertAlmostEqual(float(adv[3]), -1.0, places=6) # worst → -1
-        self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
+    """Tests for centered_lex_rank — hierarchical soft-lex CPU reference (gamma=0.5)."""
 
     def test_k1_is_zero(self):
         self.assertTrue(np.allclose(centered_lex_rank(np.array([[1, 2, 3]])), 0.0))
@@ -84,37 +75,74 @@ class TestRankFunction(unittest.TestCase):
             self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
     def test_all_tied_is_zero(self):
-        """⭐ Whole group identical -> all solutions equally good -> ZERO advantage
-        (no spurious gradient; the DAPO zero-variance case, common once T_1 saturates)."""
+        """⭐ Whole group identical -> ZERO advantage (DAPO zero-variance case)."""
         for K in (2, 5, 8):
             T = np.tile(np.array([5.0, 2.0, 1.0]), (K, 1))
             adv = centered_lex_rank(T)
             self.assertTrue(np.allclose(adv, 0.0), f"K={K}: {adv}")
 
-    def test_tied_share_average_advantage(self):
-        """⭐ Tied T-vectors get the SAME advantage (average rank), not arbitrary
-        lexsort-order ranks. Here idx 1 & 2 tie -> equal adv; unique best/worst
-        keep +1/-1; mean stays 0."""
-        T = np.array([[5, 2, 9],      # middle
-                      [5, 1, 1],      # tied-best with idx 2
-                      [5, 1, 1],      # tied-best with idx 1
-                      [7, 0, 0]],     # worst (T1=7 > all others)
-                     dtype=float)
+    def test_t1_dominates(self):
+        """⭐ T1 has the largest gradient weight: a unit T1 rank shift moves advantage
+        more than a unit T2 or T3 rank shift (gamma=0.5 → weights 4:2:1)."""
+        # All same T2/T3; only T1 differs → T1 rank is the only signal.
+        T = np.array([[3, 5, 5], [4, 5, 5], [5, 5, 5], [6, 5, 5]], dtype=float)
         adv = centered_lex_rank(T)
-        self.assertAlmostEqual(float(adv[1]), float(adv[2]), places=6)  # ties equal
-        self.assertGreater(float(adv[1]), float(adv[0]))                # tied-best > middle
-        self.assertAlmostEqual(float(adv[3]), -1.0, places=6)           # unique worst → -1
+        # Lower T1 → higher advantage, strictly monotone.
+        self.assertTrue(adv[0] > adv[1] > adv[2] > adv[3])
+        self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
+        # T1 gradient weight > T3 gradient weight: perturbing T1 moves advantage more.
+        T2 = np.array([[5, 3, 5], [5, 4, 5], [5, 5, 5], [5, 6, 5]], dtype=float)
+        T3 = np.array([[5, 5, 3], [5, 5, 4], [5, 5, 5], [5, 5, 6]], dtype=float)
+        adv_t1 = centered_lex_rank(T)
+        adv_t2 = centered_lex_rank(T2)
+        adv_t3 = centered_lex_rank(T3)
+        spread_t1 = float(adv_t1.max() - adv_t1.min())
+        spread_t2 = float(adv_t2.max() - adv_t2.min())
+        spread_t3 = float(adv_t3.max() - adv_t3.min())
+        self.assertGreater(spread_t1, spread_t2)
+        self.assertGreater(spread_t2, spread_t3)
+
+    def test_t2_signal_within_tied_t1(self):
+        """⭐ When T1 is all tied, T2 drives the advantage ordering."""
+        T = np.array([[5, 1, 9], [5, 2, 9], [5, 3, 9], [5, 4, 9]], dtype=float)
+        adv = centered_lex_rank(T)
+        # Lower T2 → higher advantage (all T1 tied, T3 tied)
+        self.assertTrue(adv[0] > adv[1] > adv[2] > adv[3])
         self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
-    def test_general_P(self):
-        """⭐ Works for P != 3 (P inferred from T width; T_1 still primary)."""
-        # P=4: [5,2,1,0] is best lex (lowest T_1, then T_2,...); [7,..] worst (T_1=7).
-        T = np.array([[5, 9, 9, 9], [5, 2, 9, 1], [5, 2, 1, 0], [7, 0, 0, 0]], dtype=float)
+    def test_t3_signal_within_tied_t1_t2(self):
+        """⭐ When T1 and T2 are all tied, T3 drives the advantage ordering."""
+        T = np.array([[5, 2, 1], [5, 2, 2], [5, 2, 3], [5, 2, 4]], dtype=float)
         adv = centered_lex_rank(T)
-        self.assertEqual(int(np.argmax(adv)), 2)
-        self.assertEqual(int(np.argmin(adv)), 3)
+        self.assertTrue(adv[0] > adv[1] > adv[2] > adv[3])
         self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
-        # random P in 2..6: finite, bounded, zero-mean
+
+    def test_tied_same_advantage(self):
+        """⭐ Identical T-vectors get the SAME advantage (midrank averaging)."""
+        T = np.array([[5, 1, 1], [5, 1, 1], [5, 2, 9], [7, 0, 0]], dtype=float)
+        adv = centered_lex_rank(T)
+        self.assertAlmostEqual(float(adv[0]), float(adv[1]), places=6)  # tied → equal
+        self.assertGreater(float(adv[0]), float(adv[2]))                 # better T2 wins
+        self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
+
+    def test_gradient_weight_ratio(self):
+        """⭐ gamma=0.5: T1 gradient share ~57%, T2 ~29%, T3 ~14% for P=3.
+        Verified by comparing advantage from T1-only vs T3-only perturbations."""
+        rng = np.random.default_rng(42)
+        # Base: K solutions with all levels spread
+        K, P = 20, 3
+        T_base = rng.random((K, P)) * 10
+        adv_base = centered_lex_rank(T_base).astype(np.float64)
+        # Perturb T1 vs T3 by the same delta → T1 perturbation changes advantage more
+        delta = 0.1
+        T_p1 = T_base.copy(); T_p1[:, 0] += delta * rng.standard_normal(K)
+        T_p3 = T_base.copy(); T_p3[:, 2] += delta * rng.standard_normal(K)
+        change_t1 = np.abs(centered_lex_rank(T_p1).astype(np.float64) - adv_base).mean()
+        change_t3 = np.abs(centered_lex_rank(T_p3).astype(np.float64) - adv_base).mean()
+        self.assertGreater(change_t1, change_t3)  # T1 moves advantage more than T3
+
+    def test_general_P(self):
+        """⭐ Works for any P: finite, bounded, zero-mean; T1 still primary."""
         rng = np.random.default_rng(2)
         for _ in range(30):
             K = int(rng.integers(2, 9))
@@ -124,53 +152,40 @@ class TestRankFunction(unittest.TestCase):
             self.assertLessEqual(np.abs(adv).max(), 1.0 + 1e-9)
             self.assertAlmostEqual(float(adv.mean()), 0.0, places=6)
 
-    def test_no_ties_matches_integer_rank(self):
-        """⭐ With no ties the result is byte-identical to the plain integer-rank
-        formula (the validated core behaviour must not change)."""
-        rng = np.random.default_rng(1)
-        for _ in range(30):
-            K = int(rng.integers(2, 10))
-            T = rng.random((K, 3)) * 1000  # large spread → no accidental ties
-            order = np.lexsort((T[:, 2], T[:, 1], T[:, 0]))
-            rank = np.empty(K)
-            rank[order] = np.arange(K - 1, -1, -1)
-            expected = ((rank - (K - 1) / 2.0) / ((K - 1) / 2.0)).astype(np.float32)
-            self.assertTrue(np.array_equal(centered_lex_rank(T), expected))
-
 
 class TestGPURankMatchesCPU(unittest.TestCase):
-    """⭐ centered_lex_rank_gpu must exactly match the CPU reference on all cases."""
+    """⭐ centered_hier_rank_gpu must exactly match the CPU reference on all cases."""
 
     def _cpu_batch(self, T_np):
         """Run CPU reference for each row and stack -> (B, K) float32."""
         return np.stack([centered_lex_rank(T_np[b]) for b in range(T_np.shape[0])])
 
     def test_no_ties(self):
-        """Random T with large spread -> no ties; GPU must match CPU exactly."""
+        """Random T with large spread -> no ties; GPU must match CPU."""
         rng = np.random.default_rng(42)
         T_np = rng.random((16, 8, 3)).astype(np.float32) * 1000
         T_gpu = torch.from_numpy(T_np)
-        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        gpu_out = centered_hier_rank_gpu(T_gpu).numpy()
         cpu_out = self._cpu_batch(T_np.astype(np.float64))
         np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-5,
-                                   err_msg="GPU lex rank diverges from CPU (no-tie case)")
+                                   err_msg="GPU hier rank diverges from CPU (no-tie case)")
 
     def test_with_ties(self):
         """Intentional ties: identical rows in some groups. Tie-averaging must match."""
         T_np = np.array([
-            [[5., 2., 9.], [5., 1., 1.], [5., 1., 1.], [7., 0., 0.]],
+            [[5., 1., 1.], [5., 1., 1.], [5., 2., 9.], [7., 0., 0.]],
             [[1., 0., 0.], [1., 0., 0.], [2., 0., 0.], [3., 0., 0.]],
         ], dtype=np.float32)
         T_gpu = torch.from_numpy(T_np)
-        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        gpu_out = centered_hier_rank_gpu(T_gpu).numpy()
         cpu_out = self._cpu_batch(T_np.astype(np.float64))
         np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-5,
-                                   err_msg="GPU lex rank diverges from CPU (tie case)")
+                                   err_msg="GPU hier rank diverges from CPU (tie case)")
 
     def test_all_tied(self):
-        """Whole group tied -> all zeros on GPU (same as CPU reference)."""
+        """Whole group tied -> all zeros on GPU."""
         T_np = np.tile(np.array([3., 1., 2.]), (4, 8, 1)).astype(np.float32)
-        gpu_out = centered_lex_rank_gpu(torch.from_numpy(T_np)).numpy()
+        gpu_out = centered_hier_rank_gpu(torch.from_numpy(T_np)).numpy()
         np.testing.assert_allclose(gpu_out, 0.0, atol=1e-6)
 
     def test_large_random(self):
@@ -178,7 +193,7 @@ class TestGPURankMatchesCPU(unittest.TestCase):
         rng = np.random.default_rng(7)
         T_np = rng.random((64, 32, 3)).astype(np.float32)
         T_gpu = torch.from_numpy(T_np)
-        gpu_out = centered_lex_rank_gpu(T_gpu).numpy()
+        gpu_out = centered_hier_rank_gpu(T_gpu).numpy()
         cpu_out = self._cpu_batch(T_np.astype(np.float64))
         self.assertTrue(np.isfinite(gpu_out).all())
         self.assertLessEqual(float(np.abs(gpu_out).max()), 1.0 + 1e-5)
@@ -189,8 +204,18 @@ class TestGPURankMatchesCPU(unittest.TestCase):
     def test_k1_group(self):
         """K=1 -> all zeros (no ranking possible)."""
         T = torch.rand(5, 1, 3)
-        out = centered_lex_rank_gpu(T).numpy()
+        out = centered_hier_rank_gpu(T).numpy()
         np.testing.assert_allclose(out, 0.0, atol=1e-9)
+
+    def test_general_P_gpu(self):
+        """GPU handles arbitrary P correctly."""
+        rng = np.random.default_rng(5)
+        for P in (2, 4, 5):
+            T_np = rng.random((8, 16, P)).astype(np.float32)
+            gpu_out = centered_hier_rank_gpu(torch.from_numpy(T_np)).numpy()
+            cpu_out = self._cpu_batch(T_np.astype(np.float64))
+            np.testing.assert_allclose(gpu_out, cpu_out, atol=1e-4,
+                                       err_msg=f"P={P}: GPU/CPU mismatch")
 
 
 class TestBatchifyLayout(unittest.TestCase):
