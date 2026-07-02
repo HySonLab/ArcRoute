@@ -20,7 +20,7 @@ from time import time
 import numpy as np
 
 from solvers.meta import EAHCARP
-from utils.ops import check_feasibility, gen_tours, print_route_log, save_sol
+from utils.ops import check_feasibility, gen_tours, iter_instances, print_route_log, save_sol
 
 
 def parse_args():
@@ -81,6 +81,8 @@ if __name__ == "__main__":
         files = sorted(glob(args.path + '/*/*.npz'))
         solver = EAHCARP(n_population=args.n_population)
         for f in files:
-            solver.import_instance(f, M=args.M)
-            t1 = time()
-            print(f, ':::', solver(n_epoch=args.n_epoch, variant=args.variant), ':::', time() - t1)
+            for i, data in enumerate(iter_instances(f, M=args.M)):
+                solver._load_data(*data)
+                label = f if i == 0 else f"{f}[{i}]"
+                t1 = time()
+                print(label, ':::', solver(n_epoch=args.n_epoch, variant=args.variant), ':::', time() - t1)

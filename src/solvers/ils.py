@@ -20,7 +20,7 @@ from time import time
 import numpy as np
 
 from solvers.meta import ILSHCARP
-from utils.ops import check_feasibility, gen_tours, print_route_log, save_sol
+from utils.ops import check_feasibility, gen_tours, iter_instances, print_route_log, save_sol
 
 
 def parse_args():
@@ -84,9 +84,11 @@ if __name__ == "__main__":
         files = sorted(glob(args.path + '/*/*.npz'))
         solver = ILSHCARP(strength=args.strength, accept_mode=args.accept_mode)
         for f in files:
-            solver.import_instance(f, M=args.M)
-            t1 = time()
-            print(f, ':::',
-                  solver(max_iter=args.max_iter, variant=args.variant,
-                         num_init_sample=args.num_init_sample, seed=args.seed),
-                  ':::', time() - t1)
+            for i, data in enumerate(iter_instances(f, M=args.M)):
+                solver._load_data(*data)
+                label = f if i == 0 else f"{f}[{i}]"
+                t1 = time()
+                print(label, ':::',
+                      solver(max_iter=args.max_iter, variant=args.variant,
+                             num_init_sample=args.num_init_sample, seed=args.seed),
+                      ':::', time() - t1)

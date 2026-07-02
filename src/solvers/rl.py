@@ -22,7 +22,7 @@ from time import time
 import numpy as np
 import torch
 
-from utils.ops import batchify, gen_tours, import_instance, print_route_log, save_sol
+from utils.ops import batchify, gen_tours, import_instance, iter_instances, print_route_log, save_sol
 
 
 class RLHCARP:
@@ -45,9 +45,8 @@ class RLHCARP:
         self.policy = policy.to(device).eval()
         self.env = CARPEnv(variant=variant, reward_mode="vector")
 
-    def import_instance(self, f, M=None):
-        dms, P, veh, demands, clss, s, d, _ = import_instance(f, M=M)
-        M_val = M if M is not None else len(veh)
+    def _load_data(self, dms, P, veh, demands, clss, s, d, edge_indxs):
+        M_val = len(veh)
         td = self._TensorDict(
             {
                 "clss":            torch.tensor(clss[None, :], dtype=torch.int64),
@@ -60,6 +59,9 @@ class RLHCARP:
             batch_size=[1],
         )
         self.td = self.env.reset(td).to(self.device)
+
+    def import_instance(self, f, M=None):
+        self._load_data(*next(iter_instances(f, M=M)))
 
     def __call__(self, num_sample=100):
         td = batchify(self.td, num_sample)
@@ -189,6 +191,8 @@ if __name__ == "__main__":
         files = sorted(glob(args.path + '/*/*.npz'))
         al = RLHCARP(ckpt_path, args.variant)
         for f in files:
-            al.import_instance(f, M=args.M)
-            t1 = time()
-            print(f, ':::', al(num_sample=args.num_sample), ':::', time() - t1)
+            for i, data in enumerate(iter_instances(f, M=args.M)):
+                al._load_data(*data)
+                label = f if i == 0 else f"{f}[{i}]"
+                t1 = time()
+                print(label, ':::', al(num_sample=args.num_sample), ':::', time() - t1)

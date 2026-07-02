@@ -117,25 +117,34 @@ def dist_edges(dms, n1, n2):
 
 def dist_edges_from_file(es):
     if isinstance(es, str):
-        es = np.load(es)
-    es_cat = np.concatenate([es['req'], es['nonreq']], axis=0)
+        es = np.load(es, allow_pickle=True)
+    req = np.array(es['req'], dtype=np.float32)
+    nonreq = np.array(es['nonreq'], dtype=np.float32)
+    # Object-array wrapping a 2-D array (from batch NPZ slice)
+    if req.ndim == 1:
+        req = np.array(req.tolist(), dtype=np.float32)
+    if nonreq.ndim == 1:
+        nonreq = np.array(nonreq.tolist(), dtype=np.float32)
+    es_cat = np.concatenate([req, nonreq], axis=0)
     adj = convert_adjacency_matrix(es_cat[:, 0], es_cat[:, 1], es_cat[:, -1])
     dms = floyd_warshall(adj)
-    dms = dist_edges(dms, es['req'][:, 0], es['req'][:, 1])
+    dms = dist_edges(dms, req[:, 0], req[:, 1])
     return dms
 
 def import_instance(es, M=None):
     # C is generated as Σq/M_nominal + 0.5 (M-dependent). Pass M to override
     # the nominal fleet stored in the .npz at eval time; None uses the stored default.
     if isinstance(es, str):
-        es = np.load(es)
-    C = es['C']
-    P = [i for i in range(1, es['P']+1)]
-    n_vehicle = int(es['M']) if M is None else int(M)
+        es = np.load(es, allow_pickle=True)
+    C = float(np.atleast_1d(es['C'])[0]) if np.ndim(es['C']) >= 1 else float(es['C'])
+    P = [i for i in range(1, int(es['P'])+1)]
+    n_vehicle = int(np.atleast_1d(es['M'])[0]) if M is None else int(M)
     M = [i for i in range(n_vehicle)]
     dms = dist_edges_from_file(es)
-    
-    es_req = es['req']
+
+    es_req = np.array(es['req'], dtype=np.float32)
+    if es_req.ndim == 1:  # object array wrapping a 2-D array
+        es_req = np.array(es_req.tolist(), dtype=np.float32)
     es_req = np.vstack([[0]*6, es_req])
     edge_indxs = np.int32(es_req[:, :2])
     demands = np.float32(es_req[:, 2]) / C
@@ -143,6 +152,30 @@ def import_instance(es, M=None):
     s = np.float32(es_req[:, 4])
     d = np.float32(es_req[:, 5])
     return dms, P, M, demands, clss, s, d, edge_indxs
+
+
+def iter_instances(path, M=None):
+    """Yield import_instance results for every instance in path.
+
+    Handles two NPZ formats transparently:
+    - Single-instance (bm5 style): C is a scalar  → yields once.
+    - Batch (osm_test/train style): C is a 1-D array → yields N times.
+    """
+    es = np.load(path, allow_pickle=True) if isinstance(path, str) else path
+    C = es['C']
+    if np.ndim(C) >= 1 and C.shape[0] > 1:
+        # Batch: build per-instance dicts and delegate to import_instance
+        for i in range(len(C)):
+            req_i = np.array(es['req'][i], dtype=np.float32)
+            nonreq_i = np.array(es['nonreq'][i], dtype=np.float32)
+            inst = {
+                'req': req_i, 'nonreq': nonreq_i,
+                'C': float(C[i]), 'M': int(es['M'][i]),
+                'P': int(req_i[:, 3].max()),
+            }
+            yield import_instance(inst, M=M)
+    else:
+        yield import_instance(es, M=M)
 
 def run_parallel2(func, items, **kwargs):
     """Map func(item, **kwargs) over items, return list of results."""

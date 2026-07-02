@@ -20,7 +20,7 @@ from time import time
 import numpy as np
 
 from solvers.meta import ACOHCARP
-from utils.ops import check_feasibility, gen_tours, print_route_log, save_sol
+from utils.ops import check_feasibility, gen_tours, iter_instances, print_route_log, save_sol
 
 
 def parse_args():
@@ -85,7 +85,9 @@ if __name__ == "__main__":
         files = sorted(glob(args.path + '/*/*.npz'))
         solver = ACOHCARP(n_ant=args.n_ant)
         for f in files:
-            solver.import_instance(f, M=args.M)
-            t1 = time()
-            print(f, ':::', solver(n_epoch=args.n_epoch, variant=args.variant,
-                                   is_local_search=args.is_local_search), ':::', time() - t1)
+            for i, data in enumerate(iter_instances(f, M=args.M)):
+                solver._load_data(*data)
+                label = f if i == 0 else f"{f}[{i}]"
+                t1 = time()
+                print(label, ':::', solver(n_epoch=args.n_epoch, variant=args.variant,
+                                           is_local_search=args.is_local_search), ':::', time() - t1)

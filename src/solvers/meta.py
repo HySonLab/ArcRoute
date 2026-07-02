@@ -14,8 +14,7 @@ class BaseHCARP:
     def __init__(self):
         self.has_instance = False
 
-    def import_instance(self, f, M=None):
-        dms, P, M, demands, clss, s, d, edge_indxs = import_instance(f, M=M)
+    def _load_data(self, dms, P, M, demands, clss, s, d, edge_indxs):
         self.dms, self.P, self.M = dms, P, M
         self.demands, self.clss, self.s, self.d = demands, clss, s, d
         self.edge_indxs = edge_indxs
@@ -23,7 +22,6 @@ class BaseHCARP:
         self.nv = len(M)
         self.nseq = len(self.s)
         self.max_len = self.nseq + (self.nv - 2)
-
         self.vars = {
             'adj': self.dms,
             'service_time': self.s,
@@ -31,6 +29,10 @@ class BaseHCARP:
             'demand': self.demands,
             'nv': self.nv,
         }
+
+    def import_instance(self, f, M=None):
+        from utils.ops import iter_instances
+        self._load_data(*next(iter_instances(f, M=M)))
     
     def get_idx(self, prob, size=1, strategy='sampling'):
         if strategy == 'greedy':
