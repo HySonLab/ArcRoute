@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import io
 from glob import glob
+from multiprocessing import Pool
 from time import time
 
 import numpy as np
@@ -39,7 +40,20 @@ def parse_args():
     # batch benchmark mode
     parser.add_argument('--path', default='data/5m', help='directory of .npz instances')
     parser.add_argument('--M', type=int, default=None)
+    parser.add_argument('--workers', type=int, default=None,
+                        help='parallel worker processes for batch mode (default: all cores)')
     return parser.parse_args()
+
+
+def _solve_one(task):
+    """Worker for batch-mode multiprocessing: one instance per call, own ILSHCARP."""
+    label, data, max_iter, variant, num_init_sample, strength, accept_mode, seed = task
+    solver = ILSHCARP(strength=strength, accept_mode=accept_mode)
+    solver._load_data(*data)
+    t1 = time()
+    result = solver(max_iter=max_iter, variant=variant,
+                     num_init_sample=num_init_sample, seed=seed)
+    return label, result, time() - t1
 
 
 if __name__ == "__main__":
@@ -82,13 +96,11 @@ if __name__ == "__main__":
     else:
         # ── batch benchmark mode ───────────────────────────────────────────
         files = sorted(glob(args.path + '/*/*.npz'))
-        solver = ILSHCARP(strength=args.strength, accept_mode=args.accept_mode)
-        for f in files:
-            for i, data in enumerate(iter_instances(f, M=args.M)):
-                solver._load_data(*data)
-                label = f if i == 0 else f"{f}[{i}]"
-                t1 = time()
-                print(label, ':::',
-                      solver(max_iter=args.max_iter, variant=args.variant,
-                             num_init_sample=args.num_init_sample, seed=args.seed),
-                      ':::', time() - t1)
+        tasks = [
+            (f if i == 0 else f"{f}[{i}]", data, args.max_iter, args.variant,
+             args.num_init_sample, args.strength, args.accept_mode, args.seed)
+            for f in files for i, data in enumerate(iter_instances(f, M=args.M))
+        ]
+        with Pool(processes=args.workers) as pool:
+            for label, result, dt in pool.imap(_solve_one, tasks):
+                print(label, ':::', result, ':::', dt)

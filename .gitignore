@@ -40,13 +40,6 @@ logs
 .python-version
 # Note: uv.lock is intentionally committed for reproducible installs.
 outputs/
-data/ood/
-data/osm/
-data/osm_train/
-data/osm_test/
-data/osm_val/
-data/osm_test_small/
-data/benchmark/
-data/bm5/
+data/*
 *.cache.pt
 *.data

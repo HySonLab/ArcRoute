@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import io
 from glob import glob
+from multiprocessing import Pool
 from time import time
 
 import numpy as np
@@ -38,7 +39,19 @@ def parse_args():
     # batch benchmark mode
     parser.add_argument('--path', default='data/5m', help='directory of .npz instances')
     parser.add_argument('--M', type=int, default=None)
+    parser.add_argument('--workers', type=int, default=None,
+                        help='parallel worker processes for batch mode (default: all cores)')
     return parser.parse_args()
+
+
+def _solve_one(task):
+    """Worker for batch-mode multiprocessing: one instance per call, own EAHCARP."""
+    label, data, n_population, n_epoch, variant = task
+    solver = EAHCARP(n_population=n_population)
+    solver._load_data(*data)
+    t1 = time()
+    result = solver(n_epoch=n_epoch, variant=variant)
+    return label, result, time() - t1
 
 
 if __name__ == "__main__":
@@ -79,10 +92,10 @@ if __name__ == "__main__":
     else:
         # ── batch benchmark mode ───────────────────────────────────────────
         files = sorted(glob(args.path + '/*/*.npz'))
-        solver = EAHCARP(n_population=args.n_population)
-        for f in files:
-            for i, data in enumerate(iter_instances(f, M=args.M)):
-                solver._load_data(*data)
-                label = f if i == 0 else f"{f}[{i}]"
-                t1 = time()
-                print(label, ':::', solver(n_epoch=args.n_epoch, variant=args.variant), ':::', time() - t1)
+        tasks = [
+            (f if i == 0 else f"{f}[{i}]", data, args.n_population, args.n_epoch, args.variant)
+            for f in files for i, data in enumerate(iter_instances(f, M=args.M))
+        ]
+        with Pool(processes=args.workers) as pool:
+            for label, result, dt in pool.imap(_solve_one, tasks):
+                print(label, ':::', result, ':::', dt)
