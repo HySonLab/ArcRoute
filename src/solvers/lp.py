@@ -256,10 +256,55 @@ def _configure(model, time_limit, threads, verbose):
     if not verbose:
         model.hideOutput()
     model.setParam('limits/time', time_limit)
+    # NOTE: `threads` is effectively a NO-OP. Community SCIP's branch-and-bound
+    # under model.optimize() is single-threaded; 'parallel/maxnthreads' only
+    # applies to the concurrent-solve mode (model.solveConcurrent()), which is
+    # UNUSABLE here: the concurrent sub-solvers do not inherit the Python
+    # ConnectivityHandler, silently accept sub-tour solutions, and return an
+    # infeasible "optimum" (verified empirically on data/bm5/small/inst_00).
+    # The parameter is still set so the intent is preserved should a compiled
+    # (copyable) constraint handler ever replace the Python one.
     try:
         model.setParam('parallel/maxnthreads', threads)
     except Exception:
         pass
+
+
+def _heuristic_ub(es, w, P, variant='P'):
+    """Weighted-sum objective value of a fast feasible heuristic solution.
+
+    Runs the InsertCheapest constructive heuristic (~30 ms on the bm5
+    instances) and returns sum_k w_k * T_k^heur. Any feasible schedule is an
+    upper bound on the MILP optimum (the MILP models the same physics, cf. the
+    evaluator cross-check), so the value is safe to use as an objective
+    cutoff. Returns None if the heuristic cannot be run on ``es``.
+
+    ``variant`` selects the local-search neighbourhood ('P' or 'U'); the
+    returned T is always computed by the evaluator's class-sorted P-builder
+    (``SolutionEvaluator`` default), i.e. it is the value of a *P-feasible*
+    schedule. That makes it a valid upper bound for MILP-P and, since every
+    P-feasible schedule is U-feasible (serve class-k arcs at level k, level
+    completion = last class-k arc completion), for MILP-U as well.
+
+    The global NumPy RNG state is saved/restored so callers see no side
+    effects; a fixed internal seed makes the bound reproducible.
+    """
+    try:
+        from solvers.meta import InsertCheapestHCARP
+        state = np.random.get_state()
+        try:
+            np.random.seed(0xA5C1)
+            h = InsertCheapestHCARP()
+            h.import_instance(es)
+            T = np.asarray(h(variant=variant, num_sample=20),
+                           dtype=np.float64).ravel()
+        finally:
+            np.random.set_state(state)
+        if T.shape[0] != P or not np.all(np.isfinite(T)):
+            return None
+        return float(sum(w[k] * T[k - 1] for k in range(1, P + 1)))
+    except Exception:
+        return None
 
 
 def _extract_T(model, T, P):
@@ -274,7 +319,7 @@ def _extract_T(model, T, P):
 # MILP-P (Section 3.3)
 # --------------------------------------------------------------------------- #
 def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
-                 return_model=False):
+                 return_model=False, heur_ub=True):
     G = build_graph(es)
     P, Mn, Q = G['P'], G['M'], G['Q']
     M = list(range(Mn))
@@ -295,14 +340,33 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
     model = Model('HDCARP-P')
     _configure(model, time_limit, threads, verbose)
 
+    # Objective cutoff from a fast feasible heuristic: gives SCIP a primal
+    # bound to prune against from node 1 (the default run spends ~15% of its
+    # time before finding any usable incumbent). Safe: the heuristic schedule
+    # is feasible, so the true optimum is <= its objective; the 1e-3 margin
+    # (1e-3 of one T_P unit) covers float-arithmetic differences between the
+    # heuristic evaluator and SCIP. If the cutoff ever proves too tight (no
+    # solution found), we re-solve without it below — exactness is never lost.
+    ub_obj = _heuristic_ub(es, w, P) if heur_ub else None
+    if ub_obj is not None:
+        model.setObjlimit(ub_obj + 1e-3)
+
     # --- variables -------------------------------------------------------- #
     x = {(m, a): model.addVar(f'x_{m}_{a}', vtype='B')
          for m in M for a in G['req_arcs']}
     y = {}
     for m in M:
         for k in classes:
+            # Tighter valid ub for deadhead counts: some optimal solution has
+            # every deadhead segment (between consecutive services / the level
+            # entry/exit) replaced by a shortest path, which is simple; a level
+            # with n_k serviced arcs has at most n_k + 1 such segments, so arc
+            # a is deadheaded at most n_k + 1 times in that optimum. Bounds
+            # only need to preserve one optimum, so this is exact.
+            nk_cls = len(G['req_by_class'][k])
             for a in G['A_prime']:
-                ub = 1 if (a[0] == dummy or a[1] == dummy) else len(G['nodes'])
+                ub = (1 if (a[0] == dummy or a[1] == dummy)
+                      else min(len(G['nodes']), nk_cls + 1))
                 y[(m, a, k)] = model.addVar(f'y_{m}_{a}_{k}', vtype='I',
                                             lb=0, ub=ub)
     t = {(m, 0): 0.0 for m in M}
@@ -325,10 +389,11 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
             dh = quicksum(G['cost'][a] * y[(m, a, k)] for a in G['A']
                           if G['cost'][a] > 0)
             model.addCons(t[(m, k)] == t[(m, k - 1)] + svc + dh)
-            # (5) r links service
-            nk = len(G['req_by_class'][k])
-            model.addCons(quicksum(x[(m, a)] for a in G['req_by_class'][k])
-                          <= nk * r[(m, k)])
+            # (5) r links service — disaggregated form x <= r (equivalent to
+            # sum_a x <= n_k r over binaries, but a strictly tighter LP
+            # relaxation: r >= max_a x instead of r >= avg_a x).
+            for a in G['req_by_class'][k]:
+                model.addCons(x[(m, a)] <= r[(m, k)])
             # (7) exactly one A_f arc per (m, k)
             model.addCons(quicksum(y[(m, a, k)] for a in G['A_f']) == 1)
         # (6) class 1 starts at the depot
@@ -376,7 +441,26 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
                           sepafreq=-1, propfreq=-1, eagerfreq=-1,
                           needscons=False)
 
+    # Branch on the big-M indicators r first, then on the assignments x,
+    # before the deadhead counts y. Pure search-order hint (feasible region
+    # and objective untouched); resolving the T_k >= t - beta(1-r)
+    # disjunctions early shrinks the tree by ~10x on the bm5 instances.
+    for var in r.values():
+        model.chgVarBranchPriority(var, 10)
+    for var in x.values():
+        model.chgVarBranchPriority(var, 5)
+
     model.optimize()
+    if (ub_obj is not None and model.getNSols() == 0
+            and model.getStatus() in ('infeasible', 'inforunbd')):
+        # The whole search was cut off by the objective cutoff (a heuristic
+        # bound below the model optimum would indicate a semantics mismatch)
+        # — re-solve without it so exactness can never be lost to the cutoff.
+        # Deliberately NOT triggered on 'timelimit' with no solution: that is
+        # the same outcome the cutoff-free model would report.
+        model.freeTransform()
+        model.setObjlimit(model.infinity())
+        model.optimize()
     Tvec = _extract_T(model, T, P)
     if return_model:
         return Tvec, model, {'x': x, 'y': y, 'r': r, 't': t, 'T': T, 'G': G,
@@ -388,7 +472,7 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
 # MILP-U (Section 3.4)
 # --------------------------------------------------------------------------- #
 def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
-                 return_model=False):
+                 return_model=False, heur_ub=True):
     G = build_graph(es)
     P, Mn, Q = G['P'], G['M'], G['Q']
     M = list(range(Mn))
@@ -409,6 +493,29 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
     model = Model('HDCARP-U')
     _configure(model, time_limit, threads, verbose)
 
+    # Objective cutoff from a fast feasible heuristic (same rationale as
+    # MILP-P): any feasible schedule upper-bounds the optimum, so SCIP can
+    # prune against it from node 1. The bound is the value of a P-feasible
+    # schedule, which is also U-feasible (see _heuristic_ub), so exactness is
+    # preserved; if the cutoff ever proves too tight we re-solve without it.
+    ub_obj = _heuristic_ub(es, w, P, variant='U') if heur_ub else None
+    if ub_obj is not None:
+        model.setObjlimit(ub_obj + 1e-3)
+
+    # Tighter valid ub for deadhead counts, MILP-U analog of the MILP-P
+    # n_k + 1 bound. In some optimum every deadhead stretch of a level
+    # (entry -> first service, between consecutive services, last service ->
+    # exit) is a simple shortest path, so with n services at level h an arc is
+    # deadheaded at most n + 1 times there. Unlike MILP-P a level may serve
+    # arcs of ANY class, so n is not bounded per class -- but capacity (27)
+    # bounds it: vehicle m serves at most n_cap arcs over ALL its levels,
+    # where n_cap = max #required arcs whose total demand fits in Q
+    # (smallest-demands-first count; 1e-6 slack matches SCIP's feastol).
+    # Hence y[(m,a,h)] <= n_cap + 1 in that optimum.
+    q_sorted = np.sort(np.array([G['q'][a] for a in G['req_arcs']],
+                                dtype=np.float64))
+    n_cap = int((np.cumsum(q_sorted) <= Q + 1e-6).sum()) if len(q_sorted) else 0
+
     # --- variables -------------------------------------------------------- #
     x = {(m, a, h): model.addVar(f'x_{m}_{a}_{h}', vtype='B')
          for m in M for a in G['req_arcs'] for h in levels}
@@ -416,7 +523,8 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
     for m in M:
         for h in levels:
             for a in G['A_prime']:
-                ub = 1 if (a[0] == dummy or a[1] == dummy) else len(G['nodes'])
+                ub = (1 if (a[0] == dummy or a[1] == dummy)
+                      else min(len(G['nodes']), n_cap + 1))
                 y[(m, a, h)] = model.addVar(f'y_{m}_{a}_{h}', vtype='I',
                                             lb=0, ub=ub)
     t = {(m, 0): 0.0 for m in M}
@@ -443,11 +551,12 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
             for k in classes:
                 # (19) T_k >= t_{m,h} - beta (1 - r_{m,k,h})
                 model.addCons(T[k] >= t[(m, h)] - beta * (1 - r[(m, k, h)]))
-                # (22) r links service of class k at level h
-                nk = len(G['req_by_class'][k])
-                model.addCons(
-                    quicksum(x[(m, a, h)] for a in G['req_by_class'][k])
-                    <= nk * r[(m, k, h)])
+                # (22) r links service of class k at level h — disaggregated
+                # form x <= r (equivalent to sum_a x <= n_k r over binaries,
+                # but a strictly tighter LP relaxation: r >= max_a x instead
+                # of r >= avg_a x), mirroring the MILP-P (5) disaggregation.
+                for a in G['req_by_class'][k]:
+                    model.addCons(x[(m, a, h)] <= r[(m, k, h)])
         # (23) level 1 starts at the depot
         model.addCons(y[(m, (dummy, depot), 1)] == 1)
         # (25) link level entry to previous-level exit.
@@ -490,6 +599,31 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
     for a in G['req_arcs']:
         model.addCons(quicksum(x[(m, a, h)] for m in M for h in levels) == 1)
 
+    # --- valid strengthening (no optimum lost) ------------------------------ #
+    n_req = len(G['req_arcs'])
+    for m in M:
+        # Capacity-cardinality cut: n_cap is the max number of required arcs
+        # whose total demand fits in Q (greedy smallest-first), so any
+        # capacity-feasible service set of vehicle m has <= n_cap arcs.
+        # Implied by (27) + integrality but NOT by the LP relaxation.
+        model.addCons(quicksum(x[(m, a, h)] for a in G['req_arcs']
+                               for h in levels) <= n_cap)
+        # Level-compaction symmetry break: an x-empty level h with a non-empty
+        # level h+1 is a pure symmetry — (i) any repositioning deadheads of the
+        # empty level can be prepended to level h+1's walk and its spurious
+        # r's dropped (all charged completion times unchanged or relaxed),
+        # then (ii) level h+1's entire content (x, y, r) shifts down into
+        # level h: t_{m,h}^new = t_{m,h+1}^old and every T_k charge keeps its
+        # numeric value, so the objective is identical. Hence some optimum
+        # has each vehicle's service-carrying levels forming a prefix, and
+        # forcing "level h empty => level h+1 empty" loses no optimum while
+        # collapsing the P-fold level-shift symmetry of the search tree.
+        for h in levels[:-1]:
+            model.addCons(
+                quicksum(x[(m, a, h + 1)] for a in G['req_arcs'])
+                <= min(n_req, n_cap)
+                * quicksum(x[(m, a, h)] for a in G['req_arcs']))
+
     # --- lazy connectivity ------------------------------------------------ #
     req_by_level = {h: list(G['req_arcs']) for h in levels}
     x_lvl = {(m, h, a): x[(m, a, h)]
@@ -504,7 +638,25 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
                           sepafreq=-1, propfreq=-1, eagerfreq=-1,
                           needscons=False)
 
+    # NOTE: deliberately NO r/x branch-priority hints here, unlike MILP-P.
+    # Measured on bm5/small/inst_01 (600 s, identical model otherwise):
+    # with r>x priorities the gap stalls at 27% and SCIP finds no incumbent
+    # on some instances; with SCIP's default (reliability pseudocost)
+    # branching the gap is 0.15%. In MILP-U the r[m,k,h] indicators are a
+    # P x P matrix per vehicle whose values are mostly implied by x, so
+    # forcing them to the top of the tree wastes the search.
+
     model.optimize()
+    if (ub_obj is not None and model.getNSols() == 0
+            and model.getStatus() in ('infeasible', 'inforunbd')):
+        # The whole search was cut off by the objective cutoff (a heuristic
+        # bound below the model optimum would indicate a semantics mismatch)
+        # — re-solve without it so exactness can never be lost to the cutoff.
+        # Deliberately NOT triggered on 'timelimit' with no solution: that is
+        # the same outcome the cutoff-free model would report.
+        model.freeTransform()
+        model.setObjlimit(model.infinity())
+        model.optimize()
     Tvec = _extract_T(model, T, P)
     if return_model:
         return Tvec, model, {'x': x, 'y': y, 'r': r, 't': t, 'T': T, 'G': G,

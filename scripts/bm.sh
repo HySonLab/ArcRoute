@@ -35,7 +35,9 @@
 #
 #   LP
 #     TIME_LIMIT   seconds per instance  (default: 3600)
-#     THREADS      SCIP threads          (default: 8)
+#     THREADS      SCIP threads          (default: 8) — currently a NO-OP:
+#                  community SCIP branch-and-bound is single-threaded; see
+#                  the note in src/solvers/lp.py::_configure.
 #
 #   RL
 #     CKPT        checkpoint .ckpt file  (required for rl)
