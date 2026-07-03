@@ -8,8 +8,9 @@ from unittest import mock
 import numpy as np
 import torch
 
-from utils.ops import batchify, unbatchify
-from trainers.grpo import GRPO, centered_lex_rank, centered_hier_rank_gpu
+from utils.ops import batchify, unbatchify, centered_lex_rank
+from trainers.grpo import (GRPO, _centered_midrank,
+                           centered_hier_rank_by_phase, centered_hier_rank_gpu)
 
 
 def _make_env(reward_mode="vector", M=3, n=15):
@@ -408,6 +409,116 @@ class TestDynamicGroupFiltering(unittest.TestCase):
         self.assertLessEqual(out["train/skipped_frac"], 1.0)
 
 
+class TestPhaseMaskedAdvantage(unittest.TestCase):
+    """⭐ Causal phase-masked advantage (docs/grpo.md §7.2): a step taken in phase p
+    gets sum_{q>=p} w_q r_q renormalized over q>=p only."""
+
+    def test_phase1_identical_to_combined(self):
+        """⭐ MAIN INVARIANT: phase-1 row is numerically identical to the classic
+        combined advantage — the fix cannot directly change the T1 gradient."""
+        torch.manual_seed(1)
+        for B, K, P in ((4, 8, 3), (2, 16, 4), (6, 5, 2)):
+            T = torch.rand(B, K, P)
+            by_phase = centered_hier_rank_by_phase(T)          # (B, P, K)
+            combined = centered_hier_rank_gpu(T)               # (B, K)
+            self.assertEqual(tuple(by_phase.shape), (B, P, K))
+            self.assertTrue(torch.equal(by_phase[:, 0, :], combined))
+
+    def test_last_phase_is_pure_last_rank(self):
+        """Phase-P row = r_P alone (weight renormalizes to 1.0, others to 0)."""
+        torch.manual_seed(2)
+        T = torch.rand(3, 6, 3)
+        by_phase = centered_hier_rank_by_phase(T)
+        r_last = _centered_midrank(T[..., -1])                 # (B, K)
+        self.assertTrue(torch.allclose(by_phase[:, -1, :], r_last, atol=1e-6))
+
+    def test_middle_phase_renormalized(self):
+        """P=3, phase 2: (w_2 r_2 + w_3 r_3) / (w_2 + w_3) with w_q = gamma^(q-1)."""
+        torch.manual_seed(3)
+        gamma = 0.5
+        T = torch.rand(2, 5, 3)
+        by_phase = centered_hier_rank_by_phase(T, gamma=gamma)
+        r2 = _centered_midrank(T[..., 1])
+        r3 = _centered_midrank(T[..., 2])
+        w2, w3 = gamma ** 1, gamma ** 2
+        expected = (w2 * r2 + w3 * r3) / (w2 + w3)
+        self.assertTrue(torch.allclose(by_phase[:, 1, :], expected, atol=1e-6))
+
+    def test_rows_zero_mean_bounded_finite(self):
+        """Every phase row is a convex combo of centered ranks: finite, in [-1,1],
+        zero-mean per group. K=1 -> all zeros."""
+        torch.manual_seed(4)
+        T = torch.rand(4, 8, 3)
+        by_phase = centered_hier_rank_by_phase(T)
+        self.assertTrue(torch.isfinite(by_phase).all())
+        self.assertLessEqual(by_phase.abs().max().item(), 1.0 + 1e-6)
+        self.assertTrue(torch.allclose(by_phase.mean(dim=-1),
+                                       torch.zeros(4, 3), atol=1e-6))
+        self.assertTrue(torch.equal(centered_hier_rank_by_phase(torch.rand(5, 1, 3)),
+                                    torch.zeros(5, 3, 1)))
+
+    def test_env_phase_tracked_and_stacked(self):
+        """env sets td['phase'] (min unserved class); policy stacks it per decode
+        step with the same shape as valid_mask; non-decreasing along a rollout."""
+        env, policy, td0, out = _tiny_rollout()
+        self.assertTrue((td0["phase"] == td0["clss"][..., 1:].min(-1, True).values).all())
+        ph, vm = out["phase"], out["valid_mask"]
+        self.assertEqual(tuple(ph.shape), tuple(vm.shape))
+        self.assertTrue(((ph >= 1) & (ph <= env.P)).all())
+        self.assertTrue((ph[:, 1:] >= ph[:, :-1]).all())
+
+    def test_env_phase_U_placeholder(self):
+        from env.generator import generate_dataset
+        torch.manual_seed(5)
+        env = _make_env()
+        env.variant = "U"
+        td0 = env.reset(generate_dataset(4, 15, 15, 3, num_workers=0))
+        self.assertTrue((td0["phase"] == 1).all())
+
+    def test_variant_U_loss_ignores_phase(self):
+        """⭐ U regression guard: the U training OBJECTIVE never consumes the
+        per-step phase signal — garbling outdict['phase'] (what the variant-P
+        trainer gathers phase-conditional advantages by) leaves U's loss
+        bit-identical. Note: since the bậc-3 decoder, td['phase'] is also a
+        decoder *input feature* (a constant 1 for variant U), so garbling
+        env._phase itself would legitimately change the policy's features —
+        the loss-inert quantity is the trainer-side signal tested here."""
+        def run(garble, tag):
+            torch.manual_seed(0)
+            np.random.seed(0)
+            env = _make_env()
+            env.variant = "U"
+            policy = _make_policy()
+            model = _make_model(GRPO, env, policy, tag=tag, group_size=8)
+            if garble:
+                orig_forward = policy.forward
+
+                def garbled(*a, **kw):
+                    out = orig_forward(*a, **kw)
+                    if out.get("phase") is not None:
+                        out["phase"] = torch.full_like(out["phase"], 7)
+                    return out
+
+                policy.forward = garbled
+            _, batch = _wire_and_batch(model, tag)
+            return float(model._train_step(batch)["loss"])
+
+        self.assertEqual(run(False, "pm_u0"), run(True, "pm_u1"))
+
+    def test_train_step_P_finite_loss_and_grads(self):
+        """⭐ End-to-end smoke: one real variant-P GRPO train step with the
+        phase-masked per-step advantage — finite loss, finite policy grads."""
+        torch.manual_seed(0)
+        env = _make_env()
+        policy = _make_policy()
+        model = _make_model(GRPO, env, policy, tag="pm_e2e", group_size=8)
+        _, batch = _wire_and_batch(model, "pm_e2e")
+        out = model._train_step(batch)
+        self.assertTrue(np.isfinite(float(out["loss"])))
+        pgrads = [p.grad for p in model.policy.parameters() if p.grad is not None]
+        self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
+
+
 class TestPriorityCountP(unittest.TestCase):
     """⭐ P (number of priority classes) is generalized; default 3 unchanged."""
 
@@ -423,6 +534,115 @@ class TestPriorityCountP(unittest.TestCase):
         with torch.no_grad():
             out = policy(batchify(td0, 4).clone(), env, phase="train")
         self.assertEqual(out["reward"].shape[-1], 4)   # P=4 -> T-vector width 4
+
+
+class TestBac3DecoderUpgrade(unittest.TestCase):
+    """⭐ Bậc-3 decoder upgrade (docs/grpo.md §8.1/§8.2): widened per-vehicle
+    state (phase/P + per-class remaining-arc-fraction), masked self-attention
+    among the M vehicle tokens, individual+collaborative fusion."""
+
+    def test_veh_state_dim_and_projection_width(self):
+        """_VEH_STATE_DIM = 3 + 1 + P; project_vehicle input = D + that. P is
+        threaded through Decoder and AttentionModelPolicy (P=3 default, P=4 too)."""
+        from policy.decoder import Decoder, JointMVContext
+        from policy.policy import AttentionModelPolicy
+        for P in (3, 4):
+            ctx = JointMVContext(32, P=P)
+            self.assertEqual(ctx._VEH_STATE_DIM, 3 + 1 + P)
+            self.assertEqual(ctx.project_vehicle.in_features, 32 + 3 + 1 + P)
+            self.assertEqual(ctx.project_vehicle.out_features, 32)
+        dec = Decoder(embed_dim=32, num_heads=4, P=4)
+        self.assertEqual(dec.joint_mv_context.P, 4)
+        pol = AttentionModelPolicy(embed_dim=32, num_encoder_layers=1,
+                                   num_heads=4, P=4)
+        self.assertEqual(pol.decoder.joint_mv_context.project_vehicle.in_features,
+                         32 + 3 + 1 + 4)
+        # Default construction (no P passed) stays at P=3 -> dim 7.
+        self.assertEqual(_make_policy().decoder.joint_mv_context._VEH_STATE_DIM, 7)
+
+    def test_class_progress_fractions(self):
+        """Per-class remaining-arc-fraction matches a hand computation; depot
+        column (class 0) excluded; absent class -> 0; phase feature = phase/P."""
+        from policy.decoder import JointMVContext
+        # N=6 arcs, classes [1,1,2,3,3,3]; arcs 1 (class 1) and 5 (class 3) served.
+        clss = torch.tensor([[0, 1, 1, 2, 3, 3, 3]])
+        visited = torch.zeros(1, 1, 7, dtype=torch.uint8)
+        visited[0, 0, 1] = 1
+        visited[0, 0, 5] = 1
+        td = {"clss": clss, "visited": visited,
+              "phase": torch.tensor([[2]], dtype=torch.long)}
+        M = 4
+        ctx = JointMVContext(8, P=3)
+        phase_feat, remain = ctx._class_progress(td, M, torch.float32)
+        self.assertEqual(tuple(phase_feat.shape), (1, M, 1))
+        self.assertEqual(tuple(remain.shape), (1, M, 3))
+        self.assertTrue(torch.allclose(phase_feat,
+                                       torch.full((1, M, 1), 2.0 / 3.0)))
+        expected = torch.tensor([1.0 / 2.0, 1.0, 2.0 / 3.0])  # per class 1..3
+        for m in range(M):  # global quantity: identical for every vehicle slot
+            self.assertTrue(torch.allclose(remain[0, m], expected, atol=1e-6))
+        # P=4 with no class-4 arcs: fraction 0 (not NaN), phase/P rescales.
+        ctx4 = JointMVContext(8, P=4)
+        phase4, remain4 = ctx4._class_progress(td, 2, torch.float32)
+        self.assertTrue(torch.allclose(phase4, torch.full((1, 2, 1), 2.0 / 4.0)))
+        self.assertTrue(torch.allclose(
+            remain4[0, 0], torch.tensor([0.5, 1.0, 2.0 / 3.0, 0.0]), atol=1e-6))
+
+    def test_ghost_slot_masking(self):
+        """⭐ MAIN GUARANTEE: with mixed fleet sizes in one batch (M=2 padded to
+        M_max=5), garbage in the padding (ghost) vehicle slots must not change
+        the real vehicles' queries at all — proves the vehicle self-attention
+        key mask (and the whole individual path) is padding-invariant."""
+        from env.generator import generate_dataset
+        torch.manual_seed(0)
+        env = _make_env(M=5)
+        policy = _make_policy()
+        td_batch = generate_dataset(2, 15, 15, 5, num_workers=0)
+        td_batch["num_vehicle"] = torch.tensor([2, 5])  # mixed fleet, M_max=5
+        td0 = env.reset(td_batch)
+        with torch.no_grad():
+            hidden, _ = policy.encoder(td0)
+        ctx = policy.decoder.joint_mv_context
+
+        def run(garble_seed):
+            td = td0.clone()
+            if garble_seed is not None:
+                g = torch.Generator().manual_seed(garble_seed)
+                # Instance 0 has 2 real vehicles; slots 2..4 are ghosts.
+                N1 = hidden.shape[1]
+                td["current_node"][0, 2:] = torch.randint(1, N1, (3,), generator=g)
+                td["used_capacity"][0, 2:] = torch.rand(3, generator=g) * 5.0
+                td["completion"][0, 2:] = torch.rand(3, generator=g) * 9.0
+            with torch.no_grad():
+                return ctx(hidden, td)
+
+        base, g1, g2 = run(None), run(123), run(456)
+        # Real vehicles of the padded instance: bit-identical under any garbage.
+        self.assertTrue(torch.equal(base[0, :2], g1[0, :2]))
+        self.assertTrue(torch.equal(g1[0, :2], g2[0, :2]))
+        # Full-fleet instance (inputs untouched) unchanged too.
+        self.assertTrue(torch.equal(base[1], g1[1]))
+        # Sanity: the perturbation actually reached the ghost slots' outputs.
+        self.assertFalse(torch.equal(base[0, 2:], g1[0, 2:]))
+
+    def test_train_step_P_finite_loss_and_new_module_grads(self):
+        """⭐ End-to-end smoke: one real variant-P GRPO train step through the
+        upgraded decoder — finite loss, finite grads, and the NEW modules
+        (veh_attn_qkv/out, fuse) actually receive gradient."""
+        torch.manual_seed(0)
+        env = _make_env()
+        policy = _make_policy()
+        model = _make_model(GRPO, env, policy, tag="b3_e2e", group_size=8)
+        _, batch = _wire_and_batch(model, "b3_e2e")
+        out = model._train_step(batch)
+        self.assertTrue(np.isfinite(float(out["loss"])))
+        pgrads = [p.grad for p in model.policy.parameters() if p.grad is not None]
+        self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
+        ctx = model.policy.decoder.joint_mv_context
+        for name in ("project_vehicle", "veh_attn_qkv", "veh_attn_out", "fuse"):
+            g = getattr(ctx, name).weight.grad
+            self.assertIsNotNone(g, f"{name} got no gradient")
+            self.assertTrue(torch.isfinite(g).all(), f"{name} grad not finite")
 
 
 class TestEncoderShare(unittest.TestCase):

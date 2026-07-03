@@ -18,13 +18,15 @@ class AttentionModelPolicy(nn.Module):
         train_decode_type: str = "sampling",
         val_decode_type: str = "greedy",
         test_decode_type: str = "greedy",
+        P: int = 3,
     ):
         super(AttentionModelPolicy, self).__init__()
 
         self.encoder = Encoder(
             embed_dim=embed_dim, num_layers=num_encoder_layers, num_heads=num_heads
         )
-        self.decoder = Decoder(embed_dim=embed_dim, num_heads=num_heads, check_nan=False)
+        self.decoder = Decoder(embed_dim=embed_dim, num_heads=num_heads,
+                               check_nan=False, P=P)
 
         self.embed_dim = embed_dim
 
@@ -86,8 +88,10 @@ class AttentionModelPolicy(nn.Module):
         # Main decoding: loop until all sequences are done
         step = 0
         valid_steps = []
+        phases = []
         while not td["done"].all():
             valid_steps.append(~td["done"].reshape(-1))  # (B,) True where not yet done
+            phases.append(td["phase"].reshape(-1))       # (B,) phase for THIS decision
             # Joint M×N: decoder returns (B, M, N+1) logits + feasibility mask.
             # Flatten to a plain (B, M*(N+1)) action space so the decoding strategy
             # treats it as one categorical; env.step splits the flat index into
@@ -123,6 +127,7 @@ class AttentionModelPolicy(nn.Module):
                 logprobs, actions, valid_mask, return_sum_log_likelihood
             ),
             "valid_mask": valid_mask,
+            "phase": torch.stack(phases, dim=1) if phases else None,
         }
 
         if return_actions:

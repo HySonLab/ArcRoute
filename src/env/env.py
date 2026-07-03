@@ -84,7 +84,21 @@ class CARPEnv:
             }
         )
         td.set("action_mask", self.get_action_mask(td))
+        td.set("phase", self._phase(td))
         return td
+
+    def _phase(self, td: TensorDict) -> torch.Tensor:
+        """(B, 1) long — current phase = min still-unserved class (same c_min the
+        precedence mask uses). Clamped to [1, P] so done rows stay a valid class
+        index. Variant U has no precedence, so phase is a constant placeholder 1."""
+        B = td["visited"].shape[0]
+        if self.variant != 'P':
+            return torch.ones(B, 1, dtype=torch.long, device=td.device)
+        served_arcs = td["visited"][..., 0, 1:] != 0           # (B, N)
+        clss_cust = td["clss"][..., 1:]                        # (B, N)
+        masked_cls = clss_cust.masked_fill(served_arcs, 1 << 30)
+        c_min = masked_cls.min(dim=-1, keepdim=True).values    # (B, 1)
+        return c_min.clamp(1, self.P).long()
 
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
         """Return a flat joint feasibility mask (B, M_max*(N+1)). True == FEASIBLE.
@@ -178,6 +192,7 @@ class CARPEnv:
             batch_size=batch_size,
         ).to(dev)
         td_reset.set("action_mask", self.get_action_mask(td_reset))
+        td_reset.set("phase", self._phase(td_reset))
         return td_reset
     
     

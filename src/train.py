@@ -68,6 +68,7 @@ if __name__ == "__main__":
         num_encoder_layers=args.num_encoder_layers,
         num_heads=args.num_heads,
         tanh_clipping=10,
+        P=env.P,  # decoder's per-class features must match the env's class count
     )
 
     metrics = {"train": ["reward", "loss", "T1_mean", "T2_mean", "T3_mean"]}

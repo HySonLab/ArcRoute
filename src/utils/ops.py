@@ -244,6 +244,42 @@ def convert_prob(x):
     return np.exp(x - a)
 
 
+def centered_lex_rank(T, gamma=0.5):
+    """Hierarchical centered midrank score for ONE group (CPU/numpy reference).
+
+    T     : (K, P) array — T-vectors, LOWER is better.
+    gamma : priority decay (default 0.5 → level-p weight ∝ 0.5^(p-1)).
+    Returns (K,) float32 in [-1, +1], mean==0.
+
+    Shared by trainers (GRPO group advantage, where it is the unit-test
+    ground-truth for centered_hier_rank_gpu) and solvers (EA roulette-wheel
+    fitness), so it lives here rather than in trainers/grpo.py.
+    """
+    T = np.asarray(T, dtype=np.float64)
+    K, P = T.shape
+    if K < 2:
+        return np.zeros(K, dtype=np.float32)
+    w = np.array([gamma ** p for p in range(P)], dtype=np.float64)
+    w /= w.sum()
+    adv = np.zeros(K, dtype=np.float64)
+    for p in range(P):
+        col = T[:, p]
+        order = np.argsort(col, kind='stable')   # ascending: idx of lowest value first
+        rank_sorted = np.arange(K, dtype=np.float64)  # position 0=lowest(best)
+        i = 0
+        while i < K:
+            j = i + 1
+            while j < K and col[order[j]] == col[order[i]]:
+                j += 1
+            if j > i + 1:
+                rank_sorted[i:j] = rank_sorted[i:j].mean()
+            i = j
+        rank = np.empty(K, dtype=np.float64)
+        rank[order] = rank_sorted
+        adv += w[p] * (1.0 - 2.0 * rank / (K - 1))   # +1=best, -1=worst
+    return adv.astype(np.float32)
+
+
 def print_route_log(routes, req, demands, adj, Ts):
     """Print a formatted route log to stdout.
 

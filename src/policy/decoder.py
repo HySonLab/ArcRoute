@@ -11,30 +11,73 @@ from torch.nn.functional import scaled_dot_product_attention
 
 
 class JointMVContext(nn.Module):
-    """Vehicle state embedding for the Joint M×N decode (GRPO v3).
+    """Vehicle state embedding for the Joint M×N decode (GRPO v3, bậc-3 upgrade).
 
     For each of the M vehicles, build a query from
-        [H[current_node_m], remaining_cap_m, completion_m_norm, dist_to_depot_m]
-    and project it to the embedding dim. Produces (B, M, D) vehicle queries that
-    the PointerAttention scores against the N+1 arc keys to give (B, M, N+1)
-    logits — so the policy chooses (vehicle, arc) jointly at each step.
+        [H[current_node_m], remaining_cap_m, completion_m_norm, dist_to_depot_m,
+         phase/P, per-class remaining-arc-fraction (P scalars)]
+    projected to the embedding dim ("individual" query h¹), then mix the M
+    vehicle tokens with one masked self-attention layer ("collaborative" h²,
+    RANS-style Dual Cross-Attention — real vehicles never attend to zero-state
+    padding/ghost slots), and fuse: veh_q = Linear(concat(h¹, h²)).
+    Produces (B, M, D) vehicle queries that the PointerAttention scores against
+    the N+1 arc keys to give (B, M, N+1) logits — so the policy chooses
+    (vehicle, arc) jointly at each step.
     """
 
-    _VEH_STATE_DIM = 3  # remaining_cap, completion_norm, dist_to_depot
+    _BASE_VEH_STATE_DIM = 3  # remaining_cap, completion_norm, dist_to_depot
 
-    def __init__(self, embed_dim, linear_bias=False):
+    def __init__(self, embed_dim, P=3, linear_bias=False):
         super().__init__()
+        self.P = P
+        # + 1 (phase/P) + P (per-class remaining-arc-fraction)
+        self._VEH_STATE_DIM = self._BASE_VEH_STATE_DIM + 1 + P
         self.project_vehicle = nn.Linear(
             embed_dim + self._VEH_STATE_DIM, embed_dim, bias=linear_bias
         )
+        # Self-attention among the M vehicle tokens (single-head — M <= ~10
+        # tokens, so head-splitting buys nothing; same sdpa primitive as
+        # PointerAttention._inner_mha).
+        self.veh_attn_qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=linear_bias)
+        self.veh_attn_out = nn.Linear(embed_dim, embed_dim, bias=linear_bias)
+        # Fuse individual + collaborative (RANS eq. 25 style, single linear).
+        self.fuse = nn.Linear(2 * embed_dim, embed_dim, bias=linear_bias)
+
+    def _class_progress(self, td, M, dtype):
+        """Global (per-instance) endgame features, broadcast over vehicles.
+
+        Returns:
+            phase_feat  (B, M, 1): current phase / P (td['phase'] is (B,1) long).
+            remain_frac (B, M, P): per class p in 1..P, fraction of class-p arcs
+                                    still unserved (0 if the class is absent).
+        """
+        B = td["clss"].shape[0]
+        dev = td["clss"].device
+        phase_feat = (td["phase"].to(dtype) / self.P).reshape(B, 1, 1).expand(B, M, 1)
+
+        clss = td["clss"][..., 1:]                           # (B, N) — skip depot col
+        served = td["visited"][..., 0, 1:] != 0              # (B, N) bool
+        p_range = torch.arange(1, self.P + 1, device=dev)    # (P,)
+        is_p = clss.unsqueeze(-1) == p_range                 # (B, N, P)
+        total_p = is_p.sum(dim=1)                            # (B, P)
+        unserved_p = (is_p & ~served.unsqueeze(-1)).sum(dim=1)  # (B, P)
+        remain_frac = unserved_p.to(dtype) / total_p.clamp(min=1).to(dtype)  # (B, P)
+        return phase_feat, remain_frac.unsqueeze(1).expand(B, M, self.P)
 
     def forward(self, node_embeddings, td):
         """node_embeddings: (B, N+1, D); td has per-vehicle current_node (B,M),
-        used_capacity (B,M), completion (B,M) and adj (B,N+1,N+1).
+        used_capacity (B,M), completion (B,M), adj (B,N+1,N+1), plus global
+        phase (B,1), clss (B,N+1), visited (B,1,N+1), num_vehicle (B,1).
         Returns (B, M, D) vehicle queries. Fully vectorised — no Python loop over M."""
         B, M = td["current_node"].shape
         dev = node_embeddings.device
         cn = td["current_node"]                              # (B, M)
+
+        # Real (non-padding) vehicle slots: (B, M) bool, True == real. Instances
+        # with M_i < M_max carry zero-state ghost slots the env never selects.
+        valid_veh = (
+            torch.arange(M, device=dev).view(1, M) < td["num_vehicle"].reshape(B, 1)
+        )
 
         # Node embedding for each vehicle's current node: (B, M, D)
         B_idx = torch.arange(B, device=dev).unsqueeze(1).expand(B, M)
@@ -43,16 +86,37 @@ class JointMVContext(nn.Module):
         # Remaining capacity: (B, M, 1)
         rem = (1.0 - td["used_capacity"]).unsqueeze(-1)
 
-        # Normalised completion (scale-invariant across vehicles): (B, M, 1)
-        comp_norm = td["completion"].amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        # Normalised completion (scale-invariant across vehicles): (B, M, 1).
+        # Max over REAL vehicles only (ghost completion is 0 anyway in the env,
+        # so this is numerically identical — it just makes padding-invariance
+        # exact by construction).
+        comp_norm = (
+            td["completion"].masked_fill(~valid_veh, 0.0)
+            .amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        )
         comp = (td["completion"] / comp_norm).unsqueeze(-1)  # (B, M, 1)
 
         # Distance to depot: adj[:, cn, 0] -> (B, M, 1), normalised per instance
         adj_scale = td["adj"].amax(dim=(-2, -1)).clamp(min=1e-6).unsqueeze(1)  # (B, 1)
         dist = (td["adj"][:, :, 0].gather(1, cn) / adj_scale).unsqueeze(-1)   # (B, M, 1)
 
-        feat = torch.cat([h, rem, comp, dist], dim=-1)       # (B, M, D+3)
-        return self.project_vehicle(feat)                    # (B, M, D)
+        # Global phase + per-class endgame progress (same for all M vehicles).
+        phase_feat, remain_frac = self._class_progress(td, M, node_embeddings.dtype)
+
+        feat = torch.cat([h, rem, comp, dist, phase_feat, remain_frac], dim=-1)
+        veh_q_individual = self.project_vehicle(feat)        # (B, M, D)
+
+        # Collaborative pass: self-attention among vehicle tokens, key-masked so
+        # real vehicles never attend to padded ghost slots (m >= num_vehicle_i).
+        # td["num_vehicle"] always has >= 1 real vehicle, so no all-masked row.
+        q, k, v = self.veh_attn_qkv(veh_q_individual).chunk(3, dim=-1)
+        heads = scaled_dot_product_attention(
+            q, k, v, attn_mask=valid_veh.unsqueeze(1)        # (B,1,M) over keys
+        )                                                    # (B, M, D)
+        veh_q_collab = self.veh_attn_out(heads)              # (B, M, D)
+
+        # Fuse individual + collaborative (RANS eq. 25 style): (B, M, D)
+        return self.fuse(torch.cat([veh_q_individual, veh_q_collab], dim=-1))
 
 
 class StaticEmbedding(nn.Module):
@@ -151,6 +215,7 @@ class Decoder(nn.Module):
         check_nan: bool = True,
         sdpa_fn: callable = None,
         pointer: nn.Module = None,
+        P: int = 3,
     ):
         super().__init__()
 
@@ -159,7 +224,7 @@ class Decoder(nn.Module):
 
         assert embed_dim % num_heads == 0
 
-        self.joint_mv_context = JointMVContext(embed_dim)
+        self.joint_mv_context = JointMVContext(embed_dim, P=P, linear_bias=linear_bias)
         self.dynamic_embedding = StaticEmbedding(embed_dim)
 
         self.pointer = PointerAttention(

@@ -5,6 +5,7 @@ from numpy.random import random, randint, permutation
 
 from utils.ops import import_instance, run_parallel2
 from utils.ops import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
+from utils.ops import centered_lex_rank
 from solvers.evaluator import evaluate_batch as get_Ts
 from utils.local_search import ls
 from utils.ils_operators import perturbate, accept
@@ -53,11 +54,23 @@ class BaseHCARP:
                 return False
         return True
     
+    # Lexicographic dominance base for calc_obj's Horner encoding
+    # obj = sum_p T_p * LEX_C**(P-1-p). Strict lex order (T1 > T2 > T3) is
+    # preserved as long as every T_p stays well below LEX_C: benchmark logs
+    # (logs/bm_*.out) show max T3 ~ 68, so LEX_C = 1e4 gives a ~150x safety
+    # margin — a T1 improvement of d dominates the lower levels whenever
+    # d > T_max/LEX_C ~ 0.007, far below any meaningful T1 difference, while
+    # keeping the total (~68e8 for P=3) small enough that float64 still
+    # resolves T3 differences down to ~1e-6. The old weights [1e3,1e1,1e-1]
+    # (100x per level) let a 0.01 T1 loss be outvoted by T2/T3 gains.
+    LEX_C = 1e4
+
     def calc_obj(self, actions):
-        w = np.array([1e3, 1e1, 1e-1])
-        rewards = get_Ts(self.vars, actions=actions)
+        rewards = get_Ts(self.vars, actions=actions)   # (N, P), LOWER is better
+        P = rewards.shape[1]
+        w = self.LEX_C ** np.arange(P - 1, -1, -1, dtype=np.float64)
         obj = rewards @ w
-        return -obj
+        return -obj                                     # higher = better
     
     def calc_len(self, path):
         return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
@@ -116,32 +129,43 @@ class ILSHCARP(BaseHCARP):
         self.T_final = T_final
 
     def __call__(self, max_iter=200, variant='P', num_init_sample=5,
-                 seed=None, verbose=False):
+                 seed=None, verbose=False, init_action=None):
         assert self.has_instance, "please import instance first"
         rng = np.random.default_rng(seed)
         if seed is not None:
             np.random.seed(seed)
 
-        # 1. constructive seeds -> local search -> pick the best as s0
-        samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
-        samples = [s for s in samples if s is not None]
-        assert samples, "construction failed to produce a feasible solution"
-        tours_batch = ls(self.vars, variant=variant, actions=samples)
-        action_batch = deserialize_tours_batch(tours_batch, self.nseq)
-        cur_obj, cur_action = self.get_best(action_batch)
+        if init_action is not None:
+            # 1'. warm start: skip constructive seeding, start the ILS loop
+            # from a caller-supplied flat 0-separated arc-order action
+            # (e.g. the winner of the RL hybrid funnel, see solvers/rl.py).
+            cur_action = np.asarray(init_action, dtype=np.int32)
+            cur_obj = float(self.calc_obj(cur_action[None])[0])
+        else:
+            # 1. constructive seeds -> local search -> pick the best as s0
+            samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
+            samples = [s for s in samples if s is not None]
+            assert samples, "construction failed to produce a feasible solution"
+            tours_batch = ls(self.vars, variant=variant, actions=samples)
+            action_batch = deserialize_tours_batch(tours_batch, self.nseq)
+            cur_obj, cur_action = self.get_best(action_batch)
         cur_routes = gen_tours(cur_action)
 
         best_action = cur_action.copy()
         best_obj = cur_obj
         capacity = 1.0
+        # A warm start may carry more trips than vehicles (capacity reloads →
+        # multiple 0-separated segments per vehicle), so the re-serialisation
+        # cap must fit it; the default (cold-start) path is unchanged.
+        max_len = max(self.max_len, len(cur_action))
 
         # 2. ILS loop: perturb -> local search -> accept
         for it in range(max_iter):
             pert = perturbate(cur_routes, self.dms, self.demands, self.clss,
                               capacity, variant, rng, strength=self.strength)
-            pert_action = deserialize_tours(pert, self.max_len)
+            pert_action = deserialize_tours(pert, max_len)
             tours = ls(self.vars, variant=variant, actions=[pert_action])
-            cand_action = deserialize_tours(tours[0], self.max_len)
+            cand_action = deserialize_tours(tours[0], max_len)
             cand_obj = float(self.calc_obj(cand_action[None])[0])
 
             if accept(cur_obj, cand_obj, it, max_iter, mode=self.accept_mode,
@@ -236,7 +260,14 @@ class EAHCARP(BaseHCARP):
             obj = self.calc_obj(population)
             idxs = np.argsort(obj)
             new_population = [population[idxs[-1]], population[idxs[-2]]]
-            prob = convert_prob(obj)
+            # Roulette-wheel selection: softmax over the exact-lex calc_obj would
+            # collapse to near-one-hot (LEX_C-scale dynamic range), killing the
+            # fitness-proportional diversity EA relies on. Rank instead: the
+            # centered hierarchical midrank is bounded in [-1, +1] regardless of
+            # the population's absolute T spread. gamma=0.5 matches GRPO's
+            # adv_gamma default — same multi-priority-combination philosophy.
+            T_population = get_Ts(self.vars, actions=population)
+            prob = convert_prob(centered_lex_rank(T_population, gamma=0.5))
             nb = len(population) // 2 - 1
             new_population += [c for cs in run_parallel2(self.operate, [prob]*nb, population=population, variant=variant) 
                                for c in cs]

@@ -20,7 +20,7 @@ FLEET="2,3,5,7,10"
 VARIANT=P
 GROUP_SIZE="${GROUP_SIZE:-16}"
 CURRICULUM="${CURRICULUM:-small}" # small | medium | large | (empty = all)
-CHECKPOINT_DIR=outputs/checkpoints/grpo_osm
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-outputs/checkpoints/grpo_osm}"
 ACCELERATOR=gpu
 DEVICES=1
 

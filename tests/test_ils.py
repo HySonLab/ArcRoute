@@ -2,13 +2,15 @@ import os
 import sys
 import unittest
 from collections import Counter
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from utils.ils_operators import perturbate, accept, routes_to_action
-from utils.ops import gen_tours
+from utils.local_search import ls
+from utils.ops import gen_tours, deserialize_tours_batch
 from solvers.meta import BaseHCARP, ILSHCARP
 
 
@@ -191,24 +193,75 @@ class TestRoutesToAction(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 1d. calc_obj — exact lexicographic ordering (regression for the old
+#     weighted-sum [1e3, 1e1, 1e-1] which was NOT lex-order preserving)
+# --------------------------------------------------------------------------- #
+class TestCalcObjLexOrder(unittest.TestCase):
+    def test_calc_obj_prefers_better_T1(self):
+        """A=(5.00,10,10) beats B=(5.01,5,5) on the primary objective; the old
+        weights ranked B higher (5060.5 < 5101), i.e. -obj_B > -obj_A."""
+        al = make_instance(nv=3, seed=5)
+        T = np.array([[5.00, 10.0, 10.0],
+                      [5.01,  5.0,  5.0]], dtype=np.float64)
+        dummy_actions = np.zeros((2, 3), dtype=np.int32)
+        with mock.patch('solvers.meta.get_Ts', return_value=T):
+            obj = al.calc_obj(dummy_actions)
+        # sanity: the old formula really does misrank this pair
+        w_old = np.array([1e3, 1e1, 1e-1])
+        self.assertGreater((-T @ w_old)[1], (-T @ w_old)[0])
+        # the fixed calc_obj must rank A (better T1) strictly above B
+        self.assertGreater(obj[0], obj[1])
+
+    def test_calc_obj_ties_break_on_lower_levels(self):
+        """Equal T1 -> T2 decides; equal T1,T2 -> T3 decides."""
+        al = make_instance(nv=3, seed=5)
+        T = np.array([[5.0, 9.0, 50.0],
+                      [5.0, 9.5,  1.0],
+                      [5.0, 9.0, 49.0]], dtype=np.float64)
+        with mock.patch('solvers.meta.get_Ts', return_value=T):
+            obj = al.calc_obj(np.zeros((3, 3), dtype=np.int32))
+        self.assertGreater(obj[2], obj[0])   # same T1,T2 -> lower T3 wins
+        self.assertGreater(obj[0], obj[1])   # same T1 -> lower T2 wins
+
+    def test_calc_obj_generalizes_over_P(self):
+        """Weight vector is built from rewards.shape[1], not hardcoded P=3."""
+        al = make_instance(nv=3, seed=5)
+        T = np.array([[1.0, 2.0, 3.0, 10.0],
+                      [1.0, 2.0, 3.0,  9.0]], dtype=np.float64)
+        with mock.patch('solvers.meta.get_Ts', return_value=T):
+            obj = al.calc_obj(np.zeros((2, 3), dtype=np.int32))
+        self.assertGreater(obj[1], obj[0])
+
+
+# --------------------------------------------------------------------------- #
 # Step 2. ILSHCARP end-to-end
 # --------------------------------------------------------------------------- #
 class TestILS(unittest.TestCase):
     def test_ils_improves_over_construction(self):
         al = make_instance(nv=3, seed=5)
 
-        # greedy construction (no LS) baseline objective
-        construct = al.get_once(al.M, al.clss)
-        self.assertIsNotNone(construct)
-        base_obj = float(al.calc_obj(construct[None])[0])
+        # Replicate ILS's own initialization (seeding np.random the same way
+        # al(seed=123) does replays the identical sample stream): 5 constructive
+        # samples -> local search -> best. ILS's best-ever tracking starts from
+        # exactly this solution, so its final answer must match or beat it.
+        # (An *external* construction sample is NOT a valid baseline: ILS never
+        # sees it, and the exact-lex objective has no weighted-sum slack.)
+        np.random.seed(123)
+        samples = [al.get_once(al.M, al.clss) for _ in range(5)]
+        samples = [s for s in samples if s is not None]
+        self.assertTrue(samples)
+        tours_batch = ls(al.vars, variant='P', actions=samples)
+        action_batch = deserialize_tours_batch(tours_batch, al.nseq)
+        base_obj = float(al.get_best(action_batch)[0])
 
         T = al(max_iter=50, variant='P', num_init_sample=5, seed=123)
         # get_Ts returns shape (1, P)
         self.assertEqual(T.shape, (1, 3))
-        w = np.array([1e3, 1e1, 1e-1])
-        ils_obj = -float(T[0] @ w)
+        # Route both sides through calc_obj so the comparison is decoupled
+        # from calc_obj's internal weighting formula.
+        ils_obj = float(al.calc_obj(al._last_best_action[None])[0])
 
-        # ILS result must be at least as good as raw construction
+        # ILS result must be at least as good as its own initialization
         self.assertGreaterEqual(ils_obj, base_obj - 1e-6)
 
     def test_ils_sa_mode_runs(self):

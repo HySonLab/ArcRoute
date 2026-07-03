@@ -8,7 +8,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from utils.ops import gen_tours
+from utils.ops import gen_tours, convert_prob, centered_lex_rank
+from solvers.evaluator import evaluate_batch as get_Ts
 from solvers.meta import EAHCARP
 
 
@@ -233,6 +234,44 @@ class TestGetParent(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# TestSelectionProb — roulette-wheel selection must stay non-degenerate
+# --------------------------------------------------------------------------- #
+class TestSelectionProb(unittest.TestCase):
+    """EA's parent-selection probabilities are softmax over centered_lex_rank
+    (bounded [-1, +1]) rather than over the exact-lex calc_obj scalar, whose
+    LEX_C-scale dynamic range would collapse softmax to near-one-hot."""
+
+    def setUp(self):
+        np.random.seed(5)
+        self.al = make_instance(nv=3, seed=5, n_population=20)
+        self.pop = self.al.init_population()
+
+    def test_selection_prob_non_degenerate(self):
+        # exactly the expression EAHCARP.__call__ uses for `prob`
+        T = get_Ts(self.al.vars, actions=self.pop)
+        prob = convert_prob(centered_lex_rank(T, gamma=0.5))
+        self.assertAlmostEqual(float(prob.sum()), 1.0, places=9)
+        self.assertLess(float(prob.max()), 0.9)
+        self.assertGreater(float(prob.min()), 0.0)
+
+    def test_selection_prob_raw_lex_obj_would_degenerate(self):
+        # contrast: softmax over the exact-lex objective IS near-one-hot for a
+        # population whose individuals meaningfully differ (deterministic
+        # hand-built T spread) — the reason EA must rank before softmaxing.
+        T = np.array([[5.0, 10.0, 10.0],
+                      [5.2,  9.0,  9.0],
+                      [6.0,  8.0,  8.0],
+                      [7.0,  7.0,  7.0]], dtype=np.float64)
+        with mock.patch('solvers.meta.get_Ts', return_value=T):
+            obj = self.al.calc_obj(np.zeros((4, 3), dtype=np.int32))
+        prob_raw = convert_prob(obj)
+        self.assertGreater(float(prob_raw.max()), 0.99)
+        # ...while the rank-based probability stays smooth for the same T
+        prob_rank = convert_prob(centered_lex_rank(T, gamma=0.5))
+        self.assertLess(float(prob_rank.max()), 0.9)
+
+
+# --------------------------------------------------------------------------- #
 # TestEAEndToEnd
 # --------------------------------------------------------------------------- #
 class TestEAEndToEnd(unittest.TestCase):
@@ -246,8 +285,9 @@ class TestEAEndToEnd(unittest.TestCase):
 
         T = al(n_epoch=10, variant='P')
         self.assertEqual(T.shape, (1, 3))
-        w = np.array([1e3, 1e1, 1e-1])
-        ea_obj = -float(T[0] @ w)
+        # Route both sides through calc_obj so the comparison is decoupled
+        # from calc_obj's internal weighting formula.
+        ea_obj = float(al.calc_obj(al._last_best_action[None])[0])
 
         self.assertGreaterEqual(ea_obj, base_obj - 1e-6)
 

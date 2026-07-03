@@ -40,6 +40,12 @@
 #   RL
 #     CKPT        checkpoint .ckpt file  (required for rl)
 #     NUM_SAMPLE  beam width             (default: 100)
+#     EPS         eps-lex T1 tolerance for shortlisting (default: 0.005 = 0.5%)
+#     HYBRID      1 = two-tier funnel: eps-lex shortlist + local search on it (default: 0)
+#     SHORTLIST   HYBRID=1 only: #candidates that get local search (default: 10)
+#     WARM_ILS    1 = hybrid funnel + short ILS refinement warm-started from the
+#                 hybrid winner (default: 0; implies the hybrid funnel)
+#     ILS_ITERS   WARM_ILS=1 only: ILS iteration budget (default: 50)
 #
 # Output:
 #   Prints solver lines to stdout AND saves to logs/bm_<solver>_<variant>_<ts>.out
@@ -49,6 +55,8 @@
 #   SOLVER=ea DATA_DIR=data/2m VARIANT=U N_EPOCH=200 bash scripts/bm.sh
 #   SOLVER=lp TIME_LIMIT=300 THREADS=4 bash scripts/bm.sh
 #   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt NUM_SAMPLE=200 bash scripts/bm.sh
+#   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt HYBRID=1 SHORTLIST=10 bash scripts/bm.sh
+#   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt HYBRID=1 SHORTLIST=25 WARM_ILS=1 ILS_ITERS=50 bash scripts/bm.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -84,6 +92,11 @@ THREADS="${THREADS:-8}"
 # ── rl ────────────────────────────────────────────────────────────────────────
 CKPT="${CKPT:-}"
 NUM_SAMPLE="${NUM_SAMPLE:-100}"
+EPS="${EPS:-0.005}"
+HYBRID="${HYBRID:-0}"          # 1 = two-tier funnel (eps-lex shortlist + local search)
+SHORTLIST="${SHORTLIST:-10}"   # HYBRID=1 only: #candidates that get local search
+WARM_ILS="${WARM_ILS:-0}"      # 1 = hybrid funnel + warm-started short ILS refinement
+ILS_ITERS="${ILS_ITERS:-50}"   # WARM_ILS=1 only: ILS iteration budget
 
 # ── output ────────────────────────────────────────────────────────────────────
 mkdir -p logs
@@ -150,11 +163,14 @@ case "$SOLVER" in
         echo "  Set CKPT=outputs/checkpoints/last.ckpt" >&2
         exit 1
     fi
+    HYBRID_ARGS=()
+    [[ "$HYBRID" == "1" ]] && HYBRID_ARGS=(--hybrid --shortlist "$SHORTLIST")
+    [[ "$WARM_ILS" == "1" ]] && HYBRID_ARGS+=(--warm_ils --ils_iters "$ILS_ITERS" --shortlist "$SHORTLIST")
     uv run python -m solvers.rl \
         --seed "$SEED" --variant "$VARIANT" \
         --cpkt "$CKPT" --path "$DATA_DIR" \
-        --num_sample "$NUM_SAMPLE" \
-        "${M_ARGS[@]}" | tee "$OUT"
+        --num_sample "$NUM_SAMPLE" --eps "$EPS" \
+        "${M_ARGS[@]}" "${HYBRID_ARGS[@]}" | tee "$OUT"
     ;;
 
   *)
