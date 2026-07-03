@@ -57,8 +57,8 @@ def build_graph(es):
       A_t            list of (v, dummy) arcs, traversal 0
       A_prime        list of (tail, head) for A union A_f union A_t
       cost           dict arc -> traversal time over A_prime (A_f/A_t -> 0)
-      V_t_k          dict class -> set of tail vertices of that class
-      V_t            set, union of all V_t_k
+      V_t_k          dict class -> set of head vertices of that class's arcs
+      V_t            set, union of all V_t_k (plus the depot)
       node_sp        dict (u, v) -> node-to-node shortest path time (Floyd-Warshall)
       P              int, number of priority classes
       M              int, number of vehicles
@@ -85,7 +85,15 @@ def build_graph(es):
         s[a] = float(service)
         cls[a] = int(clss)
         req_by_class[int(clss)].append(a)
-        V_t_k[int(clss)].add(int(tail))
+        # V_t^k must be the HEAD vertices of class-k required arcs: a vehicle's
+        # physical position at a hierarchy-level boundary is always either the
+        # depot or the head of the last arc it serviced, so the dummy node's
+        # transition arcs A_f/A_t must attach exactly there. Using tails
+        # instead would force a spurious post-service deadhead (from the head
+        # of the last serviced arc to some tail vertex) before the vehicle
+        # could exit the level -- charged to t_{m,k}, inflating T_k and making
+        # the "exact" optimum worse than feasible heuristic solutions.
+        V_t_k[int(clss)].add(int(head))
     V_t = set().union(*V_t_k.values()) if V_t_k else set()
     V_t = V_t | {depot}  # depot is a service-relevant vertex too
 
