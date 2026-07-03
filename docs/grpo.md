@@ -1008,3 +1008,72 @@ vs exact-oracle T1" as a passive validation-time diagnostic in any future
 training run (near-zero cost, gives a calibrated T1-optimality readout and
 would be the pre-registered success metric if this idea is ever revisited
 with a from-scratch retrain).
+
+## 12. Investigated and rejected: LS-shaped training advantage (reward shaping)
+
+Sibling investigation to §11, same throughline ("can a classical heuristic
+be folded into training instead of staying inference-only") but a
+deliberately different mechanism meant to sidestep §11's specific failure
+mode. Also negative — kept here for the same reason as §11: so it isn't
+re-investigated without new information.
+
+**Mechanism tried**: instead of forcing any action (§11's problem), let the
+K=16 rollouts per training group sample entirely on-policy as today, then
+run the existing local search (`utils/local_search.py`, deterministic,
+inference's `_local_search_one` "keep post-LS only if lex-better" rule) on
+**every** rollout's decoded route, and compute the group-relative phase-
+masked advantage from the **post-LS** T-vectors instead of the raw decode
+ones — while replaying/reinforcing the log-likelihood of the original,
+untouched sampled actions (not the LS-modified route). The hope: sharper,
+less noisy credit assignment (rank by "how good after a cheap deterministic
+polish", not raw sampling luck), with no action forced and therefore none
+of §11's symmetry-punishment problem.
+
+**Soundness is genuinely different from §11's**: REINFORCE's unbiasedness
+only requires the reward be a deterministic function of the sampled
+trajectory (no gradient through it, nothing off-distribution) — local
+search satisfies that; this is not an invalid estimator toward the shaped
+objective it targets. It has real literature precedent (DeepACO, NeurIPS
+2023, trains toward LS-refined solutions via REINFORCE) as a workable
+*general* pattern in neural combinatorial optimization.
+
+**But it has its own distinct contamination problem, and the data
+confirms it hurts anyway.** How much LS improves a given rollout is driven
+by incidental "swap headroom" in that specific sampled route (same-class
+swaps only, per `intra_route_opt`'s per-class-`p` structure) — a mediocre
+decode with easy nearby fixes gets an artificially boosted rank position, a
+decode already near a local optimum doesn't, and because LS runs
+sequentially class-by-class on the same route, a phase-1 rearrangement's
+knock-on effect also contaminates whatever T2/T3 ranks the phase-2/3
+credit. Measured (300-step fine-tune of `epoch=159.ckpt`, same protocol as
+§11 — fixed/matched batches and seeds vs a plain-GRPO control):
+
+- **Wall-clock**: 2.67x slower per training step (1.85s vs 0.69s) — local
+  search cost dominates, rollout itself is unaffected (~0.04s either way).
+- **Convergence on the training curriculum ("small")**: no benefit; several
+  deployment-relevant post-LS metrics moved slightly the *wrong* direction
+  relative to control over the last 5 evals (`lex16_T2` +0.06, `lex16_T3`
+  +0.24, `sls16_T3` +0.12, `bs16_match` -0.01) — consistent in direction
+  with the headroom-noise mechanism above, though this is a short fine-tune
+  of an already-converged checkpoint so the signal is modest.
+- **Transfer to `medium`** (256 held-out instances, same paired protocol as
+  §11): decisively negative. Best-of-16 T1 win/tie/loss vs control =
+  22.3%/6.1%/71.7%; lex-16 win/tie/loss = 25.9%/0.0%/74.1%. Even on the
+  exact metric this mechanism was designed to optimize (deployment-style
+  post-LS best-of-17), it **loses to plain-GRPO control more often than it
+  wins** (45.7% win / 54.3% loss) — the LS-shaped arm's raw sampling
+  diversity/quality measurably degraded on `medium` (best-of-16 T1 mean:
+  base 8.13, control 8.23, LS-shaped 8.75), consistent with training having
+  rewarded "LS-friendly" raw actions over genuinely good ones.
+
+**Recommendation**: don't pursue further without a redesign that first
+fixes the headroom-conflation problem (e.g., shape only the advantage's
+*magnitude* while preserving raw-T rank order, or normalize each rollout's
+LS gain against its own baseline LS-improvability rather than feeding the
+absolute post-LS value into the rank) — the contamination mechanism is
+structural, not a "needs more steps" issue, and the medium-transfer test
+(this idea's best chance to differentiate itself from §11) confirmed the
+concern rather than refuting it. Same bottom line as §11: keep the
+inference-time-only P1+P2 design (§9-§10); if inference speed is the
+actual constraint, tune the inference budget directly rather than
+retraining.
