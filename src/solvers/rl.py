@@ -137,12 +137,25 @@ class RLHybHCARP(RLHCARP):
     max-completion (T_k) objective, so a candidate's post-LS T-vector is only
     kept if it's lex-better than its pre-LS T-vector -- this makes the hybrid
     provably no worse than plain `RLHCARP` with the same eps/num_sample.
+
+    `topk_t1` (default 0, no-op) adds a second, T1-only-ranked pool of extra
+    candidates on top of the eps-lex shortlist -- the eps-lex shortlist finds
+    good (T2,T3) tiebreaks among near-best-T1 samples, but the pool's raw
+    best-T1 sample is sometimes still worse than a competing heuristic's T1;
+    widening `num_sample` alone doesn't reliably surface it into the eps-band
+    shortlist. Measured on `data/osm_test_small` (2858 instances,
+    `outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt`): raising
+    `num_sample` 100->400 and adding `topk_t1=100` moved "T1 not worse than
+    ILS" 82.75%->95.31%, "T2 not worse" 44.2%->53.1%, lex-win 69.3%->86.4%,
+    Pareto-dominance 26.2%->36.5%, at 0.144s/instance (still 5.6x faster than
+    ILS's 0.81s/instance) -- see `logs/status_bm.md` for the full repro.
     """
 
-    def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005):
+    def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0):
         super().__init__(pw, variant, device=device)
         self.shortlist = shortlist
         self.eps = eps
+        self.topk_t1 = topk_t1
         from solvers.evaluator import SolutionEvaluator
         self.evaluator = SolutionEvaluator(variant=variant)
 
@@ -185,6 +198,10 @@ class RLHybHCARP(RLHCARP):
         actions = out["actions"].cpu().numpy().astype(np.int64)       # (num_sample, dec_steps)
 
         keep = eps_lex_select(reward, eps=self.eps, shortlist=self.shortlist)
+        if self.topk_t1 > 0:
+            top = np.argsort(reward[:, 0])[:self.topk_t1]
+            keep = np.array(sorted(set(keep.tolist()) | set(int(x) for x in top)),
+                            dtype=keep.dtype)
 
         td0 = self.td[0]
         M = int(td0["num_vehicle"])
@@ -239,8 +256,9 @@ class RLWarmILSHCARP(RLHybHCARP):
     """
 
     def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005,
-                 ils_iters=50, ils_strength=3, seed=None):
-        super().__init__(pw, variant, device=device, shortlist=shortlist, eps=eps)
+                 topk_t1=0, ils_iters=50, ils_strength=3, seed=None):
+        super().__init__(pw, variant, device=device, shortlist=shortlist, eps=eps,
+                          topk_t1=topk_t1)
         self.ils_iters = ils_iters
         self.ils_strength = ils_strength
         self.seed = seed
@@ -289,6 +307,10 @@ def parse_args():
                         help='batch mode: two-tier funnel (eps-lex shortlist + local search)')
     parser.add_argument('--shortlist', type=int, default=10,
                         help='hybrid mode: #candidates that get local search')
+    parser.add_argument('--topk_t1', type=int, default=0,
+                        help='hybrid mode: extra #candidates picked by raw T1 rank '
+                             '(on top of the eps-lex shortlist), local-searched too. '
+                             '0 = disabled (default, no behavior change)')
     parser.add_argument('--warm_ils', action='store_true',
                         help='batch mode: hybrid funnel + short ILS refinement '
                              'warm-started from the hybrid winner (implies --hybrid)')
@@ -398,9 +420,11 @@ if __name__ == "__main__":
         files = sorted(glob(args.path + '/*/*.npz'))
         if args.warm_ils:
             al = RLWarmILSHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
-                                eps=args.eps, ils_iters=args.ils_iters, seed=args.seed)
+                                eps=args.eps, topk_t1=args.topk_t1,
+                                ils_iters=args.ils_iters, seed=args.seed)
         elif args.hybrid:
-            al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist, eps=args.eps)
+            al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
+                            eps=args.eps, topk_t1=args.topk_t1)
         else:
             al = RLHCARP(ckpt_path, args.variant)
         for f in files:
