@@ -74,13 +74,22 @@ design; see §7).
   identical copies of one instance produce identical embeddings — GRPO
   exploits this to skip redundant encoding, see §4).
 
-### Decoder (`src/policy/decoder.py`) — "Joint M×N" (GRPO v3)
+### Decoder (`src/policy/decoder.py`) — "Joint M×N" (GRPO v3) + bậc-3 upgrade (§8)
 
-- `JointMVContext`: for each of the M vehicles builds a query from
+- `JointMVContext`: for each of the M vehicles builds a **local** feature
   `[node_embedding[current_node_m], remaining_capacity_m, completion_m /
-  max_m(completion), dist(current_node_m, depot)]` (3 scalar features +
-  the D-dim node embedding), linearly projected to `embed_dim`. Fully
-  vectorized over M — no Python loop.
+  max_m(completion), dist(current_node_m, depot), phase_m/P, per-class
+  remaining-arc-fraction_m (P values)]` (7 scalars + the D-dim node
+  embedding for P=3), linearly projected to `embed_dim` → `veh_q_individual`
+  ("h¹"). This individual query then passes through a **masked self-attention
+  over the M vehicle tokens** (`veh_attn_qkv`/`veh_attn_out`, masked by
+  `valid_veh = arange(M) < num_vehicle` so padded "ghost" vehicle slots in a
+  mixed-fleet-size batch can't pollute real vehicles — see §8.2) to produce
+  a **collaborative** query `veh_q_collab` ("h²"), and the two are fused
+  (`self.fuse`, `Linear(2D→D)`) into the final `veh_q` used downstream. Fully
+  vectorized over M — no Python loop. (Pre-bậc-3, `veh_q` was just the local
+  feature projected directly, with no phase/class-progress features and no
+  cross-vehicle signal — see §7.3/§8 for why that was a gap.)
 - `PointerAttention`: standard glimpse/logit pointer mechanism, but scores
   the **M vehicle queries** against the **N+1 arc keys** in one batched
   matmul → `logits (B, M, N+1)`. Flattened to `(B, M*(N+1))` for the decoding
@@ -107,13 +116,15 @@ temperature / top-k / top-p knobs exist but training doesn't use them
 (`temperature=1.0`, `tanh_clipping=10` at train time per `src/train.py`, `0`
 for the plain `AttentionModelPolicy` default).
 
-### What the decoder does **not** see (relevant to current known weakness)
+### What the decoder sees, pre- vs post-bậc-3
 
-`JointMVContext`'s vehicle state is only `[remaining_cap, completion_norm,
-dist_to_depot]` — no signal for "how many arcs of the current/next priority
-class remain," no explicit deadhead cost between the vehicle and the nearest
-unserved arc of the active class. The policy can only infer phase-transition
-behavior indirectly through which arcs happen to be masked. See §6.
+Pre-bậc-3 (§6.1/§6.2's checkpoints), `JointMVContext`'s vehicle state was
+only `[remaining_cap, completion_norm, dist_to_depot]` — no signal for "how
+many arcs of the current/next priority class remain," no cross-vehicle
+awareness at all. §7.3/§8 diagnosed both gaps; bậc 3 (above, training now,
+§8.5) adds class-progress features and cross-vehicle self-attention to close
+them. §6.2's benchmarked checkpoints (v4-v6 in `logs/status_bm.md`) predate
+this change; a fresh bậc-3 benchmark is pending training completion.
 
 ## 4. GRPO trainer (`src/trainers/grpo.py`)
 
@@ -285,8 +296,47 @@ advantage/loss code differs.
   the calibrated expectation in §7.6 ("beats ILS on the large majority while
   staying an order of magnitude faster", not 100% dominance on every one of
   2858 instances) — though on *average* across T1/T2/T3 that bar is now met
-  or exceeded. §8 ("bậc 3") or a larger shortlist are the next levers if
-  more is wanted.
+  or exceeded. §8 ("bậc 3") is the next lever, now implemented and training
+  (§6.3).
+- **Root-cause analysis of the residual gap** (post-bậc-2): the 25.8%
+  Pareto-dominance ceiling is not primarily a compute-asymmetry problem
+  (RL too slow/shallow a search vs ILS's 200 iterations) — direct
+  instance-level analysis of the benchmark data shows **60.1%** of
+  instances are "mixed": RL wins one objective, ILS wins another, neither
+  dominates. Both solvers optimize lex-style objectives that permit
+  trade-offs across (T1,T2,T3); Pareto-dominance forbids trade-offs
+  entirely. This is a metric-geometry mismatch between what's being
+  optimized and what's being measured, not evidence either solver is
+  weak — it reframes "≥99% Pareto-dominance" as an unrealistic bar for two
+  lex-style optimizers being compared under a stricter-than-lex metric, and
+  redirects effort toward improving T2 quality at the source (§8) rather
+  than searching harder at inference (§6.3.1, §6.3.2 below — both explored
+  and set aside for this reason).
+
+### 6.3 Explored alternatives (rejected / refuted) — kept so they aren't re-investigated
+
+**6.3.1 RL-warm-started ILS — tried, rejected as not worth the tradeoff.**
+Idea: seed ILS's initial solution from the bậc-2+1 funnel-hybrid winner
+(via `vehicles_to_action`) instead of ILS's own constructive heuristic, then
+run a much smaller ILS iteration budget on top (`RLWarmILSHCARP` in
+`src/solvers/rl.py`, `--warm_ils --ils_iters`). Measured result: "T1 not
+worse than ILS" rose from ~81.4% → ~85.9% of instances, Pareto-dominance
+25.8% → 27.0%, but speedup dropped 16.9x → 9.2x (needs `ils_iters=50` on top
+of the hybrid funnel to get there). Explicit call: **the gain is too small
+for the speed given up** — rejected in favor of pushing on §8 (improve the
+policy itself) instead of leaning harder on inference-time search.
+
+**6.3.2 "Gamma-misalignment" hypothesis — proposed, then refuted by data.**
+Hypothesis: GRPO's soft `adv_gamma=0.5` (T1/T2/T3 gradient share 57/29/14%,
+§4) is less T1-strict than ILS's near-exact lexicographic `calc_obj`
+comparison, so RL might be systematically under-prioritizing T1 relative to
+ILS — fix would be lowering `gamma` to sharpen T1's share further. Checked
+against the actual benchmark data: RL **already beats ILS on both T1 and
+T3** (v6: T1 -3.2%, T3 -1.9%) and its only remaining deficit is T2 (+4.2%).
+Lowering `gamma` shifts gradient share *away* from T2 toward T1 — it would
+sharpen an objective that isn't the binding constraint while further
+starving the one that is. Hypothesis direction was backwards; discarded
+without a retrain.
 
 ## 7. Root cause of the T2/T3 gap, and why "bậc 2" closed most of it
 
@@ -410,7 +460,7 @@ See conversation history / Fable analysis for the fuller design writeup
 (inference-time hybridization vs training-objective fixes vs novel
 architecture ideas) if resuming this work.
 
-### 7.7 Implementation (§7.2 only — §7.3 decoder features not yet done, see §8)
+### 7.7 Implementation (§7.2 — §7.3's decoder features shipped separately in §8)
 
 Code-reviewed line-by-line and independently test-verified (not just taking
 the implementing agent's word for it) — 195 tests green, including new
@@ -442,15 +492,17 @@ old combined formula) and a `variant='U'` regression guard.
     path is untouched (verified byte-identical loss under a phase-garbling
     regression test).
 
-**Not done**: §7.3's decoder input features (class-progress, endgame
-awareness) — phase-masking only fixes *credit assignment*; the decoder still
-has no *input signal* to act on it. That's §8, proposed but not built.
+§7.3's decoder input features (class-progress, endgame awareness) —
+phase-masking only fixes *credit assignment*; the decoder separately needed
+an *input signal* to act on it — that's §8, now implemented and training.
 
-## 8. Proposed next step ("bậc 3") — combined decoder upgrade (not implemented)
+## 8. "Bậc 3" — combined decoder upgrade — IMPLEMENTED, TRAINING
 
-Two independent gaps point at the same module (`JointMVContext`,
-`src/policy/decoder.py:13-55`) and are cheapest to fix together in one
-retrain rather than sequentially:
+Two independent gaps pointed at the same module (`JointMVContext`,
+`src/policy/decoder.py`) and were cheapest to fix together in one retrain
+rather than sequentially. Both are now implemented and code-reviewed
+line-by-line (§8.1 below reflects the actual code, not a proposal); training
+is in progress (§8.5).
 
 - **§7.3's gap**: no per-class remaining-arc-count or current-phase signal.
 - **A second gap found by reviewing a SIGKDD 2025 paper** ("Enhancing
@@ -465,13 +517,13 @@ retrain rather than sequentially:
   *every* tested scale — unlike their other mechanism (§8.3), it is not
   scale-gated, so it's relevant now, not just later.
 
-### 8.1 Proposed topology (not built)
+### 8.1 Topology (implemented — `src/policy/decoder.py::JointMVContext`)
 
 Encoder is **unchanged**. Only `JointMVContext` changes:
 
 ```
 hidden (B,N+1,D) + td state (current_node, used_capacity, completion, adj,
-                              phase [already exists from §7.7], clss, visited)
+                              phase [from §7.7], clss, visited, num_vehicle)
         │
         ▼
 ┌─────────────────── per-vehicle LOCAL feature (widened) ───────────────────┐
@@ -479,48 +531,53 @@ hidden (B,N+1,D) + td state (current_node, used_capacity, completion, adj,
 │          , remaining_cap_m                         (1)  existing         │
 │          , completion_norm_m                        (1)  existing        │
 │          , dist_to_depot_m                          (1)  existing        │
-│          , phase_m / P                              (1)  NEW (§7.3)      │
-│          , per-class remaining-arc-fraction          (P=3) NEW (§7.3)     │
-│          ]                                    → D+7 (was D+3)            │
+│          , phase_feat_m = phase_m / P                (1)  NEW            │
+│          , remain_frac_m (per-class remaining-arc     (P) NEW            │
+│            fraction, from clss+visited, depot excl.,                     │
+│            0 if class absent — div-by-zero clamp)                        │
+│          ]                                    → D + (3+1+P) = D+7 for P=3│
 └────────────────────────────────────────────────────────────────────────┘
-        │  project_vehicle: Linear(D+7 → D)
+        │  project_vehicle: Linear(D+7 → D)      [_class_progress() computes
+        │                                          phase_feat/remain_frac]
         ▼
 veh_q_individual (B, M, D)     — "h¹" in RANS's naming, still per-vehicle-only
         │
-        ▼  NEW: self-attention among the M vehicle tokens (masked, see §8.2)
-   MHA_vehicles(veh_q_individual) → veh_q_collab (B, M, D)   — "h²"
+        ▼  self-attention among the M vehicle tokens, masked by valid_veh
+   veh_attn_qkv (Linear D→3D) → masked MHA → veh_attn_out (Linear D→D)
+        → veh_q_collab (B, M, D)   — "h²"
         │
-        ▼  NEW: fuse individual + collaborative (RANS eq. 25 style)
-   veh_q = fusion_mlp( concat(veh_q_individual, veh_q_collab) )   (B, M, D)
-        │
-        ▼  (unchanged from here — same as today)
+        ▼  fuse individual + collaborative (RANS eq. 25 style)
+   veh_q = self.fuse( concat(veh_q_individual, veh_q_collab) )   (B, M, D)
+        │  Linear(2D → D)
+        ▼  (unchanged from here — same as before bậc 3)
 veh_q + graph_context (broadcast) → PointerAttention(...) → logits (B,M,N+1)
 ```
 
-Est. cost: ~60-80 LOC in `decoder.py`, ~+200K params (2.5M total is tiny),
-no `env.py`/`trainer` changes beyond what §7.7 already added (`td["phase"]`
-is reused, not re-derived). RANS's cross-attention-to-nodes path is **not**
+Actual cost: `JointMVContext.__init__(embed_dim, P=3, linear_bias=False)`
+adds `veh_attn_qkv`, `veh_attn_out`, `fuse` — measured ~+200K params on top
+of the 2.5M baseline. `AttentionModelPolicy.__init__` and `Decoder.__init__`
+both gained a `P: int = 3` param threaded down from `src/train.py`
+(`P=env.P`). No `env.py` changes beyond what §7.7 already added — `td["phase"]`
+is reused, not re-derived. RANS's cross-attention-to-nodes path was **not**
 needed — `PointerAttention` already cross-attends `veh_q` against
-`glimpse_k/v` under the feasibility mask; the only missing ingredient is the
-vehicle-to-vehicle self-attention pre-mixing step.
+`glimpse_k/v` under the feasibility mask; the only missing ingredient was the
+vehicle-to-vehicle self-attention pre-mixing step, now built.
 
-### 8.2 Must-handle: dynamic fleet size (`M ∈ {2,3,5,7,10}`, sampled per instance)
+### 8.2 Dynamic fleet size — handled, proven by test
 
-Training samples fleet size per instance and pads to `M_max` within a batch
-(`env.reset`, `M_max = int(nv.max().item())`) — an instance with `M_i=2` in a
-batch alongside an `M_i=10` instance gets state tensors padded to `M_max=10`,
-with the extra slots zero-initialized "ghost" vehicles. Existing code already
-masks these out of the *action* space (`get_action_mask`'s
-`nonexistent_mask`, `veh_range >= M_per_inst`) — but a **new** self-attention
-layer among vehicle tokens needs the *same* masking applied to itself, or
-real vehicles' representations get polluted by attending to meaningless
-zero-state ghost slots. Fix is the standard transformer padding-mask pattern
-(same `attn_mask`/`sdpa_fn` mechanism `PointerAttention._inner_mha` already
-uses) — recompute `valid_veh = arange(M_max) < td["num_vehicle"]` (cheap,
-from data already on `td`, no `env.py` change needed) and pass it as the
-attention mask for `MHA_vehicles`. Attention itself is permutation-equivariant
-and count-agnostic, so no per-M special-casing is needed beyond this mask —
-one model handles `M=2` through `M=10` (and beyond) uniformly.
+`valid_veh = arange(M) < td["num_vehicle"]` (B,M) bool is computed once in
+`JointMVContext.forward()` and used two ways: (1) masks `comp_norm`'s `amax`
+reduction to real vehicles only (so ghost slots can't skew the normalization
+denominator), (2) passed as the attention mask to the vehicle self-attention
+(`attn_mask=valid_veh.unsqueeze(1)`, True=attend) so ghost "phantom" vehicle
+slots — zero-initialized padding when a batch mixes e.g. `M_i=2` and
+`M_i=10` instances — can't pollute real vehicles' collaborative
+representations. This is proven, not just argued: `tests/test_grpo.py`'s
+`TestBac3DecoderUpgrade::test_ghost_slot_masking` perturbs the ghost-slot
+values in an otherwise-identical batch and asserts the real vehicles'
+outputs are **bit-identical** (`torch.equal`) regardless — attention over
+`M=2..10` is permutation-equivariant and count-agnostic given this one mask,
+no per-M special-casing needed.
 
 ### 8.3 Deferred: Rank-Augmented Module + Disagreement Regularization
 
@@ -541,17 +598,38 @@ this section — until then it's dead weight.
 
 ### 8.4 Sequencing
 
-1. ~~Let bậc 2 finish and get benchmarked~~ — **done, §6.2**: bậc 2 + bậc 1
-   reaches T3 gap +0.1% (noise-level), T2 +6.6%, 20.6% Pareto-dominance,
-   22.8x faster than ILS. This is no longer a blocking dependency for §8 —
-   it's now a judgment call on whether the remaining T2 gap and
-   Pareto-dominance ceiling are worth the next retrain, not a prerequisite
-   check.
-2. If more gap-closing is wanted: build §8.1+§8.2 together as one change,
-   retrain once on top of the phase-masked advantage (consider `group_size`
-   16→32 in the same run, §7.6).
-3. Add the §8.3 monitoring metrics in that same change (passive, ~15 LOC,
-   zero architectural risk).
-4. Defer §8.3's actual fix (RA module + DR loss) until the monitoring
-   metrics actually show degradation, or the curriculum reaches `large` and
-   real instances start exceeding a few hundred arcs.
+1. ~~Let bậc 2 finish and get benchmarked~~ — **done, §6.2**.
+2. ~~Build §8.1+§8.2 together as one change~~ — **done**: implemented,
+   code-reviewed line-by-line (not just taking the implementing agent's
+   report at face value), and covered by `tests/test_grpo.py`'s
+   `TestBac3DecoderUpgrade` (4 tests, including `test_ghost_slot_masking`,
+   §8.2) — full suite green before launching the retrain.
+3. §8.3's monitoring metrics — **not added**; deferred along with §8.3's
+   fix itself (still not worth building, reasoning in §8.3 unchanged).
+4. **Retraining now** — see §8.5.
+
+### 8.5 Training status
+
+Launched on top of the bậc-2 checkpoint's identical hyperparameters (clean
+A/B — only the decoder architecture differs): `MAX_EPOCH=200 BATCH_SIZE=512
+MINI_BATCH_SIZE=256 GROUP_SIZE=16 CURRICULUM=small`, seed 6868.
+
+- Log: `logs/train_20260703_162357.out`. Checkpoint dir:
+  `outputs/checkpoints/grpo_osm_bac3/`. Lightning run: `outputs/lightning_logs/version_3`.
+- Confirmed healthy at launch (epoch 0, no NaN/crash) and remains healthy
+  through epoch 140/200 (last checked 2026-07-03 21:28): best-so-far
+  checkpoint `epoch=131.ckpt` by `val/lex_best`, `last.ckpt` updating every
+  epoch.
+- **Measurably slower per training step** than bậc 2's run (~0.38-0.44 it/s
+  vs bậc 2's ~0.56-0.60 it/s, roughly 30-35% slower) — this is the added
+  per-decode-step cost of `_class_progress()` + the vehicle self-attention
+  block in `JointMVContext`, run once per decode step for every one of the
+  `B*K` rollout copies. Confirmed via code inspection that **no local
+  search is involved in the training path** — bậc 1's funnel hybrid
+  (`RLHybHCARP`) is an inference-only benchmark tool (`src/solvers/rl.py`),
+  never invoked from `src/train.py`/`src/trainers/grpo.py`; the slowdown is
+  entirely the new decoder compute, not an accidental local-search call.
+- Once complete: benchmark the best checkpoint against ILS on
+  `data/osm_test_small` using the same `HYBRID=1 SHORTLIST=25` protocol as
+  bậc 2's v6 row (`logs/status_bm.md`), to produce a clean bậc-2-vs-bậc-3
+  comparison at matched inference settings.
