@@ -730,6 +730,109 @@ config in this document), at the cost of speed dropping from 16.9x to
 needed. Full detail and repro commands: `logs/status_bm.md`.
 
 This is the best result across the full bậc 0→3+P1 progression on every
-axis. Current recommended default inference config for
-`grpo_osm_bac3/epoch=159.ckpt`: `HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25
-EPS=0.01 TOPK_T1=100`.
+axis. See §10 for how the remaining ~5% T1 gap was closed to a literal 100%
+guarantee.
+
+## 10. "P2" — an exact T1 oracle closes the remaining gap to literal 100%
+
+### 10.1 Why P1 still isn't 100%, and what makes 100% possible at all
+
+P1's 94.89% is fundamentally a sampling result: K=400 rollouts almost always
+find ILS's T1 or better, but "almost always" is not "always" — there is no
+guarantee against a residual few percent of instances where the pool simply
+doesn't contain a good enough sample. Closing that residual with more
+sampling alone hits diminishing returns (§9.1's K-scaling data: 20%→30%→
+40%→52% not-worse at K=12/25/50/100 — each doubling buys a shrinking
+increment). A *guarantee* requires an exact method, not more samples.
+
+One exists here, specific to variant P: under linear precedence, every
+vehicle must serve all of its class-1 arcs before any higher class, so a
+vehicle's class-1 workload is an **opening route prefix**, and T1 depends
+*only* on how the class-1 arcs are partitioned across vehicles and ordered
+within each one. With ~7-10 class-1 arcs on this benchmark (never observed
+above 10; the implementation guards up to 16), this is a Held-Karp
+shortest-path DP over the class-1 arcs combined with a submask partition DP
+across ≤M vehicles — solved *exactly*, not sampled, in single-digit
+milliseconds per instance (`src/solvers/oracle.py::t1_oracle_argmin`).
+
+### 10.2 Design: an extra candidate arm, not a replacement
+
+The oracle's optimal class-1 partition is forced into the policy's decode
+as an opening prefix (`_decode_forced`, bypassing the normal sampling
+entrypoint to inject specific actions), then classes 2/3 are completed by
+the policy — `oracle_r=64` sampled completions + 1 greedy, shortlisted by a
+T2-eps-band (all completions from one forced prefix share T1 exactly, so
+plain strict-lex degenerates to argmin-T2 — the same continuous-float
+degeneracy `eps_lex_select` fixed for T1 in bậc 0), then local-searched
+(`_local_search_one`, the same P1-era "keep post-LS only if lex-better"
+convention). This "head" arm's own best candidate is then **unioned** with
+the existing P1 pool arm's answer (`oracle_union_pick`): if the head's T1 is
+strictly better, take it; if the pool's T1 is strictly better, keep it; if
+tied, an eps-band on T2 then min T3 decides — so the oracle arm can only
+help or tie, never override an already-at-least-as-good P1 answer. The
+union winner is re-evaluated through the float64 `SolutionEvaluator` (the
+same precision path local search already uses) before being returned, so
+the "100% not-worse" guarantee holds at full precision rather than the
+decode-time float32 reward's.
+
+An optional exact secondary DP (`oracle_tiebreak=True`, default on) breaks
+ties among multiple T1-optimal class-1 partitions (common — true on ~34% of
+instances) by minimizing a "how soon can each vehicle start class-2" proxy
+(prefix finish time + distance from final position to the nearest class-2
+arc), *within* the T1-optimal tie set — so it cannot regress T1, only choose
+better among equally-T1-optimal options.
+
+### 10.3 Result: the feared T2/T3 regression did not happen — it inverted
+
+Before building this, the obvious risk was raised and taken seriously:
+forcing a policy into a prefix it never chose itself (out-of-distribution
+relative to training, where it always starts from its own decisions) could
+plausibly produce worse completions. Measured on the full 2858-instance
+benchmark (`epoch=159.ckpt`, `NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01
+TOPK_T1=100 ORACLE_HEAD=1`, `scripts/bm.sh`):
+
+| Config | T1 | T2 | T3 | gap vs ILS (T1/T2/T3) | lex-win | Pareto-dom | speedup |
+|---|---|---|---|---|---|---|---|
+| ILS | 5.012 | 10.056 | 15.804 | — | — | — | 1.0x |
+| Bậc 3 + P1 (v8) | 4.758 | 10.047 | 15.515 | -5.1%/-0.1%/-1.8% | 90.2% | 36.4% | 5.4x |
+| **Bậc 3 + P1 + P2** | **4.692** | **8.894** | **14.965** | **-6.4%/-11.6%/-5.3%** | **98.0%** | **57.5%** | 4.1x |
+
+**T1-not-worse-than-ILS: 94.89% → 100.00%** — verified at both a `1e-6`
+relative tolerance and literal `tol=0` exact comparison (the float64
+re-evaluation step delivers the guarantee at full precision, no residual
+float32 noise). Every other tracked metric improved substantially rather
+than regressing: T2-not-worse 52.9%→85.09%, T3-not-worse 55.9%→63.19%,
+lex-win 90.2%→98.0%, Pareto-dominance 36.4%→57.5% — the best result across
+the entire bậc 0→3+P1+P2 progression on every axis simultaneously, at the
+cost of speed dropping further from 5.4x to 4.1x ILS (still comfortably
+faster).
+
+The mechanism behind the inverted risk: the oracle's class-1 partition is
+min-max-balanced across vehicles *by construction* (that's literally what
+it optimizes), which tends to leave vehicles in a better-positioned state
+for class-2 than the policy's own typically-unbalanced prefixes would —
+so forcing it doesn't just avoid hurting T2/T3, it actively helps on
+average.
+
+### 10.4 Scope and caveats
+
+- **Variant P only.** The oracle's forced-opening-prefix premise depends on
+  P's linear precedence; `RLHybHCARP._oracle_head_arm` explicitly declines
+  (returns `None`, falls back to the pool arm unchanged) when
+  `self.variant != 'P'`. `oracle_head` has no effect for variant U and
+  should stay off there.
+- **Applicability guard, not an assumption.** `t1_oracle_argmin` requires
+  `n1 <= max_n1` (default 16; the DP is `O(2^n1 · n1²)`) and a
+  capacity-feasible partition to exist; either failing returns `T1 = inf`
+  and the caller falls back to the pool arm with no crash. This benchmark's
+  actual max `n1` is 10 — comfortably inside the guard — but the guard is
+  enforced, not assumed, for future data with larger class-1 counts.
+  Scaling to noticeably larger `n1` would need a different, likely
+  approximate, method for the class-1 subproblem — the guard is exactly
+  the tripwire for when that becomes necessary.
+- **Backward compatible.** `oracle_head` defaults to `False`; every
+  existing config, script, and prior benchmark row is unaffected. Proven by
+  `tests/test_rl.py::TestOracleHeadRegression.test_disabled_is_byte_identical_to_p1`
+  (byte-identical output to the pre-P2 pipeline under a fixed seed) and
+  `test_oracle_code_not_reached_when_disabled` (the oracle path isn't even
+  invoked unless opted in).

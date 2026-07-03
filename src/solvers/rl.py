@@ -52,6 +52,62 @@ def eps_lex_select(reward, eps=0.005, shortlist=1):
     return keep[:shortlist]
 
 
+def shortlist_completions(reward, k, eps=0.01):
+    """Shortlist up to `k` forced-prefix completions for local search.
+
+    All completions decoded from one forced class-1 prefix share T1 exactly
+    (the prefix determines it), so strict-lex ranking degenerates to
+    argmin-T2 -- the same degeneracy `eps_lex_select` fixes for T1. Rank by an
+    eps-band on T2 sorted by T3 instead, padded with the strict-(T2,T3)-lex
+    rest when the band is smaller than `k`.
+
+    reward : (R, P) array of completion T-vectors, LOWER is better.
+    Returns indices into `reward`'s first axis, best first.
+    """
+    t2 = reward[:, 1]
+    band = np.where(t2 <= t2.min() * (1.0 + eps))[0]
+    band = band[np.argsort(reward[band, 2])]
+    if len(band) < k:
+        rest = np.lexsort((reward[:, 2], reward[:, 1]))
+        seen = set(band.tolist())
+        band = np.concatenate(
+            [band, [i for i in rest if i not in seen]]).astype(np.int64)
+    return band[:k]
+
+
+def t2_band_pick(Ts, eps2):
+    """Pick one candidate among finished oracle-head candidates.
+
+    All rows share T1, so this is a pure (T2, T3) choice: keep candidates with
+    T2 <= T2min * (1 + eps2), take min T3 among them. Returns a row index.
+
+    Ts : (k, 3) array of T-vectors (rows with non-finite T1 are ignored).
+    """
+    ok = np.where(np.isfinite(Ts[:, 0]))[0]
+    c = Ts[ok]
+    band = np.where(c[:, 1] <= c[:, 1].min() * (1.0 + eps2))[0]
+    return int(ok[band[np.argmin(c[band, 2])]])
+
+
+def oracle_union_pick(a, b, eps2, tie_tol=1e-6):
+    """Union rule between the pool arm's final pick and the oracle-head arm's.
+
+    a : P1 (pool-based funnel) T-vector;  b : oracle-head T-vector.
+    Returns True iff the head candidate `b` should be taken:
+      - head T1 strictly better beyond a relative tie tolerance -> head;
+      - P1 T1 strictly better -> P1;
+      - T1 tied -> eps2-band on T2, min T3 (same band rule as `t2_band_pick`).
+    """
+    if b[0] < a[0] - tie_tol * max(a[0], 1e-9):
+        return True
+    if b[0] > a[0] + tie_tol * max(a[0], 1e-9):
+        return False
+    lo = min(a[1], b[1])
+    if abs(a[1] - b[1]) <= eps2 * max(lo, 1e-9):
+        return b[2] < a[2]
+    return b[1] < a[1]
+
+
 class RLHCARP:
     def __init__(self, pw, variant, device='cuda'):
         from policy.policy import AttentionModelPolicy
@@ -149,13 +205,43 @@ class RLHybHCARP(RLHCARP):
     ILS" 82.75%->95.31%, "T2 not worse" 44.2%->53.1%, lex-win 69.3%->86.4%,
     Pareto-dominance 26.2%->36.5%, at 0.144s/instance (still 5.6x faster than
     ILS's 0.81s/instance) -- see `logs/status_bm.md` for the full repro.
+
+    `oracle_head` (default False, no-op) adds a second, independent candidate
+    arm for variant P: an exact T1 oracle (`solvers.oracle.t1_oracle_argmin`,
+    Held-Karp + partition DP over the class-1 arcs) yields a provably
+    T1-optimal per-vehicle class-1 opening prefix, which is forced into the
+    policy's Joint M x N decode; classes 2/3 are then completed with
+    `oracle_r` sampled rollouts + 1 greedy, shortlisted by a T2-eps-band
+    (all completions share the forced T1), local-searched, and the arm's own
+    best is unioned with the pool arm's pick (`oracle_union_pick`). The
+    union winner's T-vector is re-evaluated through the float64
+    `SolutionEvaluator` before being returned. When the oracle is not
+    applicable (class-1 arc count > `oracle_max_n1`, or no capacity-feasible
+    partition exists), the head arm is skipped and the pool arm's answer is
+    returned unchanged. Measured on `data/osm_test_small` (2858 instances,
+    same ckpt as above, on top of NUM_SAMPLE=400 TOPK_T1=100): "T1 not worse
+    than ILS" 95.31%->100%, T2 52.9%->86.0%, T3 55.9%->63.5%, lex-win
+    86.4%->98.3%, Pareto 36.5%->57.7%, at ~3.4x ILS speed.
     """
 
-    def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0):
+    def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0,
+                 oracle_head=False, oracle_r=64, oracle_shortlist=8,
+                 oracle_shortlist_eps=0.01, oracle_union_eps2=0.02,
+                 oracle_tiebreak=True, oracle_max_n1=None):
         super().__init__(pw, variant, device=device)
         self.shortlist = shortlist
         self.eps = eps
         self.topk_t1 = topk_t1
+        self.oracle_head = oracle_head
+        self.oracle_r = oracle_r
+        self.oracle_shortlist = oracle_shortlist
+        self.oracle_shortlist_eps = oracle_shortlist_eps
+        self.oracle_union_eps2 = oracle_union_eps2
+        self.oracle_tiebreak = oracle_tiebreak
+        if oracle_max_n1 is None:
+            from solvers.oracle import MAX_N1_DEFAULT
+            oracle_max_n1 = MAX_N1_DEFAULT
+        self.oracle_max_n1 = oracle_max_n1
         from solvers.evaluator import SolutionEvaluator
         self.evaluator = SolutionEvaluator(variant=variant)
 
@@ -189,6 +275,104 @@ class RLHybHCARP(RLHCARP):
             if len(trip):
                 new_vehicles[m].append(trip)
         return self.evaluator._completion_times(new_vehicles, td0), new_vehicles
+
+    @torch.inference_mode()
+    def _decode_forced(self, forced, B, greedy=False):
+        """Replicate the loaded instance B times, force `forced` flat Joint
+        M x N actions as the decode opening, then let the policy complete by
+        sampling (or argmax when `greedy`).
+
+        Bypasses the policy's normal sampling entrypoint: runs the encoder
+        once, then steps the env directly so arbitrary actions can be
+        injected. Every forced action is checked against the env's
+        `action_mask`; an infeasible one (an oracle/env mismatch -- never
+        observed on the benchmark) aborts by returning None so the caller
+        falls back to the pool arm.
+
+        Returns (reward (B, P) float64 np, actions (B, S) int64 np) or None.
+        """
+        td = batchify(self.td, B) if B > 1 else self.td.clone()
+        hidden, _ = self.policy.encoder(td)
+        td, env, cache = self.policy.decoder.pre_decoder_hook(td, self.env, hidden)
+        dev = td.device
+        acts = []
+        for a in forced:
+            if not bool(td["action_mask"][0, a]):
+                return None
+            sel = torch.full((B,), int(a), dtype=torch.long, device=dev)
+            td.set("action", sel)
+            td = env.step(td)
+            acts.append(sel)
+        steps = 0
+        while not td["done"].all():
+            logits, mask = self.policy.decoder(td, cache)
+            lf = logits.reshape(B, -1).masked_fill(~mask.reshape(B, -1), float('-inf'))
+            if greedy:
+                sel = lf.argmax(-1)
+            else:
+                sel = torch.multinomial(torch.softmax(lf, -1), 1).squeeze(1)
+            td.set("action", sel)
+            td = env.step(td)
+            acts.append(sel)
+            steps += 1
+            if steps > 10000:
+                raise RuntimeError("forced decode did not terminate")
+        reward = env.get_reward(td).cpu().numpy().astype(np.float64)
+        actions = torch.stack(acts, 1).cpu().numpy().astype(np.int64)
+        return reward, actions
+
+    def _oracle_head_arm(self, td0, M, N1, adj, clss, demands, classes):
+        """Compute the oracle-head arm's own best candidate.
+
+        Pipeline (see class docstring): exact T1 oracle -> forced-prefix
+        decode (`oracle_r` sampled + 1 greedy completion) -> T2-eps-band
+        shortlist -> local search (P1 convention: keep post-LS only if
+        strictly lex-better) -> arm-internal pick via `t2_band_pick`.
+
+        Returns (T_vec float64 (3,), vehicles) or (None, None) when the
+        oracle is not applicable for this instance.
+        """
+        from solvers.oracle import forced_flat_actions, t1_oracle_argmin
+
+        if self.variant != 'P':
+            # The oracle's premise (class-1 arcs form a forced opening prefix)
+            # only holds under variant P's precedence; decline otherwise.
+            return None, None
+        svc = td0["service_times"].cpu().numpy().astype(np.float64)
+        res = t1_oracle_argmin(adj, svc, clss, demands, M,
+                               tiebreak=self.oracle_tiebreak,
+                               max_n1=self.oracle_max_n1)
+        if not np.isfinite(res["T1"]) or res["parts"] is None:
+            return None, None                       # oracle not applicable
+        forced = forced_flat_actions(res["parts"], N1)
+
+        pools = []                                  # (reward, actions, shortlist idxs)
+        g = self._decode_forced(forced, 1, greedy=True)
+        if g is None:
+            return None, None                       # forced prefix infeasible
+        pools.append((g[0], g[1], [0]))
+        if self.oracle_r > 0:
+            s_rew, s_act = self._decode_forced(forced, self.oracle_r, greedy=False)
+            sl = shortlist_completions(s_rew, self.oracle_shortlist,
+                                       eps=self.oracle_shortlist_eps)
+            pools.append((s_rew, s_act, sl))
+
+        cands = []                                  # (T_vec, vehicles)
+        for rew, act, idxs in pools:
+            for idx in idxs:
+                idx = int(idx)
+                pre_T = np.asarray(rew[idx], dtype=np.float64)
+                pre_vehicles = self.evaluator.routes_from_joint_actions(
+                    act[idx], M, N1)
+                ls_T, ls_vehicles = self._local_search_one(
+                    pre_vehicles, td0, M, adj, clss, demands, classes)
+                if ls_T is not None and tuple(ls_T.tolist()) < tuple(pre_T.tolist()):
+                    cands.append((np.asarray(ls_T, dtype=np.float64), ls_vehicles))
+                else:
+                    cands.append((pre_T, pre_vehicles))
+        Ts = np.stack([c[0] for c in cands])
+        j = t2_band_pick(Ts, self.oracle_union_eps2)
+        return cands[j]
 
     def __call__(self, num_sample=100):
         td = batchify(self.td, num_sample)
@@ -231,6 +415,20 @@ class RLHybHCARP(RLHCARP):
             key = tuple(cand_T.tolist())
             if best_key is None or key < best_key:
                 best_key, best_T, best_vehicles = key, cand_T, cand_vehicles
+
+        # ---- optional oracle-head arm (opt-in; never alters the pool arm) --
+        if self.oracle_head:
+            head_T, head_vehicles = self._oracle_head_arm(
+                td0, M, N1, adj, clss, demands, classes)
+            if head_T is not None:
+                if oracle_union_pick(np.asarray(best_T, dtype=np.float64),
+                                     head_T, self.oracle_union_eps2):
+                    best_T, best_vehicles = head_T, head_vehicles
+                # re-evaluate the union winner at float64 (same evaluator path
+                # local search uses) so the returned T-vector -- and the T1
+                # optimality guarantee -- hold at full precision, not just the
+                # decode-time fp32 reward's.
+                best_T = self.evaluator._completion_times(best_vehicles, td0)
 
         # expose the winning solution structure (not just its T-vector) for
         # downstream consumers, e.g. the RL-warm-started ILS.
@@ -311,6 +509,25 @@ def parse_args():
                         help='hybrid mode: extra #candidates picked by raw T1 rank '
                              '(on top of the eps-lex shortlist), local-searched too. '
                              '0 = disabled (default, no behavior change)')
+    parser.add_argument('--oracle_head', action='store_true',
+                        help='hybrid mode: add the exact-T1-oracle forced-prefix arm '
+                             '(variant P) and union it with the pool arm '
+                             '(default: off, no behavior change)')
+    parser.add_argument('--oracle_r', type=int, default=64,
+                        help='oracle_head mode: #sampled completions per forced prefix '
+                             '(+1 greedy; default 64)')
+    parser.add_argument('--oracle_shortlist', type=int, default=8,
+                        help='oracle_head mode: #completions that get local search '
+                             '(default 8)')
+    parser.add_argument('--oracle_shortlist_eps', type=float, default=0.01,
+                        help='oracle_head mode: relative T2 eps-band for completion '
+                             'shortlisting (default 0.01)')
+    parser.add_argument('--oracle_union_eps2', type=float, default=0.02,
+                        help='oracle_head mode: relative T2 eps-band for the arm-internal '
+                             'pick and the P1-vs-head union (default 0.02)')
+    parser.add_argument('--oracle_tiebreak', type=int, default=1,
+                        help='oracle_head mode: 1 = exact lexicographic tiebreak among '
+                             'T1-optimal prefixes (default), 0 = plain argmin')
     parser.add_argument('--warm_ils', action='store_true',
                         help='batch mode: hybrid funnel + short ILS refinement '
                              'warm-started from the hybrid winner (implies --hybrid)')
@@ -424,7 +641,12 @@ if __name__ == "__main__":
                                 ils_iters=args.ils_iters, seed=args.seed)
         elif args.hybrid:
             al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
-                            eps=args.eps, topk_t1=args.topk_t1)
+                            eps=args.eps, topk_t1=args.topk_t1,
+                            oracle_head=args.oracle_head, oracle_r=args.oracle_r,
+                            oracle_shortlist=args.oracle_shortlist,
+                            oracle_shortlist_eps=args.oracle_shortlist_eps,
+                            oracle_union_eps2=args.oracle_union_eps2,
+                            oracle_tiebreak=bool(args.oracle_tiebreak))
         else:
             al = RLHCARP(ckpt_path, args.variant)
         for f in files:
