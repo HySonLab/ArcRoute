@@ -13,6 +13,11 @@ precedence). Objective: lexicographically minimize `(T1, T2, T3)` where
 
 ## 2. Data flow (topology)
 
+### 2.1 Shared building block: one decode step
+
+Both training and inference bottom out in the same encoder → decoder → env
+loop; what differs is what wraps around it (§2.2 vs §2.3).
+
 ```
 .npz instance (data/osm_train|val|test)
         │  utils.ops.import_instance / iter_instances
@@ -31,6 +36,8 @@ precedence). Objective: lexicographically minimize `(T1, T2, T3)` where
         │
         ▼   ┌──────────────────────────── decode loop (while not done) ────────────┐
         │   │ JointMVContext(cache.node_embeddings, td) → veh_q (B,M,D)            │
+        │   │   (bậc-3: individual query + masked cross-vehicle self-attention     │
+        │   │    + fuse, §3/§8 — identical module at train and inference time)     │
         │   │ PointerAttention(veh_q, glimpse_k, glimpse_v, logit_k, mask)          │
         │   │        → logits (B,M,N+1)                                            │
         │   │ flatten → (B, M*(N+1)) joint action space                            │
@@ -41,17 +48,101 @@ precedence). Objective: lexicographically minimize `(T1, T2, T3)` where
         │   └─────────────────────────────────────────────────────────────────────┘
         ▼
   env.get_reward(td) : T_k = max over class-k arcs of completion_at_arc  (GPU, no CPU Scheduler)
-        │
-        ▼
-  GRPO.centered_hier_rank_gpu(T)  →  group-relative advantage
-        │
-        ▼
-  clipped surrogate loss (mini-batch replay) → backward → AdamW step
 ```
 
 Key point: the policy decides **(vehicle, arc) jointly at every step** — it is
 not "decide arc order, then assign to vehicles" (that was the pre-GRPO-v3
 design; see §7).
+
+### 2.2 Training-time pipeline (`src/train.py` + `src/trainers/grpo.py`)
+
+No funnel, no local search, no oracle head — those are all inference-only
+additions in `src/solvers/rl.py` and are never invoked from the training
+code path. Training only ever runs the §2.1 loop once per rollout, purely
+to produce a gradient signal:
+
+```
+batch of B instances (curriculum "small": 20_30/20_40, M random in {2,3,5,7,10})
+      │
+      ▼  encoder (§2.1), once per instance
+      ▼  batchify K=16 (group_size, POMO-style — instance-norm makes the K
+      │  copies' embeddings identical, so this is free, no extra encode)
+      ▼
+┌──────────── rollout, torch.no_grad(), decode_type='sampling' ─────────────┐
+│ §2.1 decode loop, B*K copies in parallel, decoder = current bậc-3 module  │
+│ NO local search, NO oracle head → actions + reward (B,K,3) = (T1,T2,T3)  │
+└────────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼  centered_hier_rank_by_phase(T, gamma=0.5)  (§4, §7.2)
+      │    per-level centered midrank across the K group, combined with
+      │    geometric weights; each decode step only receives advantage from
+      │    priority levels it could causally still influence (its phase)
+      ▼  DAPO dynamic group filtering: all-K-tied groups → zero advantage,
+      │  dropped before the gradient pass (train/skipped_frac)
+      ▼
+┌──────── mini-batch replay, WITH gradient, decode_type='evaluate' ─────────┐
+│ replay the stored actions in chunks of mini_batch_size, fresh log-probs, │
+│ REINFORCE surrogate (no PPO ratio/clip — θ is unchanged since rollout)   │
+│ weighted by per-step phase-gathered advantage − entropy bonus            │
+└────────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼  gradient accumulated across chunks → one backward + AdamW step
+      ▼  (periodic) eval step: greedy rollout on val set → val/T{k}_best,
+         val/lex_best → drives ModelCheckpoint selection
+```
+
+### 2.3 Inference-time pipeline (current best config)
+
+Checkpoint `epoch=159.ckpt`, `HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01
+TOPK_T1=100 ORACLE_HEAD=1`.
+
+`src/solvers/rl.py::RLHybHCARP`. Same encoder/decoder as §2.2 (weights
+frozen, `eval()` mode) — everything below is inference-time search wrapped
+around it, none of it changes what the policy learned:
+
+```
+.npz instance
+      │
+      ▼  encoder (§2.1), once per instance
+      │
+      ├──────────────────────── ARM A: pool funnel (P1, §9) ───────────────────┐
+      │  batchify K=400 → §2.1 decode loop, decode_type='sampling'             │
+      │  → eps_lex_select(eps=0.01, shortlist=25)   [near-best-T1 candidates]  │
+      │  → ∪ top-100-by-raw-T1 (topk_t1=100)        [T1-dedicated candidates]  │
+      │  → local search (intra/inter route) per candidate, keep only if       │
+      │    strictly lex-better than pre-LS                                    │
+      │  → strict-lex-best  =>  pool_best (T1,T2,T3)                          │
+      └──────────────────────────────────────────────────────────────────────────┘
+      │
+      ├──────────────────── ARM B: oracle head (P2, §10, variant P only) ──────┐
+      │  t1_oracle_argmin (`solvers/oracle.py`): Held-Karp + partition DP over │
+      │    class-1 arcs → exact T1 optimum + witnessing per-vehicle prefix     │
+      │    (+ optional exact tiebreak among T1-optimal ties)                   │
+      │  → force prefix into decode (`_decode_forced`, bypasses the normal     │
+      │    sampling entrypoint to inject specific actions)                     │
+      │  → complete classes 2/3: oracle_r=64 sampled + 1 greedy                │
+      │  → shortlist by T2-eps-band (oracle_shortlist=8) → local search        │
+      │  → arm-internal pick (`t2_band_pick`)  =>  head_best (T1,T2,T3)        │
+      │  (guard: n1 > max_n1=16 or infeasible → returns None, arm contributes  │
+      │   nothing, pool_best passes through unchanged)                        │
+      └──────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼  oracle_union_pick(pool_best, head_best, eps2=0.02):
+      │    T1 strictly better on one side → take it; T1 tied → eps-band on T2,
+      │    then min T3
+      ▼  re-evaluate the union winner via the float64 SolutionEvaluator
+      │  (same precision path local search already uses — the T1 guarantee
+      │   holds at full precision, not just decode-time float32)
+      ▼
+  output: (T1, T2, T3) + winning route
+```
+
+Summary: one encode, two parallel candidate-finding arms (one searches
+broadly via sampling + local search, the other solves the T1 subproblem
+exactly and lets the policy complete the rest), merged lexicographically,
+then re-verified at full precision. Everything past the encoder/decoder is
+inference-time compute, not learned weights — §2.2's training never sees
+any of it.
 
 ## 3. Policy architecture
 
@@ -144,9 +235,11 @@ Critic-free: **group-relative rank IS the advantage**, no value network.
    skipped.
 5. **Mini-batch replay with gradient**: chunks of `mini_batch_size // K`
    instances at a time, `decode_type='evaluate'` replays the stored actions
-   to get fresh log-likelihoods at the current policy, clipped surrogate
-   loss, gradient accumulated across chunks, **one** optimizer step per
-   training step (`automatic_optimization=False`).
+   to get fresh log-likelihoods at the current policy — since θ hasn't
+   changed since the rollout, this is a REINFORCE surrogate, not a PPO
+   ratio/clip (see §4's Loss subsection) — gradient accumulated across
+   chunks, **one** optimizer step per training step
+   (`automatic_optimization=False`).
 
 This two-phase (no-grad full rollout, then grad-enabled mini-batch replay)
 is what keeps memory bounded: encode-once-with-grad at B×K=1024 sequences on
@@ -183,11 +276,19 @@ Out of scope for this doc; see `solvers/meta.py::BaseHCARP.calc_obj` and
 
 ### Loss
 
-Length-normalized log-likelihood (sum over valid decode steps / valid count,
-excludes post-`done` padding steps) × clipped-ratio surrogate
-(`clip_range` via PPO-style `ratio = exp(ll_new - ll_old)`) − `entropy_lambda
-* entropy`. Gradient-clipped by norm, `AdamW`, linear warmup → one-shot
-cosine decay to `lr_min` (`configure_optimizers`).
+**Not a clipped PPO surrogate — pure REINFORCE at fixed θ.** The mini-batch
+replay recomputes log-likelihoods with the *same* weights the rollout used
+(no optimizer step happens between rollout and replay), so there's no
+old-vs-new policy ratio to clip; `grpo.py`'s own module docstring notes this
+explicitly ("opt.step after all chunks keeps theta fixed, so a PPO ratio
+would be == 1"). The actual loss is a per-step advantage-weighted
+log-likelihood: `surr = -((ll * adv_step).sum(-1) / valid_len).mean()`
+(`adv_step` = the phase-gathered advantage, §7.7) `− entropy_lambda *
+entropy`. Gradient-clipped by norm, `AdamW`, linear warmup → one-shot
+cosine decay to `lr_min` (`configure_optimizers`). (This section previously
+described a PPO-style clipped-ratio surrogate that doesn't match the code —
+corrected after it was flagged during the oracle-in-training investigation,
+§11.)
 
 ### Eval step
 
@@ -836,3 +937,74 @@ average.
   (byte-identical output to the pre-P2 pipeline under a fixed seed) and
   `test_oracle_code_not_reached_when_disabled` (the oracle path isn't even
   invoked unless opted in).
+
+## 11. Investigated and rejected: moving the oracle into training
+
+P2 (§10) only helps at *inference* time and costs real latency (5.4x→4.1x
+ILS). The natural next question — can the exact T1 oracle be folded into
+*training* instead, so the policy learns to act like it directly (faster
+inference, no separate oracle-forced decode arm needed), and does that
+lesson transfer to `medium`/`large` curriculum where the oracle itself is
+computationally inapplicable (§10.4, n1 ≈ 21-35 there vs the guard's 16)?
+Investigated via a smoke-scale experiment (fine-tuning `epoch=159.ckpt` for
+a few hundred steps, not a full retrain) before committing to anything —
+**result: negative, don't pursue this**, kept here so it isn't re-investigated.
+
+**Mechanism tried**: mix 1-2 of each K=16 training rollouts per group with an
+oracle-forced class-1 prefix (same `_decode_forced` mechanism §10 uses at
+inference), let the policy complete classes 2/3, and feed the result through
+the *existing* GRPO machinery unchanged (phase-masked group-rank advantage,
+DAPO filtering, replay loss) — no new loss term. This is mathematically
+clean in this trainer specifically because the loss is **pure REINFORCE at
+fixed θ, not a clipped PPO ratio** (§4's Loss subsection, corrected during
+this investigation) — there's no importance-sampling machinery an off-policy
+forced rollout could violate; a forced rollout's gradient is just
+rank-advantage-weighted imitation, which should auto-anneal to zero once the
+policy already matches the oracle (midrank tie-averaging zeroes a tied
+slot's relative advantage).
+
+**Measured result: it makes the policy worse, not better, at both scales.**
+At the training curriculum itself ("small"), a symmetry problem bites: the
+oracle's `parts` fix one arbitrary vehicle-assignment + linearization out of
+a large T1-equivalent class, so naive teacher-forcing punishes the policy
+for preferring any other equally-good linearization (probed: base-policy
+mean logp on forced steps ≈ -5.3 to -5.8 vs -1.7 to -1.9 on its own
+choices). A symmetry-aware "constrained-decode" variant (restrict the
+action set to {each vehicle's next oracle-part arc}, let the policy pick
+its own interleaving/timing) reduces the damage but still doesn't help:
+across every dose/lr tried (teacher 2/16 and 1/16 doses, constrained-decode
+2/16), the greedy-decode match-rate against the exact oracle *degraded*
+relative to a plain-GRPO control run on the same fixed batches (control:
+58-60%, flat; oracle-guided arms: 45-51%, worse), and the best-of-16 gap
+only marginally beat the control's own run-to-run noise band.
+
+**Transfer to `medium` — the hoped-for payoff — was clearly negative, not
+just absent.** Paired greedy-T1 head-to-head against a matched control on
+247 `medium`-curriculum val instances (n1 mean 21.3, oracle verifiably
+inapplicable on 100% of them): every oracle-guided arm lost to its control
+more often than it won (worst: 74.1% loss rate; best variant tried, the
+constrained-decode one: still 61.5% loss rate). Whatever the guidance
+taught was small-scale-specific pattern-matching, not a transferable
+"balance class-1 completion across vehicles" skill — the opposite of the
+hoped-for generalization.
+
+**Caveat, stated plainly**: this fine-tunes an already-converged, plateaued
+checkpoint for a few hundred steps — it does not rule out that mixing this
+signal in *from scratch* (integrated over a full ~5h training run rather
+than bolted onto a plateau) could behave differently. That hypothesis is
+untested and not cheaply testable (it requires the full retrain this
+investigation was specifically designed to avoid committing to without
+evidence).
+
+**Recommendation adopted**: keep the inference-time-only P1+P2 design
+(§9-§10) as-is; it already delivers 100% T1-not-worse, 98% lex-win, 57.5%
+Pareto-dominance at 4.1x ILS speed, and the smoke evidence argues against
+spending a training cycle chasing this specific idea. If inference speed
+(4.1x) becomes the binding constraint, the right lever is tuning the
+inference budget directly (`NUM_SAMPLE`/`oracle_r`/`oracle_shortlist`) —
+orthogonal to training, cheap to re-measure, no retrain required. One cheap
+thing worth keeping from this investigation: logging "greedy/best-of-K T1
+vs exact-oracle T1" as a passive validation-time diagnostic in any future
+training run (near-zero cost, gives a calibrated T1-optimality readout and
+would be the pre-registered success metric if this idea is ever revisited
+with a from-scratch retrain).
