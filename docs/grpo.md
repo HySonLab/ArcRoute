@@ -1382,3 +1382,73 @@ instance range. A full benchmark run on real `medium`/`large` curriculum
 data (analogous to `logs/status_bm.md`'s small-curriculum rows) has not
 yet been done — this section documents the component-level validation
 that makes such a run possible, not a new end-to-end benchmark result.
+
+## 16. Investigated and rejected (4th and final round): staged imitate-then-RL-cleanup
+
+Fourth and final round in the training-time-hybridization series (§11-13),
+testing one specific, previously-untested idea: instead of mixing a
+heuristic/imitation signal WITH ongoing RL training every step (§11-13,
+all failed), **separate the two into clean sequential stages** — (Phase A)
+a dedicated imitation-only fine-tune on class-1 behavior (no RL loss at
+all), then (Phase B) a further plain-GRPO-only phase meant to let the
+policy "clean up" any imitation artifacts before evaluation. This also
+tests a necessary precondition for a further idea (freeze class-1's
+result, move to class-2, repeat) that the user proposed and explicitly
+deferred pending this narrower result.
+
+**Design**: Phase A = 100 steps of pure cross-entropy on class-1 decode
+steps only, target = the exact T1 oracle's solution (fast and exact at
+`small`-curriculum n1 sizes), linearized via §13's symmetry-mitigating
+policy-preferred interleaving. Phase B = 200 further steps of ordinary
+GRPO (no imitation, no forcing at all) on the same data. Total 300 steps,
+matching the existing 300-step plain-GRPO control's budget exactly (fair,
+matched-budget comparison, reused from prior rounds).
+
+**Result: does not repeat the prior rounds' decisive medium-transfer
+failure — but only because Phase B erases what Phase A taught, not
+because it found something that survives.** Measured class-1-step
+logp-gap trajectory (target vs the policy's own choice, held-out small
+instances): pre-Phase-A -1.99 → after Phase A **-0.51** (genuine, strong
+learning of the oracle's behavior) → after Phase B **-1.70**, reverting to
+within ~0.3 nats of the plain-GRPO control's -2.02. The reversion happens
+fast — the first ~25 of Phase B's 200 GRPO steps already undo most of it.
+
+On the medium-curriculum decisive test (247 real held-out instances): the
+post-Phase-A-only checkpoint is the **worst performer measured across all
+four rounds of this investigation** — 82.6% lex16 loss rate vs base
+(worse than §13's BC arm), T1-not-worse-vs-ILS 11.3% (down from base's
+23.1%). After Phase B's cleanup, the final checkpoint recovers to
+parity-with-noise against the matched-budget control (53.8% lex16 win,
+23.5% T1-not-worse — nominally the best figures of any heuristic-involved
+arm in this whole series, but within the run-to-run noise band this
+project has repeatedly measured for this metric, e.g. §9's finding that
+even ILS-vs-itself only reaches 66.6%). So the headline "doesn't lose"
+result is real, but it is achieved by the model discarding the imitation
+signal almost entirely, not by consolidating it into something useful.
+
+**Verdict on the deferred multi-class staged/freeze idea: not worth
+pursuing.** Its premise — that Phase A's class-1 competence could be
+locked in (frozen) and built upon for class-2, then class-3 — is directly
+contradicted by this data: freezing right after Phase A would lock in the
+single worst checkpoint measured in the whole investigation; leaving it
+unfrozen (as tested) lets RL erase it within ~25 steps. There is no
+retained benefit for a freeze mechanism to protect, so the harder
+engineering problem of building one (§13 already noted the architecture
+has no separable per-phase module to freeze) isn't worth solving for this.
+
+**Cross-round synthesis (§11+§12+§13+§16 — four independently-designed
+attempts, closing this line of investigation)**: oracle-forcing,
+LS-reward-shaping, ILS-imitation, and staged imitate-then-cleanup all
+converge on the same conclusion — no way of injecting a heuristic-derived
+signal into this training loop, however carefully isolated, staged, or
+filtered, has produced a policy that is measurably better at `medium`-scale
+generalization than plain GRPO alone. The one genuinely positive signal
+surfaced anywhere in this series remains §13's `rlmed` control (plain GRPO
+fine-tuned with exposure to real medium-curriculum batches, no heuristic
+involved at all) — if a training-side improvement is wanted, broadening
+the training curriculum itself is the lever with actual evidence behind
+it, not heuristic hybridization. Recommendation unchanged from §11-13:
+report the inference-time-only P1+P2(+§15) system as the hybrid
+contribution; do not attempt a fifth heuristic-in-training variant
+without genuinely new information (e.g. a from-scratch retrain, still
+untested by any of these four smoke-scale rounds).
