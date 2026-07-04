@@ -74,8 +74,7 @@ MODE=full ALGO=ppo ./scripts/train.sh
 
 ## Pretrained weights and data
 
-- [Pretrained weights](https://drive.google.com/drive/folders/16R3gudbrDpMo9sZn-iLxHVXkXTHUCVQi)
-- [Dataset](https://drive.google.com/drive/folders/1JAgkaH1TnPz7zls_oCbsjJP2nGpkTRPm)
+- [Download pretrained weights and data](https://drive.google.com/drive/folders/1IIvJWIM-3676Nl30gROam8qQsNdRwBPU?usp=sharing)
 
 ## Citation
 
