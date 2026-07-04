@@ -218,6 +218,106 @@ class TestT1OracleArgmin(unittest.TestCase):
                          [2, 1, 2 * 7 + 3])
 
 
+# ------------------------------------------------------------------- 1b
+class TestT1HeuristicArgmin(unittest.TestCase):
+    """`t1_heuristic_argmin` -- the large-n1 fallback for `t1_oracle_argmin`
+    (P2's medium/large-curriculum extension). Never claims exactness; these
+    tests check it's never *below* the exact optimum, produces internally
+    consistent (coverage/capacity/completion-formula) parts, and degrades
+    to `inf`/`None` gracefully exactly like the oracle does."""
+
+    def setUp(self):
+        adj, _, veh, demands, clss, svc, _, _ = _hand_instance()
+        self.adj = adj.astype(np.float64)
+        self.svc = svc.astype(np.float64)
+        self.clss = clss.astype(np.int64)
+        self.dem = demands.astype(np.float64)
+        self.M = len(veh)
+
+    def test_matches_exact_and_parts_consistent(self):
+        from solvers.oracle import t1_heuristic_argmin, t1_oracle_argmin
+        exact = t1_oracle_argmin(self.adj, self.svc, self.clss, self.dem, self.M)
+        res = t1_heuristic_argmin(self.adj, self.svc, self.clss, self.dem, self.M,
+                                  time_budget=0.2, seed=0)
+        # never beats the exact optimum; on this tiny instance should match it.
+        self.assertGreaterEqual(res["T1"], exact["T1"] - 1e-6)
+        self.assertAlmostEqual(res["T1"], exact["T1"], places=6)
+
+        parts = res["parts"]
+        self.assertEqual(len(parts), self.M)
+        served = [a for p in parts for a in p]
+        self.assertEqual(sorted(served),
+                         sorted(np.where(self.clss == 1)[0].tolist()))
+        for p in parts:
+            if p:
+                self.assertLessEqual(self.dem[p].sum(), 1.0 + 1e-9)
+        comp = max(_completion(self.adj, self.svc, p) for p in parts if p)
+        self.assertAlmostEqual(res["T1"], comp, places=6)
+
+    def test_capacity_infeasible_returns_inf(self):
+        from solvers.oracle import t1_heuristic_argmin
+        dem = self.dem.copy()
+        dem[1] = 1.5                                       # class-1 arc > cap
+        res = t1_heuristic_argmin(self.adj, self.svc, self.clss, dem, self.M,
+                                  time_budget=0.05)
+        self.assertEqual(res["T1"], float("inf"))
+        self.assertIsNone(res["parts"])
+
+    def test_no_class1_arcs(self):
+        from solvers.oracle import t1_heuristic_argmin
+        clss = self.clss.copy()
+        clss[clss == 1] = 2
+        res = t1_heuristic_argmin(self.adj, self.svc, clss, self.dem, self.M,
+                                  time_budget=0.05)
+        self.assertEqual(res["T1"], 0.0)
+        self.assertEqual(res["parts"], [[] for _ in range(self.M)])
+
+    def test_cross_validates_on_larger_random_instance(self):
+        """On a bigger synthetic instance (n1=12, still exact-DP-tractable),
+        the heuristic should land within a small margin of the true optimum
+        -- never below it."""
+        from solvers.oracle import t1_heuristic_argmin, t1_oracle_argmin
+        rng = np.random.RandomState(7)
+        n1 = 12
+        N1 = n1 + 5
+        adj = rng.uniform(0.1, 1.0, size=(N1, N1))
+        np.fill_diagonal(adj, 0.0)
+        clss = np.array([0] + [1] * n1 + [2] * (N1 - 1 - n1))
+        dem = rng.uniform(0.05, 0.15, size=N1)
+        dem[0] = 0.0
+        svc = rng.uniform(0.1, 0.3, size=N1)
+        svc[0] = 0.0
+        M = 3
+        exact = t1_oracle_argmin(adj, svc, clss, dem, M, tiebreak=True)
+        heur = t1_heuristic_argmin(adj, svc, clss, dem, M, time_budget=0.3, seed=1)
+        self.assertTrue(np.isfinite(heur["T1"]))
+        self.assertGreaterEqual(heur["T1"], exact["T1"] - 1e-6)
+        rel_gap = (heur["T1"] - exact["T1"]) / exact["T1"]
+        # Smoke-level regression bound, not a tight quality claim (single
+        # random instance/seed) -- measured mean gap at this n1 range is
+        # <0.1-2% depending on budget (docs/grpo.md), so 5% leaves headroom
+        # against single-instance variance while still catching a real
+        # regression (e.g. a construction/local-search bug reintroduced).
+        self.assertLess(rel_gap, 0.05, "heuristic unexpectedly far from exact "
+                                       "on an easily-DP-tractable n1=12 instance")
+
+    def test_intra_cutoff_does_not_break_feasibility(self):
+        """Both the 'full' (intra-route 2-opt/Or-opt) and lighter
+        (relocate/swap-only) variants must still return capacity-feasible,
+        fully-covering parts -- only measured quality differs (docs/grpo.md),
+        not correctness."""
+        from solvers.oracle import t1_heuristic_argmin
+        for cutoff in (0, 1000):                # forces light vs full variant
+            res = t1_heuristic_argmin(self.adj, self.svc, self.clss, self.dem,
+                                      self.M, time_budget=0.1, intra_cutoff=cutoff)
+            served = [a for p in res["parts"] for a in p]
+            self.assertEqual(sorted(served),
+                             sorted(np.where(self.clss == 1)[0].tolist()))
+            for p in res["parts"]:
+                if p:
+                    self.assertLessEqual(self.dem[p].sum(), 1.0 + 1e-9)
+
+
 # ----------------------------------------------------------------------- 2
 class TestSelectionHelpers(unittest.TestCase):
     def test_shortlist_completions_band_and_pad(self):
@@ -312,16 +412,34 @@ class TestOracleHeadRegression(unittest.TestCase):
         got = al(num_sample=self.K)
         self.assertTrue(np.array_equal(ref, got), f"{ref} != {got}")
 
-    def test_guard_fallback_is_byte_identical(self):
-        """oracle_head=True but oracle not applicable (max_n1 exceeded) ->
-        pool answer returned unchanged, byte-identical to the default path
-        (the guard trips before any extra RNG is consumed)."""
-        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2)
+    def test_guard_fallback_is_byte_identical_when_heuristic_disabled(self):
+        """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic
+        explicitly disabled too -> pool answer returned unchanged,
+        byte-identical to the default path (neither solver runs, no extra
+        RNG consumed)."""
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2,
+                       oracle_use_heuristic=False)
         torch.manual_seed(self.SEED)
         ref = _p1_reference_call(al, self.K)
         torch.manual_seed(self.SEED)
         got = al(num_sample=self.K)
         self.assertTrue(np.array_equal(ref, got), f"{ref} != {got}")
+
+    def test_heuristic_fallback_engages_above_max_n1(self):
+        """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic
+        enabled (the default) -> the heuristic actually runs (not skipped)
+        and the union winner is still a valid, finite T-vector."""
+        import solvers.oracle as oracle_mod
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2,
+                       oracle_heuristic_time_budget=0.05)
+        self.assertTrue(al.oracle_use_heuristic)
+        with mock.patch.object(oracle_mod, "t1_heuristic_argmin",
+                               wraps=oracle_mod.t1_heuristic_argmin) as spy:
+            torch.manual_seed(self.SEED)
+            out = al(num_sample=self.K)
+        spy.assert_called()
+        self.assertEqual(out.shape, (1, 3))
+        self.assertTrue(np.isfinite(out).all())
 
     def test_enabled_end_to_end_reaches_oracle_T1(self):
         """oracle_head=True end-to-end: valid (1, 3) float64 output whose T1

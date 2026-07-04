@@ -1179,3 +1179,206 @@ information (e.g. evidence from a from-scratch retrain, which none of
 these three smoke tests constitute — all were short fine-tunes of an
 already-converged checkpoint, a caveat that applies equally to all three
 rounds and remains untested).
+
+## 14. Codebase audit — dead code and unearned complexity removed
+
+Requested directly: re-evaluate the current policy/GRPO training code for
+anything that can be cut or simplified without reducing accuracy or
+generalization, aiming for a minimal, clean implementation. Full audit
+(read-only) done first — new smoke-scale ablations run on the trained
+checkpoint to test whether the trained network actually relies on each
+"never formally isolated" architecture piece before touching anything —
+then a scoped set of changes applied based on the findings, all
+independently re-verified (reran the ablation script, cross-checked
+`outputs/lightning_logs/version_{1,2,3}/metrics.csv` directly, grepped for
+every claimed dead-code site) before implementing.
+
+### 14.1 What was NOT touched, and why — everything load-bearing stayed
+
+Weight-level forward-ablation probes (zero a pathway's contribution on the
+trained `epoch=159.ckpt`, no retraining — exact, since every relevant
+linear is bias-free) on 256 held-out `small` + 247 held-out `medium`
+instances showed every previously-"never isolated" architecture piece is
+demonstrably relied on by the trained network, **most of all on `medium`
+— the exact generalization axis being protected**:
+
+| Ablated | medium paired lex16 loss vs intact | medium T1-not-worse-vs-ILS |
+|---|---|---|
+| (intact base) | — | 0.231 |
+| cross-vehicle self-attention (§8) | **99.6%** | 0.049 |
+| both class-progress features (§8) | 87.0% | 0.130 |
+| encoder `dist_bias` (§3, pre-dates this project) | 98.8% | 0.053 |
+
+None of these were cut. (Isolating *which* piece of bậc-3's combined
+change drove §8.6's benchmark delta, or `dist_bias` with/without from
+scratch, would need real retrains — not smoke-testable, not attempted
+here; this doesn't block any decision above since both are clearly
+load-bearing either way.) `oracle_tiebreak` (§10) was also kept as-is —
+its own P2 investigation already measured a small, real, positive
+contribution (+1.4pp T2-not-worse, +1.5pp Pareto) at negligible cost; it
+was reclassified as "hardcode on" (§14.2) rather than removed.
+
+### 14.2 What was cut (all verified before removal, all behavior-neutral or explicitly signed off)
+
+- **`RLWarmILSHCARP`** (`src/solvers/rl.py`) and everything only it used
+  (`vehicles_to_action`, the `_last_best_vehicles`/`_last_best_action`
+  bookkeeping in `RLHybHCARP.__call__`, the `--warm_ils`/`--ils_iters` CLI
+  flags) — the RL-warm-started-ILS direction the user explicitly rejected
+  earlier (§6.3.1: "gain too small for the speed given up," 16.9x→9.2x for
+  +1.2pp Pareto). Verified zero test coverage and zero `logs/status_bm.md`
+  rows depend on it before deleting.
+- **DAPO dynamic group filtering** (`src/trainers/grpo.py::_train_step`) —
+  the `active_mask`/`skipped_frac`/early-return/group-dropping machinery.
+  Directly measured from all three production runs'
+  `train/skipped_frac`: **version_1 (pre-bậc-2) = 0.0 on every logged
+  step; version_3 (current production checkpoint's run) = 0.0 on every
+  logged step; version_2 (bậc-2) = mean 0.0019%, max 0.195% (~1 group in
+  512, once)**. An all-tied K=16 group needs an exact float T-vector tie
+  across all 16 samples — the same continuous-tie argument that motivated
+  replacing the original hard lex rank (§4) — so this essentially never
+  fires, and removing it is behavior-neutral for every training run ever
+  done on this codebase. `tests/test_grpo.py`'s
+  `TestDynamicGroupFiltering` (which asserted the old early-return/
+  `skipped_frac` behavior) was replaced with `TestTiedGroupsDoNotCrash`,
+  covering the invariant that actually matters (an all-zero-advantage
+  batch stays numerically safe) without asserting removed machinery.
+- **Verified-dead code**: unused `numpy` import and a byte-identical
+  duplicate `self.log(".../lex_best", ...)` call in `grpo.py`; unused
+  `gen_tours` import and a never-called `RLHCARP.import_instance` method
+  in `rl.py`; four constructor parameters accepted then silently ignored
+  or immediately overwritten — `Decoder.__init__`'s `context_embedding`/
+  `dynamic_embedding`/`sdpa_fn`/`pointer` (`src/policy/decoder.py`) and
+  `PointerAttention.__init__`'s `sdpa_fn`+`**kwargs`; the `StaticEmbedding`
+  no-op class (`forward` always returned `(0,0,0)`) and `Decoder.
+  _compute_kvl` (added zero to the cached static keys/values, i.e. an
+  identity function) — inlined and deleted; `MultiHeadAttention`'s
+  `causal` (never read) and `sdpa_fn` (stored, never called — `forward`'s
+  manual matmul path is required for the pre-softmax `dist_bias` add, so
+  it never used `self.sdpa_fn`) threaded needlessly through 4 constructor
+  signatures (`Encoder`→`GraphAttentionNetwork`→`MultiHeadAttentionLayer`→
+  `MultiHeadAttention`) down to `encoder.py`.
+- **CLI/config surface collapsed**: `oracle_r`, `oracle_shortlist`,
+  `oracle_shortlist_eps`, `oracle_union_eps2`, `oracle_tiebreak` were never
+  varied from their defaults in any historical benchmark row (every row in
+  `logs/status_bm.md` is reproducible from just `{num_sample, eps,
+  shortlist, topk_t1, oracle_head}`) — demoted from CLI flags to
+  constructor-only keyword arguments (still directly testable, e.g.
+  `tests/test_rl.py`'s oracle tests construct `RLHybHCARP`/
+  `t1_oracle_argmin` directly). `--ckpt`/`--cpkt` (two flags for the same
+  path, merged via `ckpt_path = args.ckpt or args.cpkt` regardless of
+  mode) unified to `--ckpt` everywhere, including `scripts/bm.sh`.
+
+Net: ~215 lines removed across `src/trainers/grpo.py`,
+`src/solvers/rl.py`, `src/policy/decoder.py`, `src/policy/encoder.py`,
+`scripts/bm.sh`, with `tests/test_grpo.py` updated to match — zero
+intended behavior change for the shipped P1+P2 configuration (full test
+suite green: 213 tests, 0 failures, 7 pre-existing skips; the production
+`HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1`
+config re-run end-to-end after the change to confirm no regression).
+
+## 15. Extending P2 past `max_n1`: a local-search heuristic for `medium`/`large`
+
+P2 (§10) only helps where the exact T1 oracle is computationally applicable
+(`n1 <= max_n1`, default 16 — comfortably covers `small`, roughly half of
+`medium`, essentially none of `large`, per §10.4/§13's measured n1
+distributions: small mean 8.8/max 10, medium mean 15.9/median 15/max 21,
+large mean 30/max 35). Above that, the arm was previously just skipped
+(safe, but zero benefit). Investigated a fast heuristic to extend the
+arm's reach — an ILP/CP-SAT route was explicitly considered and rejected
+(user's explicit call, not pursued) — in favor of a construction +
+local-search heuristic, scoped to exactly the same subproblem.
+
+### 15.1 Design (`src/solvers/oracle.py::t1_heuristic_argmin`)
+
+Same interface/contract as `t1_oracle_argmin` (drop-in: same `T1`/`parts`
+return shape, `inf`/`None` on infeasibility) but `O(restarts * n1^2)`-ish
+per local-search sweep bounded by a wall-clock `time_budget`, not
+`O(2^n1 * n1^2)` — runtime stays under ~1s across the whole tested n1
+range (10-35) regardless of problem size, trading the exact guarantee for
+an empirically-measured optimality gap instead.
+
+- **Construction**: farthest-point-dispersion seeding (one arc per
+  vehicle, maximizing min distance to already-chosen seeds) + greedy
+  best-insertion of the rest, ranked by the resulting *sorted-descending
+  route-cost tuple* (min-max first, balance second) so insertion choices
+  already anticipate the min-max objective, not just total cost.
+- **Local search**: first-improvement relocate/swap between routes, plus
+  per-route 2-opt + Or-opt(1,2) — but only below `intra_cutoff` (default
+  25) class-1 arcs. Above that, the O(n²)-O(n³) intra-route sweeps were
+  measured to crowd out ILS restarts within a fixed time budget; skipping
+  them and spending the budget on more relocate/swap/restarts instead
+  roughly halved the mean gap at n1=30 (3.88% → 1.98%) — a real,
+  measured tradeoff, not a guess.
+- **Anytime**: multiple randomized-seed restarts, then ILS (random
+  capacity-safe relocation kicks + re-descent) spend the remaining
+  budget. A final exact Held-Karp re-ordering polishes any route with
+  ≤12 arcs (provably order-optimal for its final assignment, independent
+  of budget).
+- **Capacity-infeasibility check**: if any single class-1 arc's own
+  demand exceeds capacity, no partition can ever place it — checked
+  upfront (the construction step otherwise seeds routes unconditionally
+  and wouldn't catch this on its own; found and fixed during test-writing,
+  `tests/test_rl.py::TestT1HeuristicArgmin::test_capacity_infeasible_returns_inf`).
+
+### 15.2 Measured quality/speed tradeoff
+
+Cross-validated against the exact DP wherever tractable (n1 ≤ 19, 284
+real instances from `data/osm_train`'s small/medium buckets):
+
+| Budget | Mean gap | Median | p90 | Exact matches |
+|---|---|---|---|---|
+| 0.03s | 0.39% | 0.00% | 0.83% | 85.6% |
+| 0.15s | 0.10% | 0.00% | 0.00% | 94.4% |
+| 0.5s | 0.04% | 0.00% | 0.00% | 97.9% |
+
+At larger n1 (vs a long best-known reference, since the exact DP isn't
+tractable there to compare against directly), quality degrades
+monotonically but runtime stays cheap (0.5s budget):
+
+| n1 | Mean gap | p90 | Median wall-clock |
+|---|---|---|---|
+| 19 | 0.18% | 0.21% | 511ms |
+| 25 | ~1.5% | ~3% | ~550ms |
+| 31 | 2.66% | 6.12% | 587ms |
+| 35 | 5.64% | 9.99% | 623ms |
+
+The heuristic never beat the exact optimum in any cross-validated
+comparison (a sanity check confirming the DP is a valid lower bound and
+the comparison methodology is sound).
+
+### 15.3 Union-based safety net still holds
+
+`oracle_union_pick` (§10.2) only inspects T-vectors, not how they were
+produced — the "extra arm can only help or tie" guarantee is structural,
+independent of whether the head arm is exact or heuristic. Directly
+verified: 12,780 union decisions built from the 284 real exact-vs-heuristic
+T1 pairs crossed with a range of pool-arm scenarios and randomized T2/T3
+draws → **0 T1-safety violations** (the union result's T1 was always ≤
+the better of the two arms, within tie-tolerance, in every case).
+
+### 15.4 Production wiring and the resulting guarantee at scale
+
+`RLHybHCARP` (`src/solvers/rl.py`) gains `oracle_use_heuristic` (default
+`True`), `oracle_heuristic_time_budget` (default 0.5s), and
+`oracle_heuristic_intra_cutoff` (default 25) constructor parameters — not
+exposed on the CLI (§14's "don't add a flag for a knob nothing varies"
+philosophy; construct `RLHybHCARP` directly if you need to change them).
+`_oracle_head_arm` now computes `n1` once and dispatches: `n1 <=
+oracle_max_n1` → exact DP (unchanged code path, so the shipped
+small-curriculum benchmark is byte-identical to before this change); `n1
+> oracle_max_n1` and `oracle_use_heuristic` → the heuristic; otherwise
+(or if `oracle_use_heuristic=False`) → not applicable, pool arm passes
+through unchanged, exactly as before.
+
+**What changes about the system's "T1 guarantee" at `medium`/`large`
+scale**: at `small` (and the ~half of `medium` with n1 ≤ 16), the
+guarantee is unchanged — literal 100% T1-not-worse-than-ILS, exact. Above
+that, it degrades gracefully (never regresses below "no oracle-head arm
+at all", per §15.3) to **"empirically within roughly 0.2-6% of the best
+solution found, in well under a second"** rather than "provably optimal"
+— an honest, measured claim, not the same mathematical guarantee, but
+still a real improvement over having no head arm at all for that
+instance range. A full benchmark run on real `medium`/`large` curriculum
+data (analogous to `logs/status_bm.md`'s small-curriculum rows) has not
+yet been done — this section documents the component-level validation
+that makes such a run possible, not a new end-to-end benchmark result.

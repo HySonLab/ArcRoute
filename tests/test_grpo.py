@@ -346,9 +346,18 @@ def _cleanup(tag):
     pass  # no .data files created any more
 
 
-class TestDynamicGroupFiltering(unittest.TestCase):
-    """⭐ DAPO dynamic group filtering: groups whose K rollouts are all tied
-    (all-zero advantage) are dropped; train/skipped_frac monitors the fraction."""
+class TestTiedGroupsDoNotCrash(unittest.TestCase):
+    """Groups whose K rollouts are all tied (all-zero advantage) contribute
+    zero surrogate loss but must not crash or produce non-finite gradients.
+
+    (Historical note: an earlier version of this trainer additionally
+    *dropped* all-tied groups from the mini-batch loop entirely, an
+    optimization measured via `train/skipped_frac` across all three
+    production training runs to fire on 0/196-204 steps in two of them and
+    ~0.002% of groups in the third -- i.e. it never activated in practice,
+    so the machinery was removed; see docs/grpo.md §「audit」. These tests
+    now cover the simpler invariant that actually matters: an all-zero
+    advantage batch is numerically safe, not that it's specially fast-pathed.)"""
 
     def _build(self, tag, **extra):
         torch.manual_seed(0)
@@ -358,9 +367,9 @@ class TestDynamicGroupFiltering(unittest.TestCase):
         model = _make_model(GRPO, env, policy, tag=tag, group_size=8, **extra)
         return env, policy, model
 
-    def test_all_tied_skips_backward(self):
-        """Every group tied -> all-zero advantage -> early return loss=0.0,
-        skipped_frac=1.0, no backward, no crash."""
+    def test_all_tied_is_finite_and_safe(self):
+        """Every group tied -> all-zero advantage -> finite loss (entropy term
+        still contributes), finite gradients, no crash."""
         env, policy, model = self._build("dgf_all")
         try:
             _, batch = _wire_and_batch(model, "dgf_all")
@@ -369,12 +378,13 @@ class TestDynamicGroupFiltering(unittest.TestCase):
                 out = model._train_step(batch)
         finally:
             _cleanup("dgf_all")
-        self.assertEqual(float(out["loss"]), 0.0)
-        self.assertAlmostEqual(out["train/skipped_frac"], 1.0, places=6)
+        self.assertTrue(np.isfinite(float(out["loss"])))
+        pgrads = [p.grad for p in model.policy.parameters() if p.grad is not None]
+        self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
 
-    def test_partial_filter_only_active_groups(self):
-        """Group 0 tied (zeros), group 1 active (non-zero) -> backward runs only
-        on the 1 active group; skipped_frac == 0.5; no crash."""
+    def test_partial_tie_is_finite_and_safe(self):
+        """Group 0 tied (zeros), group 1 active (non-zero) -> finite loss and
+        gradients, no crash."""
         env, policy, model = self._build("dgf_part")
 
         def half_zero(T):
@@ -391,22 +401,9 @@ class TestDynamicGroupFiltering(unittest.TestCase):
                 out = model._train_step(batch)
         finally:
             _cleanup("dgf_part")
-        self.assertAlmostEqual(out["train/skipped_frac"], 0.5, places=6)
         self.assertTrue(np.isfinite(float(out["loss"])))
         pgrads = [p.grad for p in model.policy.parameters() if p.grad is not None]
         self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
-
-    def test_skipped_frac_logged(self):
-        """Normal data path: 'train/skipped_frac' is present in the returned dict."""
-        env, policy, model = self._build("dgf_log")
-        try:
-            _, batch = _wire_and_batch(model, "dgf_log")
-            out = model._train_step(batch)
-        finally:
-            _cleanup("dgf_log")
-        self.assertIn("train/skipped_frac", out)
-        self.assertGreaterEqual(out["train/skipped_frac"], 0.0)
-        self.assertLessEqual(out["train/skipped_frac"], 1.0)
 
 
 class TestPhaseMaskedAdvantage(unittest.TestCase):

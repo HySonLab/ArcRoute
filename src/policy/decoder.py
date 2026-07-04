@@ -119,19 +119,6 @@ class JointMVContext(nn.Module):
         return self.fuse(torch.cat([veh_q_individual, veh_q_collab], dim=-1))
 
 
-class StaticEmbedding(nn.Module):
-    """Static embedding for general problems.
-    This is used for problems that do not have any dynamic information, except for the
-    information regarding the current action (e.g. the current node in TSP). See context embedding for more details.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super(StaticEmbedding, self).__init__()
-
-    def forward(self, td):
-        return 0, 0, 0
-
-
 class PointerAttention(nn.Module):
     def __init__(
         self,
@@ -140,8 +127,6 @@ class PointerAttention(nn.Module):
         mask_inner: bool = True,
         out_bias: bool = False,
         check_nan: bool = True,
-        sdpa_fn=None,
-        **kwargs,
     ):
         super(PointerAttention, self).__init__()
         self.num_heads = num_heads
@@ -206,15 +191,11 @@ class Decoder(nn.Module):
         self,
         embed_dim: int = 128,
         num_heads: int = 8,
-        context_embedding: nn.Module = None,
-        dynamic_embedding: nn.Module = None,
         mask_inner: bool = True,
         out_bias_pointer_attn: bool = False,
         linear_bias: bool = False,
         use_graph_context: bool = True,
         check_nan: bool = True,
-        sdpa_fn: callable = None,
-        pointer: nn.Module = None,
         P: int = 3,
     ):
         super().__init__()
@@ -225,7 +206,6 @@ class Decoder(nn.Module):
         assert embed_dim % num_heads == 0
 
         self.joint_mv_context = JointMVContext(embed_dim, P=P, linear_bias=linear_bias)
-        self.dynamic_embedding = StaticEmbedding(embed_dim)
 
         self.pointer = PointerAttention(
             embed_dim,
@@ -233,7 +213,6 @@ class Decoder(nn.Module):
             mask_inner=mask_inner,
             out_bias=out_bias_pointer_attn,
             check_nan=check_nan,
-            sdpa_fn=sdpa_fn,
         )
 
         # For each node we compute (glimpse key, glimpse value, logit key) so 3 * embed_dim
@@ -242,20 +221,6 @@ class Decoder(nn.Module):
         )
         self.project_fixed_context = nn.Linear(embed_dim, embed_dim, bias=linear_bias)
         self.use_graph_context = use_graph_context
-
-    def _compute_kvl(self, cached: PrecomputedCache, td: TensorDict):
-        glimpse_k_stat, glimpse_v_stat, logit_k_stat = (
-            cached.glimpse_key,
-            cached.glimpse_val,
-            cached.logit_key,
-        )
-        # Compute dynamic embeddings and add to static embeddings
-        glimpse_k_dyn, glimpse_v_dyn, logit_k_dyn = self.dynamic_embedding(td)
-        glimpse_k = glimpse_k_stat + glimpse_k_dyn
-        glimpse_v = glimpse_v_stat + glimpse_v_dyn
-        logit_k = logit_k_stat + logit_k_dyn
-
-        return glimpse_k, glimpse_v, logit_k
 
     def forward(
         self,
@@ -274,7 +239,12 @@ class Decoder(nn.Module):
         if isinstance(graph_ctx, Tensor):
             veh_q = veh_q + graph_ctx.unsqueeze(1)           # broadcast over M
 
-        glimpse_k, glimpse_v, logit_k = self._compute_kvl(cached, td)
+        # No dynamic (per-step) key/value embedding beyond the precomputed
+        # statics -- everything step-varying enters through JointMVContext's
+        # vehicle-state features instead (see class docstring).
+        glimpse_k, glimpse_v, logit_k = (
+            cached.glimpse_key, cached.glimpse_val, cached.logit_key
+        )
 
         # Un-flatten the stored flat action_mask (B, M*(N+1)) -> (B, M, N+1).
         B = veh_q.shape[0]

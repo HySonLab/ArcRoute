@@ -1,12 +1,11 @@
 import math
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from einops import rearrange
 from tensordict import TensorDict
 from torch import Tensor
-from torch.nn.functional import scaled_dot_product_attention
 
 
 
@@ -147,17 +146,13 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         bias: bool = True,
         attention_dropout: float = 0.0,
-        causal: bool = False,
         device: str = None,
         dtype: torch.dtype = None,
-        sdpa_fn: Optional[Callable] = None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
-        self.causal = causal
         self.attention_dropout = attention_dropout
-        self.sdpa_fn = sdpa_fn if sdpa_fn is not None else scaled_dot_product_attention
 
         self.num_heads = num_heads
         assert self.embed_dim % num_heads == 0, (
@@ -220,13 +215,12 @@ class MultiHeadAttentionLayer(nn.Sequential):
         feedforward_hidden: int = 512,
         normalization: Optional[str] = "batch",
         bias: bool = True,
-        sdpa_fn: Optional[Callable] = None,
     ):
 
         super(MultiHeadAttentionLayer, self).__init__()
 
         num_neurons = [feedforward_hidden] if feedforward_hidden > 0 else []
-        self.f1 = MultiHeadAttention(embed_dim, num_heads, bias=bias, sdpa_fn=sdpa_fn)
+        self.f1 = MultiHeadAttention(embed_dim, num_heads, bias=bias)
         self.f2 = Normalization(embed_dim, normalization)
         self.f3 = SkipConnection(
             MLP(
@@ -264,8 +258,6 @@ class GraphAttentionNetwork(nn.Module):
         num_layers: number of MHA layers
         normalization: type of normalization to use (batch, layer, none)
         feedforward_hidden: dimension of the hidden layer in the feed-forward layer
-        sdpa_fn: scaled dot product attention function (SDPA)
-        moe_kwargs: Keyword arguments for MoE
     """
 
     def __init__(
@@ -275,7 +267,6 @@ class GraphAttentionNetwork(nn.Module):
         num_layers: int,
         normalization: str = "instance",
         feedforward_hidden: int = 512,
-        sdpa_fn: Optional[Callable] = None,
     ):
         super(GraphAttentionNetwork, self).__init__()
 
@@ -286,7 +277,6 @@ class GraphAttentionNetwork(nn.Module):
                     num_heads,
                     feedforward_hidden=feedforward_hidden,
                     normalization=normalization,
-                    sdpa_fn=sdpa_fn,
                 )
                 for _ in range(num_layers)
             ]
@@ -309,7 +299,6 @@ class Encoder(nn.Module):
         normalization: str = "instance",
         feedforward_hidden: int = 512,
         net: nn.Module = None,
-        sdpa_fn=None,
     ):
         super(Encoder, self).__init__()
 
@@ -324,7 +313,6 @@ class Encoder(nn.Module):
                 num_layers,
                 normalization,
                 feedforward_hidden,
-                sdpa_fn=sdpa_fn,
             )
             if net is None
             else net

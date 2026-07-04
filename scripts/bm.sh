@@ -49,20 +49,14 @@
 #                 on top of the eps-lex shortlist (default: 0 = disabled). Pairs with a
 #                 wider NUM_SAMPLE -- e.g. NUM_SAMPLE=400 TOPK_T1=100 measured 82.75%->
 #                 95.31% "T1 not worse than ILS" on osm_test_small, see logs/status_bm.md.
-#     WARM_ILS    1 = hybrid funnel + short ILS refinement warm-started from the
-#                 hybrid winner (default: 0; implies the hybrid funnel)
-#     ILS_ITERS   WARM_ILS=1 only: ILS iteration budget (default: 50)
 #     ORACLE_HEAD HYBRID=1 only: 1 = add the exact-T1-oracle forced-prefix arm
 #                 (variant P) unioned with the pool arm (default: 0 = disabled).
+#                 Sub-tunables (sample count, shortlist sizes, eps-bands, tiebreak)
+#                 aren't exposed here -- historical sweeps never varied them from
+#                 RLHybHCARP's defaults; construct it directly in Python if needed.
 #                 Measured on osm_test_small (on top of NUM_SAMPLE=400 TOPK_T1=100):
 #                 T1-not-worse-than-ILS 95.31%->100%, T2 52.9%->86.0%, lex-win
 #                 86.4%->98.3%, at ~3.4x ILS speed.
-#     ORACLE_R              ORACLE_HEAD=1: #sampled completions per prefix (default: 64)
-#     ORACLE_SHORTLIST      ORACLE_HEAD=1: #completions local-searched (default: 8)
-#     ORACLE_SHORTLIST_EPS  ORACLE_HEAD=1: T2 eps-band for shortlisting (default: 0.01)
-#     ORACLE_UNION_EPS2     ORACLE_HEAD=1: T2 eps-band for pick/union (default: 0.02)
-#     ORACLE_TIEBREAK       ORACLE_HEAD=1: 1 = exact lexicographic prefix tiebreak
-#                           (default), 0 = plain T1 argmin
 #
 # Output:
 #   Prints solver lines to stdout AND saves to logs/bm_<solver>_<variant>_<ts>.out
@@ -74,7 +68,6 @@
 #   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt NUM_SAMPLE=200 bash scripts/bm.sh
 #   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 bash scripts/bm.sh
 #   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt HYBRID=1 SHORTLIST=10 bash scripts/bm.sh
-#   SOLVER=rl CKPT=outputs/checkpoints/last.ckpt HYBRID=1 SHORTLIST=25 WARM_ILS=1 ILS_ITERS=50 bash scripts/bm.sh
 #   SOLVER=rl CKPT=outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1 bash scripts/bm.sh
 
 set -euo pipefail
@@ -116,14 +109,7 @@ HYBRID="${HYBRID:-0}"          # 1 = two-tier funnel (eps-lex shortlist + local 
 SHORTLIST="${SHORTLIST:-10}"   # HYBRID=1 only: #candidates that get local search
 TOPK_T1="${TOPK_T1:-0}"        # HYBRID=1 only: extra #candidates by raw T1 rank, LS'd too
                                 # (0 = disabled; e.g. NUM_SAMPLE=400 TOPK_T1=100 is "bậc 3 + P1")
-WARM_ILS="${WARM_ILS:-0}"      # 1 = hybrid funnel + warm-started short ILS refinement
-ILS_ITERS="${ILS_ITERS:-50}"   # WARM_ILS=1 only: ILS iteration budget
 ORACLE_HEAD="${ORACLE_HEAD:-0}"                    # HYBRID=1 only: exact-T1-oracle arm
-ORACLE_R="${ORACLE_R:-64}"                         # sampled completions per prefix
-ORACLE_SHORTLIST="${ORACLE_SHORTLIST:-8}"          # completions that get local search
-ORACLE_SHORTLIST_EPS="${ORACLE_SHORTLIST_EPS:-0.01}"  # T2 eps-band for shortlisting
-ORACLE_UNION_EPS2="${ORACLE_UNION_EPS2:-0.02}"     # T2 eps-band for pick/union
-ORACLE_TIEBREAK="${ORACLE_TIEBREAK:-1}"            # exact lexicographic prefix tiebreak
 
 # ── output ────────────────────────────────────────────────────────────────────
 mkdir -p logs
@@ -192,13 +178,10 @@ case "$SOLVER" in
     fi
     HYBRID_ARGS=()
     [[ "$HYBRID" == "1" ]] && HYBRID_ARGS=(--hybrid --shortlist "$SHORTLIST" --topk_t1 "$TOPK_T1")
-    [[ "$ORACLE_HEAD" == "1" ]] && HYBRID_ARGS+=(--oracle_head --oracle_r "$ORACLE_R" \
-        --oracle_shortlist "$ORACLE_SHORTLIST" --oracle_shortlist_eps "$ORACLE_SHORTLIST_EPS" \
-        --oracle_union_eps2 "$ORACLE_UNION_EPS2" --oracle_tiebreak "$ORACLE_TIEBREAK")
-    [[ "$WARM_ILS" == "1" ]] && HYBRID_ARGS+=(--warm_ils --ils_iters "$ILS_ITERS" --shortlist "$SHORTLIST" --topk_t1 "$TOPK_T1")
+    [[ "$ORACLE_HEAD" == "1" ]] && HYBRID_ARGS+=(--oracle_head)
     uv run python -m solvers.rl \
         --seed "$SEED" --variant "$VARIANT" \
-        --cpkt "$CKPT" --path "$DATA_DIR" \
+        --ckpt "$CKPT" --path "$DATA_DIR" \
         --num_sample "$NUM_SAMPLE" --eps "$EPS" \
         "${M_ARGS[@]}" "${HYBRID_ARGS[@]}" | tee "$OUT"
     ;;

@@ -6,7 +6,7 @@ Usage (single instance — route log):
         --vehicles 2 --num_sample 100 --log outputs/rl_route_log.txt
 
 Usage (batch benchmark):
-    uv run python -m solvers.rl --cpkt outputs/checkpoints/last.ckpt \\
+    uv run python -m solvers.rl --ckpt outputs/checkpoints/last.ckpt \\
         --path data/5m --variant P --num_sample 1
 """
 
@@ -22,7 +22,7 @@ from time import time
 import numpy as np
 import torch
 
-from utils.ops import batchify, gen_tours, import_instance, iter_instances, print_route_log, save_sol
+from utils.ops import batchify, import_instance, iter_instances, print_route_log, save_sol
 
 
 def eps_lex_select(reward, eps=0.005, shortlist=1):
@@ -144,9 +144,6 @@ class RLHCARP:
         )
         self.td = self.env.reset(td).to(self.device)
 
-    def import_instance(self, f, M=None):
-        self._load_data(*next(iter_instances(f, M=M)))
-
     def __call__(self, num_sample=100, eps=0.005):
         td = batchify(self.td, num_sample)
         with torch.inference_mode():
@@ -154,34 +151,6 @@ class RLHCARP:
         reward = out["reward"].cpu().numpy()          # (num_sample, P)
         idx = int(eps_lex_select(reward, eps=eps, shortlist=1)[0])
         return reward[idx:idx+1]                      # (1, P)
-
-
-def vehicles_to_action(vehicles):
-    """Flatten a per-vehicle trips structure into the metaheuristics' flat
-    arc-order action format.
-
-    vehicles : list (len M) of lists-of-trips, each trip a 1D array of arc
-               indices (what `SolutionEvaluator.routes_from_joint_actions`
-               returns).
-    Returns  : 1D np.int32 array of arc indices with a single 0 separating
-               consecutive trips and no leading/trailing separator — the exact
-               convention `get_once`/`deserialize_tours` (meta.py, utils/ops.py)
-               produce and `gen_tours`/`ls`/`calc_obj` consume. Trips of the
-               same vehicle are separated exactly like trips of different
-               vehicles (the 0-separated format carries no vehicle identity;
-               for variant P the evaluator re-derives the vehicle assignment
-               from the arc order alone via `_build_P`).
-    """
-    flat = []
-    for veh_trips in vehicles:
-        for trip in veh_trips:
-            arcs = [int(a) for a in np.asarray(trip).ravel().tolist() if a != 0]
-            if arcs:
-                flat.extend(arcs)
-                flat.append(0)
-    if flat and flat[-1] == 0:
-        flat.pop()
-    return np.array(flat, dtype=np.int32)
 
 
 class RLHybHCARP(RLHCARP):
@@ -215,19 +184,36 @@ class RLHybHCARP(RLHCARP):
     (all completions share the forced T1), local-searched, and the arm's own
     best is unioned with the pool arm's pick (`oracle_union_pick`). The
     union winner's T-vector is re-evaluated through the float64
-    `SolutionEvaluator` before being returned. When the oracle is not
-    applicable (class-1 arc count > `oracle_max_n1`, or no capacity-feasible
-    partition exists), the head arm is skipped and the pool arm's answer is
-    returned unchanged. Measured on `data/osm_test_small` (2858 instances,
-    same ckpt as above, on top of NUM_SAMPLE=400 TOPK_T1=100): "T1 not worse
-    than ILS" 95.31%->100%, T2 52.9%->86.0%, T3 55.9%->63.5%, lex-win
-    86.4%->98.3%, Pareto 36.5%->57.7%, at ~3.4x ILS speed.
+    `SolutionEvaluator` before being returned. When neither solver is
+    applicable (no capacity-feasible partition exists), the head arm is
+    skipped and the pool arm's answer is returned unchanged. Measured on
+    `data/osm_test_small` (2858 instances, same ckpt as above, on top of
+    NUM_SAMPLE=400 TOPK_T1=100): "T1 not worse than ILS" 95.31%->100%, T2
+    52.9%->86.0%, T3 55.9%->63.5%, lex-win 86.4%->98.3%, Pareto 36.5%->57.7%,
+    at ~3.4x ILS speed.
+
+    Above `oracle_max_n1` (class-1 arc count), the exact DP is not an option
+    at all (`O(2^n1 * n1^2)`) -- `oracle_use_heuristic` (default True) falls
+    back to `solvers.oracle.t1_heuristic_argmin`, a multi-restart local-search
+    heuristic with the same interface/safety-net role but no exactness
+    guarantee. Measured (real `data/osm_train` instances, small+medium+large
+    n1 ranges): essentially exact (<0.1% mean gap) through n1~20, degrading
+    to ~1.7%/2.7%/5.6% mean optimality gap at n1~25/31/35 respectively, at
+    well under 1s/instance throughout. The overall system's "T1 guarantee"
+    degrades accordingly at that scale, from "provably optimal" to
+    "empirically within a few percent of best-found" -- but the union rule
+    (`oracle_union_pick`) still guarantees the head arm can only help or tie
+    the pool arm's own answer, never hurt it, regardless of which solver
+    produced it (verified: 0 T1-safety violations across 12,780 union
+    decisions built from real exact-vs-heuristic (T1) pairs).
     """
 
     def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0,
                  oracle_head=False, oracle_r=64, oracle_shortlist=8,
                  oracle_shortlist_eps=0.01, oracle_union_eps2=0.02,
-                 oracle_tiebreak=True, oracle_max_n1=None):
+                 oracle_tiebreak=True, oracle_max_n1=None,
+                 oracle_use_heuristic=True, oracle_heuristic_time_budget=None,
+                 oracle_heuristic_intra_cutoff=None):
         super().__init__(pw, variant, device=device)
         self.shortlist = shortlist
         self.eps = eps
@@ -238,10 +224,18 @@ class RLHybHCARP(RLHCARP):
         self.oracle_shortlist_eps = oracle_shortlist_eps
         self.oracle_union_eps2 = oracle_union_eps2
         self.oracle_tiebreak = oracle_tiebreak
+        from solvers.oracle import (HEURISTIC_INTRA_CUTOFF_DEFAULT,
+                                    HEURISTIC_TIME_BUDGET_DEFAULT, MAX_N1_DEFAULT)
         if oracle_max_n1 is None:
-            from solvers.oracle import MAX_N1_DEFAULT
             oracle_max_n1 = MAX_N1_DEFAULT
         self.oracle_max_n1 = oracle_max_n1
+        self.oracle_use_heuristic = oracle_use_heuristic
+        if oracle_heuristic_time_budget is None:
+            oracle_heuristic_time_budget = HEURISTIC_TIME_BUDGET_DEFAULT
+        self.oracle_heuristic_time_budget = oracle_heuristic_time_budget
+        if oracle_heuristic_intra_cutoff is None:
+            oracle_heuristic_intra_cutoff = HEURISTIC_INTRA_CUTOFF_DEFAULT
+        self.oracle_heuristic_intra_cutoff = oracle_heuristic_intra_cutoff
         from solvers.evaluator import SolutionEvaluator
         self.evaluator = SolutionEvaluator(variant=variant)
 
@@ -324,26 +318,41 @@ class RLHybHCARP(RLHCARP):
     def _oracle_head_arm(self, td0, M, N1, adj, clss, demands, classes):
         """Compute the oracle-head arm's own best candidate.
 
-        Pipeline (see class docstring): exact T1 oracle -> forced-prefix
+        Pipeline (see class docstring): exact T1 oracle (or, above
+        `oracle_max_n1`, the local-search heuristic) -> forced-prefix
         decode (`oracle_r` sampled + 1 greedy completion) -> T2-eps-band
         shortlist -> local search (P1 convention: keep post-LS only if
         strictly lex-better) -> arm-internal pick via `t2_band_pick`.
 
-        Returns (T_vec float64 (3,), vehicles) or (None, None) when the
-        oracle is not applicable for this instance.
+        Returns (T_vec float64 (3,), vehicles) or (None, None) when neither
+        solver is applicable for this instance.
         """
-        from solvers.oracle import forced_flat_actions, t1_oracle_argmin
+        from solvers.oracle import (forced_flat_actions, t1_heuristic_argmin,
+                                    t1_oracle_argmin)
 
         if self.variant != 'P':
             # The oracle's premise (class-1 arcs form a forced opening prefix)
             # only holds under variant P's precedence; decline otherwise.
             return None, None
         svc = td0["service_times"].cpu().numpy().astype(np.float64)
-        res = t1_oracle_argmin(adj, svc, clss, demands, M,
-                               tiebreak=self.oracle_tiebreak,
-                               max_n1=self.oracle_max_n1)
+        n1 = int((clss == 1).sum())
+        if n1 <= self.oracle_max_n1:
+            res = t1_oracle_argmin(adj, svc, clss, demands, M,
+                                   tiebreak=self.oracle_tiebreak,
+                                   max_n1=self.oracle_max_n1)
+        elif self.oracle_use_heuristic:
+            # Exact DP is not an option at this size (O(2^n1 * n1^2)) -- fall
+            # back to the local-search heuristic (class docstring: measured
+            # optimality gap grows with n1, but the union rule below still
+            # guarantees this arm can only help or tie, never hurt).
+            res = t1_heuristic_argmin(
+                adj, svc, clss, demands, M,
+                time_budget=self.oracle_heuristic_time_budget,
+                intra_cutoff=self.oracle_heuristic_intra_cutoff)
+        else:
+            return None, None
         if not np.isfinite(res["T1"]) or res["parts"] is None:
-            return None, None                       # oracle not applicable
+            return None, None                       # not applicable / infeasible
         forced = forced_flat_actions(res["parts"], N1)
 
         pools = []                                  # (reward, actions, shortlist idxs)
@@ -430,58 +439,7 @@ class RLHybHCARP(RLHCARP):
                 # decode-time fp32 reward's.
                 best_T = self.evaluator._completion_times(best_vehicles, td0)
 
-        # expose the winning solution structure (not just its T-vector) for
-        # downstream consumers, e.g. the RL-warm-started ILS.
-        self._last_best_vehicles = best_vehicles
-        self._last_best_action = vehicles_to_action(best_vehicles)
         return np.asarray(best_T, dtype=np.float64)[None, :]           # (1, P)
-
-
-class RLWarmILSHCARP(RLHybHCARP):
-    """Three-tier funnel: RL sampling + eps-lex shortlist + local search
-    (RLHybHCARP), then a SHORT Iterated Local Search warm-started from the
-    hybrid's winning solution instead of ILS's usual random construction.
-
-    The hybrid winner's per-vehicle trips are flattened to the metaheuristics'
-    0-separated arc-order format (`vehicles_to_action`) and passed to
-    `ILSHCARP(init_action=...)` with a reduced iteration budget (default 50 vs
-    ILS's usual 200). Note the two representations are evaluated differently:
-    ILS's evaluator (`SolutionEvaluator._build_P` for variant P) re-derives the
-    vehicle assignment from the arc order alone, so the warm start's T-vector
-    can differ from the hybrid's joint-decoded T-vector. The final result is
-    therefore the lex-best of (hybrid T, ILS T) — provably no worse than
-    `RLHybHCARP` alone.
-    """
-
-    def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005,
-                 topk_t1=0, ils_iters=50, ils_strength=3, seed=None):
-        super().__init__(pw, variant, device=device, shortlist=shortlist, eps=eps,
-                          topk_t1=topk_t1)
-        self.ils_iters = ils_iters
-        self.ils_strength = ils_strength
-        self.seed = seed
-
-    def _load_data(self, *data):
-        super()._load_data(*data)
-        self._instance_data = data          # kept for the ILS refiner
-
-    def __call__(self, num_sample=100):
-        from solvers.meta import ILSHCARP
-
-        rl_T = super().__call__(num_sample=num_sample)              # (1, P)
-        init_action = self._last_best_action
-        if init_action.size == 0:
-            return rl_T
-
-        ils = ILSHCARP(strength=self.ils_strength, accept_mode='best')
-        ils._load_data(*self._instance_data)
-        ils_T = ils(max_iter=self.ils_iters, variant=self.variant,
-                    init_action=init_action, seed=self.seed)        # (1, P)
-        self._last_ils_action = ils._last_best_action
-
-        if tuple(ils_T[0].tolist()) < tuple(rl_T[0].tolist()):
-            return ils_T
-        return rl_T
 
 
 def parse_args():
@@ -492,13 +450,12 @@ def parse_args():
     parser.add_argument('--eps', type=float, default=0.005,
                         help='relative T1 tolerance for eps-lex selection (default 0.5%%)')
     # single-instance log mode
-    parser.add_argument('--ckpt', default=None, help='checkpoint (.ckpt); enables log mode')
+    parser.add_argument('--ckpt', default=None, help='checkpoint (.ckpt)')
     parser.add_argument('--file', default=None, help='.npz instance; enables log mode')
     parser.add_argument('--vehicles', type=int, default=None, help='override fleet size')
     parser.add_argument('--log', default='outputs/rl_route_log.txt')
     parser.add_argument('--solution', default=None)
     # batch benchmark mode
-    parser.add_argument('--cpkt', default=None, help='checkpoint for batch mode')
     parser.add_argument('--path', default='data/5m', help='directory of .npz instances')
     parser.add_argument('--M', type=int, default=None)
     parser.add_argument('--hybrid', action='store_true',
@@ -512,27 +469,11 @@ def parse_args():
     parser.add_argument('--oracle_head', action='store_true',
                         help='hybrid mode: add the exact-T1-oracle forced-prefix arm '
                              '(variant P) and union it with the pool arm '
-                             '(default: off, no behavior change)')
-    parser.add_argument('--oracle_r', type=int, default=64,
-                        help='oracle_head mode: #sampled completions per forced prefix '
-                             '(+1 greedy; default 64)')
-    parser.add_argument('--oracle_shortlist', type=int, default=8,
-                        help='oracle_head mode: #completions that get local search '
-                             '(default 8)')
-    parser.add_argument('--oracle_shortlist_eps', type=float, default=0.01,
-                        help='oracle_head mode: relative T2 eps-band for completion '
-                             'shortlisting (default 0.01)')
-    parser.add_argument('--oracle_union_eps2', type=float, default=0.02,
-                        help='oracle_head mode: relative T2 eps-band for the arm-internal '
-                             'pick and the P1-vs-head union (default 0.02)')
-    parser.add_argument('--oracle_tiebreak', type=int, default=1,
-                        help='oracle_head mode: 1 = exact lexicographic tiebreak among '
-                             'T1-optimal prefixes (default), 0 = plain argmin')
-    parser.add_argument('--warm_ils', action='store_true',
-                        help='batch mode: hybrid funnel + short ILS refinement '
-                             'warm-started from the hybrid winner (implies --hybrid)')
-    parser.add_argument('--ils_iters', type=int, default=50,
-                        help='warm_ils mode: ILS iteration budget (default 50)')
+                             '(default: off, no behavior change). Sub-tunables '
+                             '(sample count, shortlist sizes, eps-bands, tiebreak) are '
+                             'not exposed on the CLI -- historical sweeps never varied '
+                             'them from RLHybHCARP\'s defaults; construct RLHybHCARP '
+                             'directly if you need to.')
     return parser.parse_args()
 
 
@@ -541,7 +482,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    ckpt_path = args.ckpt or args.cpkt
+    ckpt_path = args.ckpt
 
     if args.file:
         # ── single-instance log mode ───────────────────────────────────────
@@ -635,18 +576,10 @@ if __name__ == "__main__":
     else:
         # ── batch benchmark mode ───────────────────────────────────────────
         files = sorted(glob(args.path + '/*/*.npz'))
-        if args.warm_ils:
-            al = RLWarmILSHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
-                                eps=args.eps, topk_t1=args.topk_t1,
-                                ils_iters=args.ils_iters, seed=args.seed)
-        elif args.hybrid:
+        if args.hybrid:
             al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
                             eps=args.eps, topk_t1=args.topk_t1,
-                            oracle_head=args.oracle_head, oracle_r=args.oracle_r,
-                            oracle_shortlist=args.oracle_shortlist,
-                            oracle_shortlist_eps=args.oracle_shortlist_eps,
-                            oracle_union_eps2=args.oracle_union_eps2,
-                            oracle_tiebreak=bool(args.oracle_tiebreak))
+                            oracle_head=args.oracle_head)
         else:
             al = RLHCARP(ckpt_path, args.variant)
         for f in files:
@@ -654,7 +587,7 @@ if __name__ == "__main__":
                 al._load_data(*data)
                 label = f if i == 0 else f"{f}[{i}]"
                 t1 = time()
-                if args.hybrid or args.warm_ils:
+                if args.hybrid:
                     result = al(num_sample=args.num_sample)
                 else:
                     result = al(num_sample=args.num_sample, eps=args.eps)

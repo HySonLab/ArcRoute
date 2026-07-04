@@ -20,7 +20,6 @@ The env must run in reward_mode='vector' so the rollout reward is the (B*K,3)
 T-vector that the rank consumes.
 """
 
-import numpy as np
 import torch
 
 from utils.ops import batchify, unbatchify
@@ -208,50 +207,17 @@ class GRPO(BaseRL):
             adv_phase = centered_hier_rank_by_phase(T.detach(), gamma=self.adv_gamma)
             td.set("adv_phase", adv_phase.permute(2, 0, 1).reshape(B * K, -1))
 
-        # DAPO dynamic group filtering: a group whose K rollouts are all tied gives
-        # an all-zero advantage (zero gradient). Drop those groups so compute is
-        # spent only on groups that produce a signal; log the skipped fraction.
-        active_mask = adv_bk.abs().amax(dim=1) > 1e-6  # (B,) bool, on GPU
-        skipped_frac = float((B - int(active_mask.sum())) / B)
-
         # Per-objective means for the learning-curve log; P = #priority classes
         # (inferred from the T-vector width — no hardcoded 3).
         P = T.shape[-1]
         Tk = [T[..., k].mean() for k in range(P)]
 
-        # Whole batch inactive (every group tied): nothing to backward. Still log.
-        if not bool(active_mask.any()):
-            try:
-                self.log(
-                    "train/skipped_frac",
-                    skipped_frac,
-                    on_step=True,
-                    prog_bar=False,
-                    batch_size=B,
-                    sync_dist=True,
-                )
-            except Exception:
-                pass
-            out_log = {"loss": torch.tensor(0.0), "reward": -Tk[0].reshape(1)}
-            out_log.update({f"T{k + 1}_mean": Tk[k] for k in range(P)})
-            metrics = self.log_metrics(out_log, "train")
-            return {"loss": 0.0, "train/skipped_frac": skipped_frac, **metrics}
-
-        # Keep only active groups: build (B_a*K,) active row indices in k*B_a+b' order.
-        dev = reward.device
-        active_idx = active_mask.nonzero(as_tuple=False).flatten()  # (B_a,) GPU
-        keep = (
-            torch.arange(K, device=dev).view(K, 1) * B + active_idx.view(1, -1)
-        ).reshape(-1)
-        td = td[keep]  # (B_a*K, ...) k*B_a+b' layout
-        B_a = len(active_idx)
-
         # (2) Grad-enabled inner loop grouped by instance.
         # Each mini-batch = mb_inst unique instances × K rollouts = same samples/step
         # as before, but the encoder runs only on mb_inst rows (not mb_inst*K rows).
-        # Total encoder work: B_a (≈ B) samples vs B_a*K = B*K in the old flat loop.
+        dev = reward.device
         mb_inst = max(1, self.mini_batch_size // K)
-        inst_perm = torch.randperm(B_a, device=dev)  # shuffle on GPU
+        inst_perm = torch.randperm(B, device=dev)  # shuffle on GPU
 
         # (2) Gradient accumulation: single optimizer step over all mini-batches.
         # zero_grad once before the loop; each chunk accumulates grads; step once
@@ -261,21 +227,20 @@ class GRPO(BaseRL):
         loss_acc = torch.tensor(0.0, device=dev)
         entropy_acc = 0.0
 
-        for j in range(0, B_a, mb_inst):
-            inst_idx = inst_perm[j : j + mb_inst]  # (actual_mb,) GPU
-            orig_inst_idx = active_idx[inst_idx]  # (actual_mb,) GPU; B-indices
+        for j in range(0, B, mb_inst):
+            inst_idx = inst_perm[j : j + mb_inst]  # (actual_mb,) GPU; B-indices
 
-            # Collect all K rollouts of these instances: k*actual_mb+i layout
+            # Collect all K rollouts of these instances: k*B+i layout
             actual_mb = len(inst_idx)
-            weight = actual_mb / B_a  # proportional chunk weight
+            weight = actual_mb / B  # proportional chunk weight
             flat_row_idx = (
-                torch.arange(K, device=dev).view(K, 1) * B_a + inst_idx.view(1, -1)
+                torch.arange(K, device=dev).view(K, 1) * B + inst_idx.view(1, -1)
             ).reshape(-1)  # (actual_mb*K,)
             sub_td = td[flat_row_idx]
 
             # Encode only the actual_mb unique instances (with grad).
             sub_hidden, _ = self.policy.encoder(
-                td0[orig_inst_idx.to(reward.device)]
+                td0[inst_idx.to(reward.device)]
             )  # (actual_mb, N, D)
             sub_hidden_bk = batchify(sub_hidden, K)  # (actual_mb*K, N, D)
 
@@ -334,14 +299,6 @@ class GRPO(BaseRL):
         loss_log = loss_acc
         try:
             self.log(
-                "train/skipped_frac",
-                skipped_frac,
-                on_step=True,
-                prog_bar=False,
-                batch_size=B,
-                sync_dist=True,
-            )
-            self.log(
                 "train/entropy",
                 entropy_acc,
                 on_step=True,
@@ -363,7 +320,7 @@ class GRPO(BaseRL):
         out_log = {"loss": loss_log, "reward": -Tk[0].reshape(1)}
         out_log.update({f"T{k + 1}_mean": Tk[k] for k in range(P)})
         metrics = self.log_metrics(out_log, "train")
-        return {"loss": loss_log, "train/skipped_frac": skipped_frac, **metrics}
+        return {"loss": loss_log, **metrics}
 
     def _eval_step(self, batch, phase, dataloader_idx):
         # Deterministic greedy rollout (val/test decode type) on the B instances.
@@ -391,7 +348,5 @@ class GRPO(BaseRL):
             sync_dist=True,
             batch_size=B,
         )
-        self.log(f"{phase}/lex_best", float(-lex.mean()),
-                 on_epoch=True, sync_dist=True, batch_size=B)
         metrics = self.log_metrics({"reward": -reward[:, 0:1]}, phase, dataloader_idx)
         return {"loss": None, **metrics}
