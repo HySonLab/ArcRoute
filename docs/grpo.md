@@ -1077,3 +1077,105 @@ concern rather than refuting it. Same bottom line as §11: keep the
 inference-time-only P1+P2 design (§9-§10); if inference speed is the
 actual constraint, tune the inference budget directly rather than
 retraining.
+
+## 13. Investigated and rejected: advantage-filtered ILS-imitation (diverse-target BC)
+
+Third and final round in this line of investigation (sibling to §11-§12),
+motivated by wanting a genuine training-time "hybrid" story — this design
+was specifically engineered to fix every root cause diagnosed in §11 and
+§12, not repeat them. It also failed, and the failure generalizes the
+lesson: **any heuristic-derived training signal tried so far degrades
+medium-curriculum transfer, no matter how carefully the known failure
+modes are patched.**
+
+**Design** (addressing §11/§12's diagnosed causes point-by-point):
+- **Teacher = `ILSHCARP`**, not the exact T1 oracle — ILS runs at any
+  instance size, so `medium`-curriculum imitation targets could be
+  generated directly (no more "hope small-scale training generalizes up";
+  §11's untestable-transfer gap is closed by construction here).
+- **Diverse targets**: 3 different ILS seeds per instance (measured: full
+  diversity, mean 3.0/3.0 distinct T-vectors — never collapsed to one).
+- **Policy-preferred linearization + min-CE selection**: rather than one
+  arbitrary canonical action sequence (§11's core problem), each ILS
+  solution's per-vehicle route content is fixed but *which vehicle acts
+  next* is chosen by the policy's own greedy preference
+  (`constrained_greedy`), and of the 3 (linearized) targets, only the one
+  the policy already assigns the highest log-probability to is used for
+  the imitation loss — directly targets the symmetry-punishment cost
+  measured in §11 (reduced from -5.3 to -5.8 mean logp there to -2.2 to
+  -3.9 here, a real, measured improvement in this dimension, though not
+  eliminated).
+- **Advantage filter (self-imitation gate)**: a target is only imitated if
+  it lexicographically beats the policy's own fresh best-of-8 sample on
+  that instance — meant to stop the policy being taught to be *worse*
+  where it already wins (recall RL already beats ILS on average, §9-10).
+  Verified behaving as intended: at `small`, ILS beats the policy only
+  ~50% of the time (little to teach, consistent with RL already winning
+  there); at `medium`, ILS beats the policy's best-of-16 essentially 100%
+  of the time (real teaching material genuinely exists there).
+- **Full decoupling**: BC is a separate optimizer step every 4 GRPO steps
+  on a precomputed ILS-solution buffer, never mixed into the GRPO
+  rollout/rank/advantage machinery — avoids both §11's forced-rollout
+  contamination and §12's shaped-rank contamination by construction.
+
+**Result — still negative, and decisively so at medium** (300-step
+fine-tune of `epoch=159.ckpt`, matched seed/batches vs the §12 plain-GRPO
+control, evaluated on 247 real held-out `medium` instances with real ILS
+references, independently re-verified against the raw held-out-eval data):
+
+| Arm | vs base, medium, lex16 w/t/l | bs16 T1 mean (medium) | T1-not-worse vs ILS (medium) |
+|---|---|---|---|
+| control (plain GRPO) | 44.1%/0%/55.9% | 8.05 | 20.6% |
+| **bc (ILS-imitation)** | **13.4%/0%/86.6%** | **8.86** | **10.9%** (down from base's 23.1%) |
+| rlmed (plain GRPO, medium-batch exposure, no imitation) | **53.8%/0%/46.2%** | **7.92** | 19.8% |
+
+The BC arm is worse than the base checkpoint on every medium-curriculum
+metric measured, including the T1-not-worse figure it was hoped to
+improve. **The `rlmed` control arm — plain GRPO fine-tuning exposed to
+medium-curriculum batches, with no heuristic imitation at all — was the
+best performer of the three fine-tuned arms at medium**, beating both the
+base checkpoint (53.8% win) and the ILS-imitation arm (90.3% win). This
+isolates the effect cleanly: whatever value exists in touching
+medium-scale data during training comes from ordinary RL exposure to that
+distribution, not from imitating a heuristic. Production training
+currently uses `curriculum=small` only (§5) — broadening the training
+curriculum itself (a completely different, non-hybrid lever) is a
+genuine, real signal worth investigating separately, unlike any of the
+three heuristic-hybridization attempts.
+
+Why the filter didn't rescue it despite behaving correctly (93.8-100% of
+medium instances had a genuinely better ILS teacher, verified): passing
+the filter answers "is the teacher better", not "is imitating a whole
+foreign route, disconnected from the lexicographic T1/T2/T3 tradeoff GRPO
+teaches holistically, actually a good gradient step" — the same
+myopic/disconnected-subproblem critique from §11, now at whole-route
+granularity instead of just the class-1 prefix. The policy never caught up
+to ILS at medium within the 300-step budget, so the filter's intended
+self-annealing property (imitation pressure fades once the policy
+surpasses the teacher) never had a chance to engage — pass rate stayed
+69-97% throughout.
+
+**Cross-round synthesis (§11 + §12 + §13 — read together)**: three
+independent designs, each specifically engineered to fix the previous
+round's diagnosed root cause (exact-oracle → symmetry problem → diverse
+ILS targets + policy-preferred linearization; single-canonical-target →
+min-CE-over-targets; contaminated-rank/forced-actions → full decoupling;
+"is imitation even warranted" → advantage-filtering), have now all failed
+to transfer to `medium` curriculum. The common thread is not any one fixed
+bug — it's that a heuristic-derived training signal, however faithfully
+isolated from the RL machinery, keeps teaching something that doesn't
+generalize past the scale it was computed at.
+
+**Recommendation — final for this line of investigation**: report the
+already-shipped, fully-measured inference-time hybrid (P1 wider funnel +
+P2 exact-T1-oracle arm, §9-§10 — 100% T1-not-worse, 98% lex-win, 57.5%
+Pareto-dominance, 4.1x ILS speed on the full 2858-instance OOD benchmark,
+not a smoke test) as the paper's "hybrid RL+heuristic" contribution. It is
+not a fallback chosen for lack of a better training-time story — after
+three good-faith, well-motivated, progressively-refined attempts, it is
+the strongest and most rigorously validated hybrid result available. Do
+not attempt a fourth heuristic-in-training variant without genuinely new
+information (e.g. evidence from a from-scratch retrain, which none of
+these three smoke tests constitute — all were short fine-tunes of an
+already-converged checkpoint, a caveat that applies equally to all three
+rounds and remains untested).
