@@ -7,7 +7,7 @@ ArcRoute solves the **Hierarchical Directed Capacitated Arc Routing Problem
 - Iterated Local Search (ILS)
 - Ant Colony Optimisation (ACO)
 - Exact MILP (SCIP)
-- Reinforcement Learning (GRPO/PPO)
+- Reinforcement Learning (GRPO)
 - Hybrid RL and local search
 
 ## Installation
@@ -69,7 +69,7 @@ Results are saved in `logs/`.
 
 ```bash
 MODE=validate ALGO=grpo ./scripts/train.sh
-MODE=full ALGO=ppo ./scripts/train.sh
+MODE=full ALGO=grpo ./scripts/train.sh
 ```
 
 ## Pretrained weights and data
