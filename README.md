@@ -7,9 +7,7 @@
 - [Installation](#installation)
 - [Usage](#usage)
   - [Generate Test Benchmark Grid](#generate-test-benchmark-grid)
-  - [Run Meta Heuristic Algorithms](#run-meta-heuristic-algorithms)
-  - [Run Exact Method](#run-exact-method)
-  - [Evaluate the RL Policy](#evaluate-the-rl-policy-best-of-k-grid)
+  - [Run Benchmarks](#run-benchmarks)
   - [RL Training](#rl-training)
 - [Results](#results)
 - [Weight and Data](#weight_and_data)
@@ -122,23 +120,74 @@ full size ladder), `--m_nominal` (nominal fleet stored in the `.npz`), `--tol`
 (accepted `|A|` deviation), `--bbox N S E W` (OSM only). Re-running tops up existing
 buckets, so it is safe to resume. Training data is generated on the fly (see
 [RL Training](#rl-training)) and does not need this script.
-### Run Meta Heuristic Algorithms
-```bash
-    uv run python -m solvers.ils --data_path "data/instances/30/61_20.npz"
-    uv run python -m solvers.ea  --data_path "data/instances/30/61_20.npz"
-    uv run python -m solvers.aco --data_path "data/instances/30/61_20.npz"
+
+### Run Benchmarks
+
+Use `scripts/bm.sh` as the single benchmark entry point for all solvers. The benchmark
+directory must contain instances in `<size>/*.npz` subdirectories, for example:
+
+```text
+data/5m/
+├── 40/
+│   └── instance_01.npz
+└── 50/
+    └── instance_01.npz
 ```
 
-### Run Exact Method
+Set `SOLVER` to `ea`, `ils`, `aco`, `lp`, or `rl`. By default the script reads
+`data/5m`, uses priority variant `P` and seed `6868`, and writes output to
+`logs/bm_<solver>_<variant>_<timestamp>.out`.
+
 ```bash
-    uv run python -m solvers.lp
+# Evolutionary Algorithm (EAHCARP)
+SOLVER=ea bash scripts/bm.sh
+
+# Iterated Local Search (ILSHCARP)
+SOLVER=ils bash scripts/bm.sh
+
+# Ant Colony Optimisation (ACOHCARP)
+SOLVER=aco bash scripts/bm.sh
+
+# Exact MILP solver (SCIP)
+SOLVER=lp bash scripts/bm.sh
+
+# RL policy (GRPO or PPO checkpoint)
+SOLVER=rl CKPT=outputs/checkpoints/best.ckpt bash scripts/bm.sh
+
+# Hybrid RL + local search
+SOLVER=rl CKPT=outputs/checkpoints/best.ckpt HYBRID=1 \
+    NUM_SAMPLE=400 SHORTLIST=25 TOPK_T1=100 ORACLE_HEAD=1 \
+    bash scripts/bm.sh
 ```
-### Evaluate the RL Policy (best-of-K grid)
+
+Common overrides apply to every solver:
+
 ```bash
-    uv run python -m eval.run_grid \
-    --ckpt "outputs/checkpoints/.../best.ckpt" \
-    --path data/ood --M 2,3,5,7,10 --variant P --num_sample 100 \
-    --out outputs/grid.csv
+DATA_DIR=data/ood/unit_square VARIANT=U SEED=777 M=5 \
+    SOLVER=ils bash scripts/bm.sh
+```
+
+| Solver | Solver-specific environment variables |
+|---|---|
+| EA | `N_EPOCH` (100), `N_POPULATION` (200) |
+| ACO | `N_EPOCH` (100), `N_ANT` (50) |
+| ILS | `MAX_ITER` (200), `NUM_INIT_SAMPLE` (5), `STRENGTH` (3), `ACCEPT_MODE` (`best` or `sa`) |
+| LP | `TIME_LIMIT` (3600 seconds), `THREADS` (8; currently ignored by community SCIP) |
+| RL | `CKPT` (required), `NUM_SAMPLE` (100), `EPS` (0.005) |
+| RL hybrid | `HYBRID=1`, `SHORTLIST` (10), `TOPK_T1` (0), `ORACLE_HEAD` (0) |
+
+Examples with solver-specific settings:
+
+```bash
+SOLVER=ea DATA_DIR=data/2m VARIANT=U N_EPOCH=200 N_POPULATION=300 \
+    bash scripts/bm.sh
+
+SOLVER=ils MAX_ITER=500 NUM_INIT_SAMPLE=10 STRENGTH=4 ACCEPT_MODE=sa \
+    bash scripts/bm.sh
+
+SOLVER=aco N_EPOCH=200 N_ANT=100 bash scripts/bm.sh
+
+SOLVER=lp TIME_LIMIT=300 bash scripts/bm.sh
 ```
 
 ### RL Training
