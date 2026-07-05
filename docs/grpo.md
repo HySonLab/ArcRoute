@@ -4,6 +4,79 @@ Ground truth as of **2026-07-03**, read directly from code (`src/trainers/grpo.p
 `src/policy/*.py`, `src/env/env.py`, `src/train.py`) plus the latest training run
 and OOD benchmark.
 
+This file is a chronological research log — every section is kept, nothing
+is deleted when superseded (a later section says so explicitly and points
+back). The two sections immediately below are the only non-chronological
+parts: a **Contents** map to jump straight to a topic, and a **Current
+State** digest of what's true *right now* without reading the whole log.
+Skip both and start at §1 for the full narrative.
+
+## Contents
+
+**Foundations (architecture, stable, rarely revisited)**
+- [§1](#1-problem-being-solved) Problem being solved — HDCARP-P, objective, precedence.
+- [§2](#2-data-flow-topology) Data flow / topology — encoder→decoder→env decode step, training vs. inference.
+- [§3](#3-policy-architecture) Policy architecture — encoder, Joint M×N decoder.
+- [§4](#4-grpo-trainer-srctrainersgrpopy) GRPO trainer — critic-free, group-relative rank advantage.
+- [§5](#5-training-config--entry-point) Training config & entry point — `src/train.py`, `scripts/train.sh`.
+
+**Training-side status & fixes**
+- [§6](#6-current-status) Current status — baseline, bậc 2, bậc 3 OOD benchmark numbers (superseded readings noted inline as later bậc's land).
+- [§7](#7-root-cause-of-the-t2t3-gap-and-why-bậc-2-closed-most-of-it) Root cause of the T2/T3 gap — phase-masked advantage fix (bậc 2). **Implemented.**
+- [§8](#8-bậc-3--combined-decoder-upgrade--implemented-trained-benchmarked) "Bậc 3" combined decoder upgrade. **Implemented.**
+
+**Inference-time hybrid ("P" series) — current production pipeline**
+- [§9](#9-p1--closing-the-t1-not-worse-gap-via-a-wider-inference-time-funnel) "P1" — wider sampling funnel (`NUM_SAMPLE`/`TOPK_T1`). **Implemented.**
+- [§10](#10-p2--an-exact-t1-oracle-closes-the-remaining-gap-to-literal-100) "P2" — exact T1 oracle forced-prefix. **Implemented**, superseded mechanically by §18 (same guarantee, unified pipeline).
+- [§15](#15-extending-p2-past-max_n1-a-local-search-heuristic-for-mediumlarge) P2 past `max_n1` — heuristic fallback for medium/large n1. **Implemented.**
+- [§17](#17-clarifying-15s-scope-t1_heuristic_argmin-is-not-a-general-hdcarp-solver) Scope correction — the heuristic solves only the T1 sub-problem, not general HDCARP; large-scale end-to-end benchmark still outstanding. **Read this before citing §15.**
+- [§18](#18-unifying-the-pool-arm-and-oracle-head-arm-into-one-single-pool-pipeline) Pool-arm + oracle-head-arm unification into one pipeline, validated (820 instances, 0 regressions) and **adopted in `src/solvers/rl.py`.** This is the current production design for §9/§10/§15's mechanics.
+
+**Investigated and rejected — training-time heuristic injection (closed line of investigation, kept so it isn't retried)**
+- [§11](#11-investigated-and-rejected-moving-the-oracle-into-training) Moving the oracle into training. **Rejected.**
+- [§12](#12-investigated-and-rejected-ls-shaped-training-advantage-reward-shaping) LS-shaped training advantage (reward shaping). **Rejected.**
+- [§13](#13-investigated-and-rejected-advantage-filtered-ils-imitation-diverse-target-bc) Advantage-filtered ILS-imitation (diverse-target BC). **Rejected.**
+- [§16](#16-investigated-and-rejected-4th-and-final-round-staged-imitate-then-rl-cleanup) Staged imitate-then-RL-cleanup (4th and final round). **Rejected.** §11+§12+§13+§16 synthesis: broadening the training curriculum is the one lever with actual evidence behind it, not heuristic hybridization.
+
+**Housekeeping**
+- [§14](#14-codebase-audit--dead-code-and-unearned-complexity-removed) Codebase audit — dead code / unearned complexity removed (first pass; §18 is a second, narrower pass over `solvers/rl.py`).
+
+## Current State (TL;DR)
+
+**Training**: GRPO (critic-free, group-relative rank advantage, §4) beats PPO
+on all 3 objectives (see memory / earlier A/B). Bậc 2 (§7, phase-masked
+advantage) and bậc 3 (§8, combined decoder) are both implemented, trained,
+and confirmed by OOD benchmark — current architecture, not a proposal.
+Four separate attempts to fold a classical heuristic/oracle signal into
+*training* (§11, §12, §13, §16) all failed to transfer beyond the small
+training curriculum; **do not attempt a fifth** without genuinely new
+information (e.g. a from-scratch retrain). The one lever with real evidence
+for a training-side improvement is broadening the training curriculum
+itself (§13's `rlmed` control).
+
+**Inference (production today)**: `src/solvers/rl.py::RLHybHCARP`, single
+unified decode pool (§18) — `num_sample` free rollouts plus, when variant P
+and a capacity-feasible class-1 partition exists, oracle-forced-prefix rows
+(exact DP when n1≤16, `t1_heuristic_argmin` fallback above that per §15,
+scope caveats in §17) — shortlisted, local-searched, and picked by one
+`final_band_pick` comparator. Recommended config for
+`outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt`: `HYBRID=1
+NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1` (variant P
+only — `oracle_head` is a no-op for variant U). Benchmarked on
+`data/osm_test_small` (2858 instances): 100% T1-not-worse-than-ILS, 98%
+lex-win, 57.7% Pareto-dominance, ~3-4x faster than ILS.
+
+**Known-open items** (don't assume these are done just because a lot of
+this log is validated):
+- No end-to-end benchmark exists yet on real `medium`/`large` curriculum
+  data (only component-level validation) — §17.
+- `t1_heuristic_argmin` quality is only cross-validated against the exact
+  DP up to n1≤19, and against a "best-known reference" up to n1=35 — §15.2.
+- §18's unification is validated by paired-seed A/B, not a from-scratch
+  full benchmark rerun of `logs/status_bm.md`'s rows under the new code
+  path (expected identical by construction/validation, not re-measured
+  end-to-end).
+
 ## 1. Problem being solved
 
 HDCARP-P: fleet of M vehicles, arcs split into P=3 priority classes, class-k
@@ -1452,3 +1525,132 @@ report the inference-time-only P1+P2(+§15) system as the hybrid
 contribution; do not attempt a fifth heuristic-in-training variant
 without genuinely new information (e.g. a from-scratch retrain, still
 untested by any of these four smoke-scale rounds).
+
+## 17. Clarifying §15's scope: `t1_heuristic_argmin` is not a general HDCARP solver
+
+A claim came up worth correcting explicitly before it calcifies into
+false lore: "the oracle head's heuristic (`t1_heuristic_argmin`) is
+currently the best method for HDCARP, and can just be run for `large`
+instances." Checked against the code and this doc's own §10.4/§15 data
+(independently verified via a second-pass review) — **true only for a
+much narrower claim than stated; false as a general-HDCARP claim.**
+
+- **Runtime feasibility: holds.** `t1_heuristic_argmin` is wall-clock
+  bounded (`time_budget`, default 0.5s) instead of the exact DP's
+  `O(2^n1 * n1^2)`, and stays under ~1s across the tested n1 range 10-35
+  (`oracle.py` §15.1 docstring; §15.2 table). It genuinely *can execute*
+  on `large`-bucket instances (mean n1 30, max 35, §15) without blowing
+  up — the `time_budget` is soft, not hard, and "measured up to ~2x at
+  n1=35" (`oracle.py::t1_heuristic_argmin` docstring) is the one caveat.
+
+- **"Best for HDCARP": overstated.** `t1_heuristic_argmin` solves only the
+  class-1 opening-prefix partition sub-problem, consumed exclusively by
+  `RLHybHCARP._oracle_head_arm` (§10). Classes 2/3 and the full T2/T3
+  objective are still produced by RL sampling + `intra_route_opt`/
+  `inter_route_opt` (the pool arm), not by this function — it has no path
+  to being "the" HDCARP solver, general-purpose or otherwise. It is not
+  benchmarked anywhere against the project's actual full-problem solvers
+  (ILS/EA/ACO/`meta.py`) at any scale.
+
+- **"Can run for `large` instances" quality-wise: unverified, not
+  confirmed.** All benchmark evidence in `logs/status_bm.md` and §15.2 is
+  on `small`-curriculum data (max n1 = 10); cross-validation against the
+  exact DP only covers n1 <= 19. Beyond that (`large`'s own mean/max n1 of
+  30/35) the only reference is a "long best-known" comparison, with the
+  measured gap rising to 5.64% at n1=35 — i.e. right at the edge of what's
+  ever been checked, not comfortably inside it. §15.4 already says this
+  plainly: *"A full benchmark run on real `medium`/`large` curriculum data
+  ... has not yet been done — this section documents the component-level
+  validation that makes such a run possible, not a new end-to-end
+  benchmark result."*
+
+**Correct framing going forward**: `t1_heuristic_argmin` is the best
+*currently-implemented* answer to the class-1 sub-problem once n1 exceeds
+the exact oracle's guard (16) — a real, useful, cheap fallback — but it is
+neither a general HDCARP solver nor validated (only "applicable") at
+`large` scale. Don't cite it as "solving HDCARP" or as scale-proven beyond
+n1≈35 without first running the still-outstanding end-to-end
+`medium`/`large` benchmark (§15.4).
+
+## 18. Unifying the pool arm and oracle-head arm into one single-pool pipeline
+
+Following §17's correction (the oracle head only fixes T1, so local search
+still had to run on every candidate, including oracle-forced ones), the
+next question was whether the two-arm *structure itself* — a free-sampled
+pool arm and a separately-decoded oracle-head arm, joined post hoc by
+`oracle_union_pick` — could be collapsed into one simpler pipeline without
+losing quality. Investigated, validated, and adopted.
+
+### 18.1 Design
+
+Instead of two separate decodes (`policy.forward` for the pool, a
+hand-rolled `_decode_forced` loop for the oracle-forced rows) joined by a
+bespoke comparator, `RLHybHCARP` now runs **one batched decode**
+(`_decode_pool`) over a combined pool: `num_sample` free rows plus, when
+`_oracle_forced_prefix` finds an applicable class-1 prefix (variant P,
+n1-guard, capacity-feasible), `1 + oracle_r` prefix-forced rows (1 greedy +
+`oracle_r` sampled completions). At each decode step, rows with an
+unconsumed forced action get it overridden onto the batch's action tensor
+before `env.step`; every other row samples normally — mechanically sound
+because `env.step` is fully row-parallel and the decoder is per-row.
+
+Selection collapses similarly: one `eps_lex_select` shortlist over the
+whole pool, `topk_t1` over the free rows only (a T1 hedge — ranking forced
+rows by T1 would be meaningless since they all share one forced value), a
+guaranteed lane of the best forced rows by (T2, T3) when forcing engaged,
+then **one** local-search funnel and **one** final comparator
+(`final_band_pick`: T1 tie-band → T2 eps-band → min T3), replacing the
+three-function split `shortlist_completions` / `t2_band_pick` /
+`oracle_union_pick`.
+
+Degenerate cases collapse for free, with no special-casing: variant U, no
+capacity-feasible partition, or an oracle/env mask mismatch mid-decode →
+0 forced rows → `_decode_pool` delegates straight to
+`AttentionModelPolicy.forward`, byte-identical to the pre-unification
+default path's rollout.
+
+### 18.2 Empirical validation (before touching production code)
+
+Paired-seed A/B (`RLHybHCARP` two-arm production vs. a scratchpad
+`UnifiedRLHyb` prototype, identical seed per instance so RNG draws line up,
+plus a same-vs-same reseed control to establish the pipeline's own noise
+floor), checkpoint `grpo_osm_bac3/epoch=159.ckpt`, production config
+(`NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1`):
+
+| regime | n | T1 regressions | unified lex-worse | noise-floor lex-worse |
+|---|---|---|---|---|
+| exact DP (n1 7-15) | 520 (`osm_test_small`) | 0/520 | 31.3% | 36.5% |
+| heuristic (n1 18-35) | 300 (`osm_val` medium/large) | 0/300 | 21.7% | 22.7% |
+
+In both regimes the unified pipeline's lex-worse rate sits at or below the
+pipeline's own seed-noise floor — i.e. no detectable regression, just RNG
+scatter — and T1 never regressed once across 820 real instances (the
+LS-gating rule, "keep post-LS only if lex-better," structurally prevents
+this regardless of pool composition). Speed improved ~8-20% (one shared
+encoder pass instead of two; the gain shrinks at larger n1 because the
+heuristic's own `time_budget`/ILS-restart cost — paid once, identically, by
+both pipelines — comes to dominate wall-clock).
+
+### 18.3 Adoption
+
+Applied to `src/solvers/rl.py`: removed `shortlist_completions`,
+`t2_band_pick`, `oracle_union_pick`, `_decode_forced`, `_oracle_head_arm`,
+and the now-dead `oracle_shortlist_eps` constructor parameter (an eps-band
+knob only the deleted `shortlist_completions` call site ever read); added
+`final_band_pick`, `_oracle_forced_prefix`, `_decode_pool`, and a rewritten
+`__call__` — net roughly -100 lines, three comparators collapsed to one,
+two decode paths collapsed to one (with the forced-prefix-only-when-
+applicable delegation preserving the default path's exact rollout).
+
+`tests/test_rl.py` updated to match: `TestSelectionHelpers` →
+`TestFinalBandPick` (tests the single rule reduces to argmin-T1 absent a
+genuine T1 tie, and to a (T2, T3) choice within a tie-band, covering the
+same cases the three deleted functions' tests did); `TestForcedDecode`
+rewritten against `_decode_pool`; `TestOracleHeadRegression`'s two
+byte-identity tests renamed and narrowed to what's still exactly
+guaranteed post-unification — the *rollout* stays byte-identical to a
+plain policy call when no prefix is forced (proven directly), while the
+*final selection* intentionally now uses `final_band_pick` instead of
+strict-lex argmin (no longer asserted byte-for-byte; validated empirically
+instead, per §18.2) — full suite (`uv run python -m unittest discover -s
+tests -p "test_*.py"`) passes, 219 tests, no regressions.

@@ -1,19 +1,29 @@
 """Tests for the RL hybrid solver (`solvers.rl`) and the exact T1 oracle
-head (`solvers.oracle`, P2).
+head (`solvers.oracle`, P2). Also covers the P2->single-pool unification
+(docs/grpo.md §17/§18): the old two-arm design (separate pool-arm and
+oracle-head-arm decodes joined by `oracle_union_pick`) was replaced by one
+batched decode (`_decode_pool`) over a combined free+forced-row pool, with
+one final selection rule (`final_band_pick`).
 
 Covers:
   1. TestT1OracleArgmin      — oracle T1 matches brute force; `parts` are
      internally consistent (coverage, capacity, completion formula);
      tiebreak preserves T1 and never worsens the secondary; guards
      (max_n1, capacity-infeasible, no class-1 arcs) return "not applicable".
-  2. TestSelectionHelpers    — shortlist_completions / t2_band_pick /
-     oracle_union_pick unit behavior.
-  3. TestForcedDecode        — forcing the oracle's `parts` through the real
-     env/policy machinery reproduces the oracle T1 (fp32 tolerance).
-  4. TestOracleHeadRegression — oracle_head=False (default) is byte-identical
-     to the pre-P2 RLHybHCARP pipeline on a fixed seed (backward-compat
-     guarantee); the guard fallback is byte-identical too; oracle_head=True
-     returns a T1-optimal answer end-to-end.
+  2. TestFinalBandPick       — the single post-unification selection rule
+     (replaces the old shortlist_completions/t2_band_pick/oracle_union_pick
+     split) reduces to argmin-T1 absent a genuine tie, and to a (T2, T3)
+     choice within a T1 tie-band.
+  3. TestForcedDecode        — forcing the oracle's `parts` through
+     `_decode_pool`'s merged batch reproduces the oracle T1 (fp32 tolerance).
+  4. TestOracleHeadRegression — oracle_head=False (default) still delegates
+     to the plain policy rollout unchanged (`_decode_pool`'s byte-identical
+     fallback when no prefix is forced); the guard fallback does too;
+     oracle_head=True returns a T1-optimal answer end-to-end. (The final
+     SELECTION step is no longer asserted byte-identical to the frozen pre-
+     unification pipeline -- it intentionally now uses `final_band_pick`
+     instead of strict-lex argmin; see docs/grpo.md §17/§18 for the
+     empirical validation that this doesn't regress quality.)
 
 Run: uv run python -m unittest tests.test_rl -v
 """
@@ -101,52 +111,6 @@ def _make_hyb(**kw):
     al = RLHybHCARP(_fake_ckpt(), "P", device="cpu", **kw)
     al._load_data(*_hand_instance())
     return al
-
-
-def _p1_reference_call(al, num_sample):
-    """Frozen copy of RLHybHCARP.__call__ as of P1 (pre-oracle-head).
-
-    The regression test compares this byte-for-byte against the production
-    __call__ with oracle_head=False under an identical RNG seed — any change
-    to RNG consumption or selection logic on the default path breaks it."""
-    from utils.ops import batchify
-    from solvers.rl import eps_lex_select
-
-    td = batchify(al.td, num_sample)
-    with torch.inference_mode():
-        out = al.policy(td, env=al.env, decode_type="sampling")
-    reward = out["reward"].cpu().numpy()
-    actions = out["actions"].cpu().numpy().astype(np.int64)
-
-    keep = eps_lex_select(reward, eps=al.eps, shortlist=al.shortlist)
-    if al.topk_t1 > 0:
-        top = np.argsort(reward[:, 0])[:al.topk_t1]
-        keep = np.array(sorted(set(keep.tolist()) | set(int(x) for x in top)),
-                        dtype=keep.dtype)
-
-    td0 = al.td[0]
-    M = int(td0["num_vehicle"])
-    N1 = td0["service_times"].shape[0]
-    adj = td0["adj"].cpu().numpy().astype(np.float64)
-    clss = td0["clss"].cpu().numpy().astype(np.int64)
-    demands = td0["demand"].cpu().numpy().astype(np.float64)
-    classes = [c for c in np.unique(clss) if c != 0]
-    al.evaluator._cache_td(td0)
-
-    best_T, best_key = None, None
-    for idx in keep:
-        pre_T = reward[idx]
-        pre_vehicles = al.evaluator.routes_from_joint_actions(actions[idx], M, N1)
-        ls_T, _ = al._local_search_one(pre_vehicles, td0, M, adj, clss,
-                                       demands, classes)
-        if ls_T is not None and tuple(ls_T.tolist()) < tuple(pre_T.tolist()):
-            cand_T = ls_T
-        else:
-            cand_T = pre_T
-        key = tuple(cand_T.tolist())
-        if best_key is None or key < best_key:
-            best_key, best_T = key, cand_T
-    return np.asarray(best_T, dtype=np.float64)[None, :]
 
 
 # ----------------------------------------------------------------------- 1
@@ -319,49 +283,51 @@ class TestT1HeuristicArgmin(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------- 2
-class TestSelectionHelpers(unittest.TestCase):
-    def test_shortlist_completions_band_and_pad(self):
-        from solvers.rl import shortlist_completions
-        reward = np.array([[1.0, 0.500, 0.9],
-                           [1.0, 0.501, 0.5],
-                           [1.0, 0.600, 0.1]])
-        # eps-band on T2 = {0, 1}, sorted by T3 -> [1, 0]
-        self.assertEqual(shortlist_completions(reward, 2, eps=0.01).tolist(), [1, 0])
-        # band smaller than k -> padded with strict-(T2,T3) rest
-        self.assertEqual(shortlist_completions(reward, 3, eps=0.01).tolist(), [1, 0, 2])
+class TestFinalBandPick(unittest.TestCase):
+    """`final_band_pick` is the single post-unification selection rule,
+    replacing the old `shortlist_completions` (forced-completion shortlist,
+    now inlined as a plain lexsort in `RLHybHCARP.__call__`) and
+    `t2_band_pick` + `oracle_union_pick` (arm-internal pick + two-arm union,
+    now one T1-tie-band -> T2-eps-band -> min-T3 rule)."""
 
-    def test_t2_band_pick(self):
-        from solvers.rl import t2_band_pick
+    def test_unique_t1_min_wins_regardless_of_own_t2_t3(self):
+        from solvers.rl import final_band_pick
+        Ts = np.array([[1.0, 9.0, 9.0],
+                       [1.2, 0.0, 0.0],
+                       [2.0, 0.0, 0.0]])
+        self.assertEqual(final_band_pick(Ts, eps2=0.02), 0)
+
+    def test_t1_tie_band_falls_back_to_t2_eps_band_then_t3(self):
+        from solvers.rl import final_band_pick
+        # same fixture shape as the old test_t2_band_pick/test_oracle_union_pick
+        # T1-tied cases -- three rows share T1 (within tie_tol).
         Ts = np.array([[1.0, 0.500, 0.9],
                        [1.0, 0.505, 0.2],
                        [1.0, 0.600, 0.1],
                        [np.inf, np.inf, np.inf]])          # padding row ignored
-        self.assertEqual(t2_band_pick(Ts, 0.02), 1)        # band {0,1}, min T3
-        self.assertEqual(t2_band_pick(Ts, 0.0), 0)         # zero band -> argmin T2
+        self.assertEqual(final_band_pick(Ts, 0.02), 1)     # band {0,1}, min T3
+        self.assertEqual(final_band_pick(Ts, 0.0), 0)      # zero band -> argmin T2
 
-    def test_oracle_union_pick(self):
-        from solvers.rl import oracle_union_pick
-        a = np.array([1.0, 2.0, 3.0])
-        # head T1 strictly better / strictly worse
-        self.assertTrue(oracle_union_pick(a, np.array([0.9, 9.0, 9.0]), 0.02))
-        self.assertFalse(oracle_union_pick(a, np.array([1.1, 0.0, 0.0]), 0.02))
-        # T1 tie, T2 within band -> T3 decides
-        self.assertTrue(oracle_union_pick(a, np.array([1.0, 2.03, 2.0]), 0.02))
-        self.assertFalse(oracle_union_pick(a, np.array([1.0, 2.03, 4.0]), 0.02))
-        # T1 tie, T2 outside band -> T2 decides
-        self.assertFalse(oracle_union_pick(a, np.array([1.0, 2.5, 0.0]), 0.02))
-        self.assertTrue(oracle_union_pick(a, np.array([1.0, 1.5, 9.0]), 0.02))
+    def test_t1_not_tied_prefers_strictly_better_t1(self):
+        from solvers.rl import final_band_pick
+        # head-style T1 strictly better / strictly worse (mirrors the old
+        # oracle_union_pick's two-candidate cases, generalized to N rows).
+        self.assertEqual(
+            final_band_pick(np.array([[1.0, 2.0, 3.0], [0.9, 9.0, 9.0]]), 0.02), 1)
+        self.assertEqual(
+            final_band_pick(np.array([[1.0, 2.0, 3.0], [1.1, 0.0, 0.0]]), 0.02), 0)
 
 
 # ----------------------------------------------------------------------- 3
 class TestForcedDecode(unittest.TestCase):
     def test_forced_prefix_reproduces_oracle_T1(self):
-        """Forcing the oracle's `parts` through the real env/policy decode
-        yields decode-time T1 == oracle T1 (fp32 arithmetic tolerance), for
-        both the greedy and every sampled completion."""
+        """Forcing the oracle's `parts` through `_decode_pool`'s merged batch
+        (`num_free=0` -> every row is a forced row: 1 greedy + `oracle_r`
+        sampled completions) yields decode-time T1 == oracle T1 (fp32
+        arithmetic tolerance), for the greedy row and every sampled one."""
         from solvers.oracle import forced_flat_actions, t1_oracle_argmin
         torch.manual_seed(11)
-        al = _make_hyb(shortlist=4, eps=0.01)
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_r=7)
         td0 = al.td[0]
         N1 = td0["service_times"].shape[0]
         adj = td0["adj"].cpu().numpy().astype(np.float64)
@@ -374,15 +340,13 @@ class TestForcedDecode(unittest.TestCase):
         self.assertTrue(np.isfinite(res["T1"]))
         forced = forced_flat_actions(res["parts"], N1)
 
-        g_rew, g_act = al._decode_forced(forced, 1, greedy=True)
-        s_rew, s_act = al._decode_forced(forced, 8, greedy=False)
-        for rew in (g_rew, s_rew):
-            self.assertTrue(np.allclose(rew[:, 0], res["T1"], rtol=1e-5),
-                            f"decode T1 {rew[:, 0]} != oracle {res['T1']}")
-        # forced opening is verbatim in the action sequences
-        for act in (g_act, s_act):
-            self.assertEqual(act[:, :len(forced)].tolist(),
-                             [forced] * act.shape[0])
+        reward, actions, n_forced = al._decode_pool(0, forced)
+        self.assertEqual(n_forced, 1 + al.oracle_r)
+        self.assertTrue(np.allclose(reward[:, 0], res["T1"], rtol=1e-5),
+                        f"decode T1 {reward[:, 0]} != oracle {res['T1']}")
+        # forced opening is verbatim in every row's action sequence
+        self.assertEqual(actions[:, :len(forced)].tolist(),
+                         [forced] * actions.shape[0])
 
 
 # ----------------------------------------------------------------------- 4
@@ -395,35 +359,74 @@ class TestOracleHeadRegression(unittest.TestCase):
         self.assertFalse(al.oracle_head)
 
     def test_oracle_code_not_reached_when_disabled(self):
+        import solvers.oracle as oracle_mod
         al = _make_hyb(shortlist=4, eps=0.01)
-        with mock.patch.object(al, "_oracle_head_arm",
-                               side_effect=AssertionError("must not run")) as m:
+        with mock.patch.object(oracle_mod, "t1_oracle_argmin",
+                               side_effect=AssertionError("must not run")) as m1, \
+             mock.patch.object(oracle_mod, "t1_heuristic_argmin",
+                               side_effect=AssertionError("must not run")) as m2:
             torch.manual_seed(self.SEED)
             al(num_sample=self.K)
-        m.assert_not_called()
+        m1.assert_not_called()
+        m2.assert_not_called()
 
-    def test_disabled_is_byte_identical_to_p1(self):
-        """THE backward-compat guarantee: with oracle_head=False (default),
-        __call__ is byte-identical to the frozen P1 pipeline on a fixed seed."""
+    def test_disabled_rollout_is_byte_identical_to_plain_policy(self):
+        """Backward-compat guarantee for the default path, updated for the
+        single-pool unification: with oracle_head=False, `_oracle_forced_prefix`
+        returns None, so `_decode_pool` delegates straight to
+        `AttentionModelPolicy.forward` -- the ROLLOUT (reward/actions) is
+        byte-identical to a plain policy call on an identical RNG seed.
+
+        (The final SELECTION among the shortlist now uses `final_band_pick`
+        instead of strict-lex argmin -- see `TestFinalBandPick` for why that
+        reduces to the same choice absent a genuine T1 tie, and
+        docs/grpo.md §17/§18 for the end-to-end empirical validation that the
+        full pipeline doesn't regress. This test only pins down the part of
+        the guarantee that's still exact: the rollout itself.)"""
+        from utils.ops import batchify
         al = _make_hyb(shortlist=4, eps=0.01, topk_t1=3)
-        torch.manual_seed(self.SEED)
-        ref = _p1_reference_call(al, self.K)
-        torch.manual_seed(self.SEED)
-        got = al(num_sample=self.K)
-        self.assertTrue(np.array_equal(ref, got), f"{ref} != {got}")
 
-    def test_guard_fallback_is_byte_identical_when_heuristic_disabled(self):
+        torch.manual_seed(self.SEED)
+        td = batchify(al.td, self.K)
+        with torch.inference_mode():
+            ref_out = al.policy(td, env=al.env, decode_type="sampling")
+        ref_reward = ref_out["reward"].cpu().numpy().astype(np.float64)
+        ref_actions = ref_out["actions"].cpu().numpy().astype(np.int64)
+
+        torch.manual_seed(self.SEED)
+        got_reward, got_actions, n_forced = al._decode_pool(self.K, None)
+        self.assertEqual(n_forced, 0)
+        self.assertTrue(np.array_equal(ref_reward, got_reward))
+        self.assertTrue(np.array_equal(ref_actions, got_actions))
+
+    def test_guard_fallback_rollout_is_byte_identical_when_heuristic_disabled(self):
         """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic
-        explicitly disabled too -> pool answer returned unchanged,
-        byte-identical to the default path (neither solver runs, no extra
-        RNG consumed)."""
+        explicitly disabled too -> `_oracle_forced_prefix` returns None (no
+        solver applicable), so the rollout falls back to the plain policy
+        call unchanged, exactly as when oracle_head=False (neither solver
+        runs, no extra RNG consumed)."""
+        from utils.ops import batchify
         al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2,
                        oracle_use_heuristic=False)
+        td0 = al.td[0]
+        N1 = td0["service_times"].shape[0]
+        adj = td0["adj"].cpu().numpy().astype(np.float64)
+        clss = td0["clss"].cpu().numpy().astype(np.int64)
+        demands = td0["demand"].cpu().numpy().astype(np.float64)
+        M = int(td0["num_vehicle"])
+        forced = al._oracle_forced_prefix(td0, N1, adj, clss, demands, M)
+        self.assertIsNone(forced)
+
         torch.manual_seed(self.SEED)
-        ref = _p1_reference_call(al, self.K)
+        td = batchify(al.td, self.K)
+        with torch.inference_mode():
+            ref_out = al.policy(td, env=al.env, decode_type="sampling")
+        ref_reward = ref_out["reward"].cpu().numpy().astype(np.float64)
+
         torch.manual_seed(self.SEED)
-        got = al(num_sample=self.K)
-        self.assertTrue(np.array_equal(ref, got), f"{ref} != {got}")
+        got_reward, got_actions, n_forced = al._decode_pool(self.K, forced)
+        self.assertEqual(n_forced, 0)
+        self.assertTrue(np.array_equal(ref_reward, got_reward))
 
     def test_heuristic_fallback_engages_above_max_n1(self):
         """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic

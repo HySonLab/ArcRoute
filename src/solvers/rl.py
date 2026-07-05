@@ -52,60 +52,27 @@ def eps_lex_select(reward, eps=0.005, shortlist=1):
     return keep[:shortlist]
 
 
-def shortlist_completions(reward, k, eps=0.01):
-    """Shortlist up to `k` forced-prefix completions for local search.
+def final_band_pick(Ts, eps2, tie_tol=1e-6):
+    """Single selection rule over a combined candidate pool (free rollouts
+    plus, when applicable, oracle-forced rollouts) -- one rule covering what
+    used to be a two-arm split (`t2_band_pick` + `oracle_union_pick`).
 
-    All completions decoded from one forced class-1 prefix share T1 exactly
-    (the prefix determines it), so strict-lex ranking degenerates to
-    argmin-T2 -- the same degeneracy `eps_lex_select` fixes for T1. Rank by an
-    eps-band on T2 sorted by T3 instead, padded with the strict-(T2,T3)-lex
-    rest when the band is smaller than `k`.
+    T1 tie-band (relative `tie_tol`) -> among those, T2 eps2-band -> min T3.
+    Degenerates to argmin-T1 when no two candidates' T1 are within `tie_tol`
+    of each other (the common case among distinct free rollouts), and to a
+    pure (T2, T3) choice when candidates share one forced T1 exactly (the
+    oracle-forced-rows case).
 
-    reward : (R, P) array of completion T-vectors, LOWER is better.
-    Returns indices into `reward`'s first axis, best first.
-    """
-    t2 = reward[:, 1]
-    band = np.where(t2 <= t2.min() * (1.0 + eps))[0]
-    band = band[np.argsort(reward[band, 2])]
-    if len(band) < k:
-        rest = np.lexsort((reward[:, 2], reward[:, 1]))
-        seen = set(band.tolist())
-        band = np.concatenate(
-            [band, [i for i in rest if i not in seen]]).astype(np.int64)
-    return band[:k]
-
-
-def t2_band_pick(Ts, eps2):
-    """Pick one candidate among finished oracle-head candidates.
-
-    All rows share T1, so this is a pure (T2, T3) choice: keep candidates with
-    T2 <= T2min * (1 + eps2), take min T3 among them. Returns a row index.
-
-    Ts : (k, 3) array of T-vectors (rows with non-finite T1 are ignored).
+    Ts : (k, 3) array of T-vectors, LOWER is better (non-finite T1 ignored).
+    Returns a row index into `Ts`.
     """
     ok = np.where(np.isfinite(Ts[:, 0]))[0]
     c = Ts[ok]
-    band = np.where(c[:, 1] <= c[:, 1].min() * (1.0 + eps2))[0]
-    return int(ok[band[np.argmin(c[band, 2])]])
-
-
-def oracle_union_pick(a, b, eps2, tie_tol=1e-6):
-    """Union rule between the pool arm's final pick and the oracle-head arm's.
-
-    a : P1 (pool-based funnel) T-vector;  b : oracle-head T-vector.
-    Returns True iff the head candidate `b` should be taken:
-      - head T1 strictly better beyond a relative tie tolerance -> head;
-      - P1 T1 strictly better -> P1;
-      - T1 tied -> eps2-band on T2, min T3 (same band rule as `t2_band_pick`).
-    """
-    if b[0] < a[0] - tie_tol * max(a[0], 1e-9):
-        return True
-    if b[0] > a[0] + tie_tol * max(a[0], 1e-9):
-        return False
-    lo = min(a[1], b[1])
-    if abs(a[1] - b[1]) <= eps2 * max(lo, 1e-9):
-        return b[2] < a[2]
-    return b[1] < a[1]
+    m1 = c[:, 0].min()
+    b1 = np.where(c[:, 0] <= m1 + tie_tol * max(m1, 1e-9))[0]
+    c2 = c[b1]
+    b2 = b1[np.where(c2[:, 1] <= c2[:, 1].min() * (1.0 + eps2))[0]]
+    return int(ok[b2[np.argmin(c[b2, 2])]])
 
 
 class RLHCARP:
@@ -154,63 +121,68 @@ class RLHCARP:
 
 
 class RLHybHCARP(RLHCARP):
-    """Two-tier funnel hybrid: sample K rollouts, shortlist the ones with
-    near-best T1 (eps-lex), then run exact intra/inter-route local search
-    (`utils.local_search`) on just the shortlist and keep the lex-best result.
+    """Single-pool funnel hybrid: one batched decode produces a combined pool
+    of free-sampled rollouts plus (when applicable) oracle-forced-prefix
+    rollouts, then ONE shortlist + local-search + selection funnel picks the
+    final answer -- no separate arms, no bespoke union comparator.
 
-    Local search minimizes total deadheading cost, a proxy for the true
-    max-completion (T_k) objective, so a candidate's post-LS T-vector is only
-    kept if it's lex-better than its pre-LS T-vector -- this makes the hybrid
-    provably no worse than plain `RLHCARP` with the same eps/num_sample.
+    `_oracle_forced_prefix` computes a (provably-optimal-when-exact,
+    empirically-near-optimal-when-heuristic) class-1 opening prefix per
+    vehicle (variant P only); `_decode_pool` decodes `num_sample` free rows
+    plus, when a prefix is available, `1 + oracle_r` prefix-forced rows
+    (1 greedy + `oracle_r` sampled completions) in a SINGLE batched decode
+    loop -- rows with an unconsumed forced action get it overridden each
+    step, all other rows sample normally. Degenerate cases (variant U, no
+    capacity-feasible class-1 partition, or an oracle/env mask mismatch mid-
+    decode) collapse to 0 forced rows, i.e. exactly the plain pool funnel
+    (and `_decode_pool` delegates straight to `AttentionModelPolicy.forward`
+    in that case, so the default `oracle_head=False` path's rollout is
+    unchanged from before the unification).
 
-    `topk_t1` (default 0, no-op) adds a second, T1-only-ranked pool of extra
-    candidates on top of the eps-lex shortlist -- the eps-lex shortlist finds
-    good (T2,T3) tiebreaks among near-best-T1 samples, but the pool's raw
-    best-T1 sample is sometimes still worse than a competing heuristic's T1;
-    widening `num_sample` alone doesn't reliably surface it into the eps-band
-    shortlist. Measured on `data/osm_test_small` (2858 instances,
-    `outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt`): raising
-    `num_sample` 100->400 and adding `topk_t1=100` moved "T1 not worse than
-    ILS" 82.75%->95.31%, "T2 not worse" 44.2%->53.1%, lex-win 69.3%->86.4%,
-    Pareto-dominance 26.2%->36.5%, at 0.144s/instance (still 5.6x faster than
-    ILS's 0.81s/instance) -- see `logs/status_bm.md` for the full repro.
+    Local search (`utils.local_search`) then runs on a shortlist spanning the
+    whole pool -- `eps_lex_select` over everything, `topk_t1` over the free
+    rows (a T1-only hedge against an imperfect forced prefix), and a
+    guaranteed lane of the best forced rows by (T2, T3) when forcing engaged
+    -- and only keeps a candidate's post-LS T-vector if it's lex-better than
+    pre-LS, so the hybrid is provably no worse than plain `RLHCARP`. The
+    final `final_band_pick` (T1 tie-band -> T2 eps-band -> min T3) picks the
+    winner, re-evaluated through the float64 `SolutionEvaluator`.
 
-    `oracle_head` (default False, no-op) adds a second, independent candidate
-    arm for variant P: an exact T1 oracle (`solvers.oracle.t1_oracle_argmin`,
-    Held-Karp + partition DP over the class-1 arcs) yields a provably
-    T1-optimal per-vehicle class-1 opening prefix, which is forced into the
-    policy's Joint M x N decode; classes 2/3 are then completed with
-    `oracle_r` sampled rollouts + 1 greedy, shortlisted by a T2-eps-band
-    (all completions share the forced T1), local-searched, and the arm's own
-    best is unioned with the pool arm's pick (`oracle_union_pick`). The
-    union winner's T-vector is re-evaluated through the float64
-    `SolutionEvaluator` before being returned. When neither solver is
-    applicable (no capacity-feasible partition exists), the head arm is
-    skipped and the pool arm's answer is returned unchanged. Measured on
-    `data/osm_test_small` (2858 instances, same ckpt as above, on top of
-    NUM_SAMPLE=400 TOPK_T1=100): "T1 not worse than ILS" 95.31%->100%, T2
-    52.9%->86.0%, T3 55.9%->63.5%, lex-win 86.4%->98.3%, Pareto 36.5%->57.7%,
-    at ~3.4x ILS speed.
+    Unified (see `docs/grpo.md` §17/§18) from an earlier two-arm design
+    (separate pool-arm and oracle-head-arm decodes, joined by a since-removed
+    `oracle_union_pick`) after paired-seed A/B validation on 820 real
+    instances (`outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt`) found no
+    regression versus the two-arm production pipeline, in either the
+    exact-DP regime (n1<=16, 520 instances) or the heuristic-fallback regime
+    (n1 19-35, 300 instances): T1 never regressed (0/820), and T2/T3 scatter
+    sat at or below the pipeline's own seed-noise floor, while running
+    ~8-20% faster (one shared encoder pass instead of two).
 
-    Above `oracle_max_n1` (class-1 arc count), the exact DP is not an option
-    at all (`O(2^n1 * n1^2)`) -- `oracle_use_heuristic` (default True) falls
-    back to `solvers.oracle.t1_heuristic_argmin`, a multi-restart local-search
-    heuristic with the same interface/safety-net role but no exactness
-    guarantee. Measured (real `data/osm_train` instances, small+medium+large
-    n1 ranges): essentially exact (<0.1% mean gap) through n1~20, degrading
-    to ~1.7%/2.7%/5.6% mean optimality gap at n1~25/31/35 respectively, at
-    well under 1s/instance throughout. The overall system's "T1 guarantee"
-    degrades accordingly at that scale, from "provably optimal" to
-    "empirically within a few percent of best-found" -- but the union rule
-    (`oracle_union_pick`) still guarantees the head arm can only help or tie
-    the pool arm's own answer, never hurt it, regardless of which solver
-    produced it (verified: 0 T1-safety violations across 12,780 union
-    decisions built from real exact-vs-heuristic (T1) pairs).
+    Historical validation this design carries forward (`data/osm_test_small`,
+    2858 instances, same checkpoint, see `logs/status_bm.md`):
+    - `topk_t1` (T1-only hedge lane): raising `num_sample` 100->400 and
+      adding `topk_t1=100` moved "T1 not worse than ILS" 82.75%->95.31%, "T2
+      not worse" 44.2%->53.1%, lex-win 69.3%->86.4%, Pareto-dominance
+      26.2%->36.5%, at 0.144s/instance (5.6x faster than ILS).
+    - `oracle_head` (forced-prefix rows, exact DP when n1<=`oracle_max_n1`):
+      on top of the above, "T1 not worse than ILS" 95.31%->100%, T2
+      52.9%->86.0%, T3 55.9%->63.5%, lex-win 86.4%->98.3%, Pareto
+      36.5%->57.7%, at ~3.4x ILS speed.
+    - `oracle_use_heuristic` (`t1_heuristic_argmin` fallback above
+      `oracle_max_n1`, exact DP being `O(2^n1 * n1^2)`): essentially exact
+      (<0.1% mean gap) through n1~20, degrading to ~1.7%/2.7%/5.6% mean gap
+      at n1~25/31/35, well under 1s/instance throughout. The forced-prefix
+      lane's guarantee degrades accordingly from "provably optimal" to
+      "empirically within a few percent of best-found" at that scale, but
+      the funnel still only ever keeps a forced candidate if it's lex-better
+      than or tied with the rest of the pool -- it can only help or tie,
+      never hurt (verified pre-unification: 0 T1-safety violations across
+      12,780 union decisions built from real exact-vs-heuristic (T1) pairs).
     """
 
     def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0,
                  oracle_head=False, oracle_r=64, oracle_shortlist=8,
-                 oracle_shortlist_eps=0.01, oracle_union_eps2=0.02,
+                 oracle_union_eps2=0.02,
                  oracle_tiebreak=True, oracle_max_n1=None,
                  oracle_use_heuristic=True, oracle_heuristic_time_budget=None,
                  oracle_heuristic_intra_cutoff=None):
@@ -221,7 +193,6 @@ class RLHybHCARP(RLHCARP):
         self.oracle_head = oracle_head
         self.oracle_r = oracle_r
         self.oracle_shortlist = oracle_shortlist
-        self.oracle_shortlist_eps = oracle_shortlist_eps
         self.oracle_union_eps2 = oracle_union_eps2
         self.oracle_tiebreak = oracle_tiebreak
         from solvers.oracle import (HEURISTIC_INTRA_CUTOFF_DEFAULT,
@@ -270,70 +241,21 @@ class RLHybHCARP(RLHCARP):
                 new_vehicles[m].append(trip)
         return self.evaluator._completion_times(new_vehicles, td0), new_vehicles
 
-    @torch.inference_mode()
-    def _decode_forced(self, forced, B, greedy=False):
-        """Replicate the loaded instance B times, force `forced` flat Joint
-        M x N actions as the decode opening, then let the policy complete by
-        sampling (or argmax when `greedy`).
-
-        Bypasses the policy's normal sampling entrypoint: runs the encoder
-        once, then steps the env directly so arbitrary actions can be
-        injected. Every forced action is checked against the env's
-        `action_mask`; an infeasible one (an oracle/env mismatch -- never
-        observed on the benchmark) aborts by returning None so the caller
-        falls back to the pool arm.
-
-        Returns (reward (B, P) float64 np, actions (B, S) int64 np) or None.
-        """
-        td = batchify(self.td, B) if B > 1 else self.td.clone()
-        hidden, _ = self.policy.encoder(td)
-        td, env, cache = self.policy.decoder.pre_decoder_hook(td, self.env, hidden)
-        dev = td.device
-        acts = []
-        for a in forced:
-            if not bool(td["action_mask"][0, a]):
-                return None
-            sel = torch.full((B,), int(a), dtype=torch.long, device=dev)
-            td.set("action", sel)
-            td = env.step(td)
-            acts.append(sel)
-        steps = 0
-        while not td["done"].all():
-            logits, mask = self.policy.decoder(td, cache)
-            lf = logits.reshape(B, -1).masked_fill(~mask.reshape(B, -1), float('-inf'))
-            if greedy:
-                sel = lf.argmax(-1)
-            else:
-                sel = torch.multinomial(torch.softmax(lf, -1), 1).squeeze(1)
-            td.set("action", sel)
-            td = env.step(td)
-            acts.append(sel)
-            steps += 1
-            if steps > 10000:
-                raise RuntimeError("forced decode did not terminate")
-        reward = env.get_reward(td).cpu().numpy().astype(np.float64)
-        actions = torch.stack(acts, 1).cpu().numpy().astype(np.int64)
-        return reward, actions
-
-    def _oracle_head_arm(self, td0, M, N1, adj, clss, demands, classes):
-        """Compute the oracle-head arm's own best candidate.
-
-        Pipeline (see class docstring): exact T1 oracle (or, above
-        `oracle_max_n1`, the local-search heuristic) -> forced-prefix
-        decode (`oracle_r` sampled + 1 greedy completion) -> T2-eps-band
-        shortlist -> local search (P1 convention: keep post-LS only if
-        strictly lex-better) -> arm-internal pick via `t2_band_pick`.
-
-        Returns (T_vec float64 (3,), vehicles) or (None, None) when neither
-        solver is applicable for this instance.
+    def _oracle_forced_prefix(self, td0, N1, adj, clss, demands, M):
+        """Compute the oracle's forced class-1 opening-prefix flat actions,
+        or None when not applicable (variant U, `oracle_head=False`, n1 too
+        large with the heuristic disabled, or no capacity-feasible partition
+        exists). Exact DP (`t1_oracle_argmin`) when n1 <= `oracle_max_n1`;
+        otherwise `t1_heuristic_argmin` if `oracle_use_heuristic` (see the
+        class docstring for the measured quality/speed tradeoff of that
+        fallback).
         """
         from solvers.oracle import (forced_flat_actions, t1_heuristic_argmin,
                                     t1_oracle_argmin)
-
-        if self.variant != 'P':
+        if not self.oracle_head or self.variant != 'P':
             # The oracle's premise (class-1 arcs form a forced opening prefix)
             # only holds under variant P's precedence; decline otherwise.
-            return None, None
+            return None
         svc = td0["service_times"].cpu().numpy().astype(np.float64)
         n1 = int((clss == 1).sum())
         if n1 <= self.oracle_max_n1:
@@ -341,61 +263,80 @@ class RLHybHCARP(RLHCARP):
                                    tiebreak=self.oracle_tiebreak,
                                    max_n1=self.oracle_max_n1)
         elif self.oracle_use_heuristic:
-            # Exact DP is not an option at this size (O(2^n1 * n1^2)) -- fall
-            # back to the local-search heuristic (class docstring: measured
-            # optimality gap grows with n1, but the union rule below still
-            # guarantees this arm can only help or tie, never hurt).
             res = t1_heuristic_argmin(
                 adj, svc, clss, demands, M,
                 time_budget=self.oracle_heuristic_time_budget,
                 intra_cutoff=self.oracle_heuristic_intra_cutoff)
         else:
-            return None, None
+            return None
         if not np.isfinite(res["T1"]) or res["parts"] is None:
-            return None, None                       # not applicable / infeasible
-        forced = forced_flat_actions(res["parts"], N1)
+            return None                       # not applicable / infeasible
+        return forced_flat_actions(res["parts"], N1)
 
-        pools = []                                  # (reward, actions, shortlist idxs)
-        g = self._decode_forced(forced, 1, greedy=True)
-        if g is None:
-            return None, None                       # forced prefix infeasible
-        pools.append((g[0], g[1], [0]))
-        if self.oracle_r > 0:
-            s_rew, s_act = self._decode_forced(forced, self.oracle_r, greedy=False)
-            sl = shortlist_completions(s_rew, self.oracle_shortlist,
-                                       eps=self.oracle_shortlist_eps)
-            pools.append((s_rew, s_act, sl))
+    @torch.inference_mode()
+    def _decode_pool(self, num_free, forced):
+        """One batched decode producing the combined candidate pool:
+        `num_free` free-sampled rollouts plus, when `forced` is not None,
+        `1 + oracle_r` oracle-prefix-forced rows (1 greedy + `oracle_r`
+        sampled completions) -- all decoded in a SINGLE loop. At each step,
+        rows with an unconsumed forced action get it overridden onto the
+        batch's action tensor before `env.step`; every other row (free rows,
+        and forced rows past their prefix) samples normally.
 
-        cands = []                                  # (T_vec, vehicles)
-        for rew, act, idxs in pools:
-            for idx in idxs:
-                idx = int(idx)
-                pre_T = np.asarray(rew[idx], dtype=np.float64)
-                pre_vehicles = self.evaluator.routes_from_joint_actions(
-                    act[idx], M, N1)
-                ls_T, ls_vehicles = self._local_search_one(
-                    pre_vehicles, td0, M, adj, clss, demands, classes)
-                if ls_T is not None and tuple(ls_T.tolist()) < tuple(pre_T.tolist()):
-                    cands.append((np.asarray(ls_T, dtype=np.float64), ls_vehicles))
+        When `forced` is None (oracle not applicable), delegates straight to
+        `AttentionModelPolicy.forward` -- this keeps the `oracle_head=False`
+        default path's rollout byte-identical to before the pool/oracle-head
+        unification (same RNG consumption), not just qualitatively similar.
+
+        If the env's `action_mask` ever rejects the forced action (an
+        oracle/env mismatch -- never observed on the benchmark), forcing is
+        aborted for the rest of the decode and `n_forced` is reported as 0:
+        those rows simply continue as ordinary samples and compete in the
+        pool like any other rollout, rather than aborting the whole call.
+
+        Returns (reward (B, P) float64 np, actions (B, S) int64 np, n_forced).
+        """
+        if forced is None:
+            td = batchify(self.td, num_free)
+            with torch.inference_mode():
+                out = self.policy(td, env=self.env, decode_type='sampling')
+            reward = out["reward"].cpu().numpy().astype(np.float64)
+            actions = out["actions"].cpu().numpy().astype(np.int64)
+            return reward, actions, 0
+
+        n_forced = 1 + self.oracle_r
+        B = num_free + n_forced
+        td = batchify(self.td, B)
+        hidden, _ = self.policy.encoder(td)
+        td, env, cache = self.policy.decoder.pre_decoder_hook(td, self.env, hidden)
+        L = len(forced)
+        g = num_free                          # greedy-completion forced row
+        forced_ok = True
+        acts, t = [], 0
+        while not td["done"].all():
+            logits, mask = self.policy.decoder(td, cache)
+            lf = logits.reshape(B, -1).masked_fill(~mask.reshape(B, -1), float('-inf'))
+            sel = torch.multinomial(torch.softmax(lf, -1), 1).squeeze(1)
+            if forced_ok:
+                if t < L:
+                    a = int(forced[t])
+                    if not bool(mask.reshape(B, -1)[g, a]):
+                        forced_ok = False      # oracle/env mismatch: demote to free
+                    else:
+                        sel[g:] = a
                 else:
-                    cands.append((pre_T, pre_vehicles))
-        Ts = np.stack([c[0] for c in cands])
-        j = t2_band_pick(Ts, self.oracle_union_eps2)
-        return cands[j]
+                    sel[g] = lf[g].argmax(-1)  # greedy completion row
+            td.set("action", sel)
+            td = env.step(td)
+            acts.append(sel)
+            t += 1
+            if t > 10000:
+                raise RuntimeError("decode did not terminate")
+        reward = env.get_reward(td).cpu().numpy().astype(np.float64)
+        actions = torch.stack(acts, 1).cpu().numpy().astype(np.int64)
+        return reward, actions, (n_forced if forced_ok else 0)
 
     def __call__(self, num_sample=100):
-        td = batchify(self.td, num_sample)
-        with torch.inference_mode():
-            out = self.policy(td, env=self.env, decode_type='sampling')
-        reward = out["reward"].cpu().numpy()                          # (num_sample, P)
-        actions = out["actions"].cpu().numpy().astype(np.int64)       # (num_sample, dec_steps)
-
-        keep = eps_lex_select(reward, eps=self.eps, shortlist=self.shortlist)
-        if self.topk_t1 > 0:
-            top = np.argsort(reward[:, 0])[:self.topk_t1]
-            keep = np.array(sorted(set(keep.tolist()) | set(int(x) for x in top)),
-                            dtype=keep.dtype)
-
         td0 = self.td[0]
         M = int(td0["num_vehicle"])
         N1 = td0["service_times"].shape[0]
@@ -403,42 +344,60 @@ class RLHybHCARP(RLHCARP):
         clss = td0["clss"].cpu().numpy().astype(np.int64)
         demands = td0["demand"].cpu().numpy().astype(np.float64)
         classes = [c for c in np.unique(clss) if c != 0]
+
+        forced = self._oracle_forced_prefix(td0, N1, adj, clss, demands, M)
+        reward, actions, n_forced = self._decode_pool(num_sample, forced)
+        B = reward.shape[0]
+
+        # ---- ONE shortlist over the combined pool --------------------------
+        keep = set(int(i) for i in
+                   eps_lex_select(reward, eps=self.eps, shortlist=self.shortlist))
+        if self.topk_t1 > 0:
+            # T1-only hedge lane, free rows only: forced rows all share one
+            # T1, so ranking them by T1 is meaningless and would just crowd
+            # out the hedge against an imperfect forced prefix.
+            top = np.argsort(reward[:num_sample, 0])[:self.topk_t1]
+            keep |= set(int(x) for x in top)
+        if n_forced:
+            # Guaranteed representation of the oracle candidates even when
+            # the forced T1 doesn't anchor the eps band (the heuristic-oracle
+            # case): the greedy row + the best `oracle_shortlist` forced rows
+            # by (T2, T3) -- all forced rows share one T1, so this is a pure
+            # (T2, T3) ranking (same rationale as the old, now-removed
+            # `shortlist_completions`).
+            fr = np.arange(num_sample, B)
+            order = fr[np.lexsort((reward[fr, 2], reward[fr, 1]))]
+            keep |= {num_sample} | set(int(i) for i in order[:self.oracle_shortlist])
+        keep = sorted(keep)
+
         # SolutionEvaluator only lazily caches (adj/svc/clss) on first use, and
-        # we call `_completion_times` directly (bypassing `__call__`, which is
-        # what normally refreshes the cache) -- must refresh explicitly per
-        # instance or later, differently-sized instances read stale arrays.
+        # we call `_completion_times` directly below (bypassing `__call__`,
+        # which is what normally refreshes the cache) -- must refresh
+        # explicitly per instance or later, differently-sized instances read
+        # stale arrays.
         self.evaluator._cache_td(td0)
 
-        best_T, best_key, best_vehicles = None, None, None
+        # ---- ONE local-search funnel + ONE final comparator ----------------
+        cands = []                                  # (T_vec, vehicles)
         for idx in keep:
-            pre_T = reward[idx]
+            pre_T = np.asarray(reward[idx], dtype=np.float64)
             pre_vehicles = self.evaluator.routes_from_joint_actions(actions[idx], M, N1)
             ls_T, ls_vehicles = self._local_search_one(
                 pre_vehicles, td0, M, adj, clss, demands, classes)
             # local search optimizes total deadhead (a proxy for T_k), so only
             # keep it if it's actually lex-better than the pre-LS rollout.
             if ls_T is not None and tuple(ls_T.tolist()) < tuple(pre_T.tolist()):
-                cand_T, cand_vehicles = ls_T, ls_vehicles
+                cands.append((np.asarray(ls_T, dtype=np.float64), ls_vehicles))
             else:
-                cand_T, cand_vehicles = pre_T, pre_vehicles
-            key = tuple(cand_T.tolist())
-            if best_key is None or key < best_key:
-                best_key, best_T, best_vehicles = key, cand_T, cand_vehicles
+                cands.append((pre_T, pre_vehicles))
+        Ts = np.stack([c[0] for c in cands])
+        j = final_band_pick(Ts, self.oracle_union_eps2)
 
-        # ---- optional oracle-head arm (opt-in; never alters the pool arm) --
-        if self.oracle_head:
-            head_T, head_vehicles = self._oracle_head_arm(
-                td0, M, N1, adj, clss, demands, classes)
-            if head_T is not None:
-                if oracle_union_pick(np.asarray(best_T, dtype=np.float64),
-                                     head_T, self.oracle_union_eps2):
-                    best_T, best_vehicles = head_T, head_vehicles
-                # re-evaluate the union winner at float64 (same evaluator path
-                # local search uses) so the returned T-vector -- and the T1
-                # optimality guarantee -- hold at full precision, not just the
-                # decode-time fp32 reward's.
-                best_T = self.evaluator._completion_times(best_vehicles, td0)
-
+        # Re-evaluate the winner at float64 (same evaluator path local search
+        # uses) so the returned T-vector -- and the T1 optimality guarantee
+        # when the winner came from the forced lane -- hold at full
+        # precision, not just the decode-time fp32 reward's.
+        best_T = self.evaluator._completion_times(cands[j][1], td0)
         return np.asarray(best_T, dtype=np.float64)[None, :]           # (1, P)
 
 
@@ -459,7 +418,7 @@ def parse_args():
     parser.add_argument('--path', default='data/5m', help='directory of .npz instances')
     parser.add_argument('--M', type=int, default=None)
     parser.add_argument('--hybrid', action='store_true',
-                        help='batch mode: two-tier funnel (eps-lex shortlist + local search)')
+                        help='batch mode: single-pool funnel (eps-lex shortlist + local search)')
     parser.add_argument('--shortlist', type=int, default=10,
                         help='hybrid mode: #candidates that get local search')
     parser.add_argument('--topk_t1', type=int, default=0,
@@ -467,8 +426,8 @@ def parse_args():
                              '(on top of the eps-lex shortlist), local-searched too. '
                              '0 = disabled (default, no behavior change)')
     parser.add_argument('--oracle_head', action='store_true',
-                        help='hybrid mode: add the exact-T1-oracle forced-prefix arm '
-                             '(variant P) and union it with the pool arm '
+                        help='hybrid mode: add oracle-forced-prefix rows (variant P) '
+                             'into the same decode pool as the free rollouts '
                              '(default: off, no behavior change). Sub-tunables '
                              '(sample count, shortlist sizes, eps-bands, tiebreak) are '
                              'not exposed on the CLI -- historical sweeps never varied '
