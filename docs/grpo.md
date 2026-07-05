@@ -2,7 +2,8 @@
 
 Ground truth as of **2026-07-03**, read directly from code (`src/trainers/grpo.py`,
 `src/policy/*.py`, `src/env/env.py`, `src/train.py`) plus the latest training run
-and OOD benchmark.
+and OOD benchmark. Full-file audit re-verified against the actual repo state
+(code, checkpoints, logs, tests) on **2026-07-05**.
 
 This file is a chronological research log — every section is kept, nothing
 is deleted when superseded (a later section says so explicitly and points
@@ -43,28 +44,49 @@ Skip both and start at §1 for the full narrative.
 
 ## Current State (TL;DR)
 
-**Training**: GRPO (critic-free, group-relative rank advantage, §4) beats PPO
-on all 3 objectives (see memory / earlier A/B). Bậc 2 (§7, phase-masked
-advantage) and bậc 3 (§8, combined decoder) are both implemented, trained,
-and confirmed by OOD benchmark — current architecture, not a proposal.
-Four separate attempts to fold a classical heuristic/oracle signal into
-*training* (§11, §12, §13, §16) all failed to transfer beyond the small
-training curriculum; **do not attempt a fifth** without genuinely new
-information (e.g. a from-scratch retrain). The one lever with real evidence
-for a training-side improvement is broadening the training curriculum
-itself (§13's `rlmed` control).
+Re-verified against the actual repo state (checkpoint files loaded and
+`strict=True`-tested against today's code, `src/trainers/` directory
+listed, not just re-read from prose) on 2026-07-05.
+
+**Training**: `src/trainers/` currently contains only `base.py` + `grpo.py`
+— **PPO has been removed from the codebase**, not merely disfavored; GRPO
+is the sole trainer. Bậc 2 (§7, phase-masked advantage) and bậc 3 (§8,
+combined decoder) are both implemented, trained, and confirmed by OOD
+benchmark — current architecture, not a proposal. Four separate attempts
+to fold a classical heuristic/oracle signal into *training* (§11, §12,
+§13, §16) all failed to transfer beyond the small training curriculum;
+**do not attempt a fifth** without genuinely new information (e.g. a
+from-scratch retrain). The one lever with real evidence for a
+training-side improvement is broadening the training curriculum itself
+(§13's `rlmed` control).
 
 **Inference (production today)**: `src/solvers/rl.py::RLHybHCARP`, single
 unified decode pool (§18) — `num_sample` free rollouts plus, when variant P
 and a capacity-feasible class-1 partition exists, oracle-forced-prefix rows
 (exact DP when n1≤16, `t1_heuristic_argmin` fallback above that per §15,
 scope caveats in §17) — shortlisted, local-searched, and picked by one
-`final_band_pick` comparator. Recommended config for
-`outputs/checkpoints/grpo_osm_bac3/epoch=159.ckpt`: `HYBRID=1
-NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1` (variant P
-only — `oracle_head` is a no-op for variant U). Benchmarked on
-`data/osm_test_small` (2858 instances): 100% T1-not-worse-than-ILS, 98%
-lex-win, 57.7% Pareto-dominance, ~3-4x faster than ILS.
+`final_band_pick` comparator. Recommended config: `HYBRID=1 NUM_SAMPLE=400
+SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1` (variant P only —
+`oracle_head` is a no-op for variant U). Benchmarked on
+`data/osm_test_small` (2858 instances, `logs/status_bm.md` final row): 100%
+T1-not-worse-than-ILS, 98% lex-win, 57.5% Pareto-dominance, ~4x faster than
+ILS (a validation rerun quoted in `rl.py`'s docstring reads 98.3%/57.7%/3.4x
+— same run family, RNG-level scatter).
+
+**Checkpoint: use `outputs/checkpoints/grpo_osm_bac3/{epoch=159,last}.ckpt`.**
+These are the only checkpoints on disk that `strict=True`-load into the
+current policy (verified directly, not assumed) — bậc-3's decoder shape
+(167 tensors, `JointMVContext`'s cross-vehicle `veh_attn_*`/`fuse` +
+7-scalar vehicle state). Every other checkpoint on disk predates the
+bậc-3 decoder upgrade and **fails to load** with today's code (missing
+`veh_attn_*`/`fuse` keys and/or a `project_vehicle` shape mismatch) —
+every single one checked directly:
+`grpo_osm/{epoch=183,epoch=189_saved,last,old}.ckpt`, `best_small.ckpt`,
+`curriculum_small/{epoch=166,last}.ckpt`, `grpo_osm_phasemask/last.ckpt`.
+(The formerly-listed `grpo_osm_phasemask/epoch=189_saved.ckpt` was in this
+same broken state and has since been deleted; its dir retains only that
+non-loading `last.ckpt`.) `curriculum_medium/` is currently empty —
+no medium-curriculum checkpoint exists yet.
 
 **Known-open items** (don't assume these are done just because a lot of
 this log is validated):
@@ -150,8 +172,6 @@ batch of B instances (curriculum "small": 20_30/20_40, M random in {2,3,5,7,10})
       │    per-level centered midrank across the K group, combined with
       │    geometric weights; each decode step only receives advantage from
       │    priority levels it could causally still influence (its phase)
-      ▼  DAPO dynamic group filtering: all-K-tied groups → zero advantage,
-      │  dropped before the gradient pass (train/skipped_frac)
       ▼
 ┌──────── mini-batch replay, WITH gradient, decode_type='evaluate' ─────────┐
 │ replay the stored actions in chunks of mini_batch_size, fresh log-probs, │
@@ -171,51 +191,60 @@ TOPK_T1=100 ORACLE_HEAD=1`.
 
 `src/solvers/rl.py::RLHybHCARP`. Same encoder/decoder as §2.2 (weights
 frozen, `eval()` mode) — everything below is inference-time search wrapped
-around it, none of it changes what the policy learned:
+around it, none of it changes what the policy learned. As of §18, this is
+**one merged decode over one candidate pool**, not two separately-decoded
+arms joined afterward:
 
 ```
 .npz instance
       │
       ▼  encoder (§2.1), once per instance
       │
-      ├──────────────────────── ARM A: pool funnel (P1, §9) ───────────────────┐
-      │  batchify K=400 → §2.1 decode loop, decode_type='sampling'             │
-      │  → eps_lex_select(eps=0.01, shortlist=25)   [near-best-T1 candidates]  │
-      │  → ∪ top-100-by-raw-T1 (topk_t1=100)        [T1-dedicated candidates]  │
-      │  → local search (intra/inter route) per candidate, keep only if       │
-      │    strictly lex-better than pre-LS                                    │
-      │  → strict-lex-best  =>  pool_best (T1,T2,T3)                          │
-      └──────────────────────────────────────────────────────────────────────────┘
+      ▼  _oracle_forced_prefix (variant P only, §10):
+      │    t1_oracle_argmin (`solvers/oracle.py`, Held-Karp + partition DP
+      │    over class-1 arcs, n1<=max_n1=16) or, above that, the
+      │    t1_heuristic_argmin fallback (§15) → exact-or-near-optimal T1 +
+      │    witnessing per-vehicle class-1 prefix. Guard (n1>max_n1 with the
+      │    heuristic off, or no capacity-feasible partition) → None: no
+      │    prefix is forced, the pool below is 100% free rows (§17/§18).
       │
-      ├──────────────────── ARM B: oracle head (P2, §10, variant P only) ──────┐
-      │  t1_oracle_argmin (`solvers/oracle.py`): Held-Karp + partition DP over │
-      │    class-1 arcs → exact T1 optimum + witnessing per-vehicle prefix     │
-      │    (+ optional exact tiebreak among T1-optimal ties)                   │
-      │  → force prefix into decode (`_decode_forced`, bypasses the normal     │
-      │    sampling entrypoint to inject specific actions)                     │
-      │  → complete classes 2/3: oracle_r=64 sampled + 1 greedy                │
-      │  → shortlist by T2-eps-band (oracle_shortlist=8) → local search        │
-      │  → arm-internal pick (`t2_band_pick`)  =>  head_best (T1,T2,T3)        │
-      │  (guard: n1 > max_n1=16 or infeasible → returns None, arm contributes  │
-      │   nothing, pool_best passes through unchanged)                        │
-      └──────────────────────────────────────────────────────────────────────────┘
+      ▼  _decode_pool(num_free=400, forced): ONE batched §2.1 decode loop,
+      │  B = 400 + (1 + oracle_r=64) rows if a prefix was found, else B=400:
+      │    rows[0:400]      free samples, decode_type='sampling'
+      │    row 400          forced class-1 prefix, greedy completion
+      │    rows[401:465]    forced class-1 prefix, sampled completion
+      │  forced rows get their prefix action overridden onto the batch's
+      │  action tensor each step (env.step is row-parallel); free rows and
+      │  forced-row completions decode normally. `forced=None` → this whole
+      │  step degenerates to calling `policy.forward` directly (byte-
+      │  identical rollout to the pre-oracle-head/pre-P1 default path).
       │
-      ▼  oracle_union_pick(pool_best, head_best, eps2=0.02):
-      │    T1 strictly better on one side → take it; T1 tied → eps-band on T2,
-      │    then min T3
-      ▼  re-evaluate the union winner via the float64 SolutionEvaluator
-      │  (same precision path local search already uses — the T1 guarantee
-      │   holds at full precision, not just decode-time float32)
+      ▼  ONE shortlist over the combined pool:
+      │    eps_lex_select(eps=0.01, shortlist=25)         [near-best-T1, any row]
+      │    ∪ top-100-by-raw-T1 among FREE rows only        [topk_t1=100, T1 hedge]
+      │    ∪ {greedy forced row} ∪ best-8-by-(T2,T3) among forced rows
+      │      (oracle_shortlist=8, only when a prefix was forced — all forced
+      │       rows share one T1, so this is a pure (T2,T3) ranking)
+      │
+      ▼  local search (intra/inter route) per shortlisted candidate, keep
+      │  only if strictly lex-better than pre-LS
+      ▼  final_band_pick(eps2=0.02): T1 tie-band (tie_tol=1e-6) → among
+      │  those, T2 eps-band → min T3.  =>  winner (T1,T2,T3) + route
+      ▼  re-evaluate the winner via the float64 SolutionEvaluator (same
+      │  precision path local search already uses — the T1 guarantee holds
+      │  at full precision, not just decode-time float32)
       ▼
   output: (T1, T2, T3) + winning route
 ```
 
-Summary: one encode, two parallel candidate-finding arms (one searches
-broadly via sampling + local search, the other solves the T1 subproblem
-exactly and lets the policy complete the rest), merged lexicographically,
-then re-verified at full precision. Everything past the encoder/decoder is
-inference-time compute, not learned weights — §2.2's training never sees
-any of it.
+Summary: one encode, one decode over a pool that mixes free rollouts with
+(when applicable) oracle-forced-prefix rollouts, one shortlist, one local-
+search funnel, one selection rule. Before §18 this was two separately-
+decoded arms (a "pool funnel" and an "oracle head") merged afterward by a
+bespoke union comparator — functionally equivalent (validated on 820 real
+instances, §18.2), but the merged-pool version is what's in production now.
+Everything past the encoder/decoder is inference-time compute, not learned
+weights — §2.2's training never sees any of it.
 
 ## 3. Policy architecture
 
@@ -259,11 +288,11 @@ any of it.
   matmul → `logits (B, M, N+1)`. Flattened to `(B, M*(N+1))` for the decoding
   strategy, so at every step the policy picks one `(vehicle, arc)` pair from
   a single categorical over the whole joint space.
-- No `dynamic_embedding` beyond the static cache (`StaticEmbedding` — a
-  placeholder returning 0); all step-varying information enters through
-  `JointMVContext`'s vehicle-state features, not through re-projected node
-  keys.
-- Feasibility mask (`env.get_action_mask`, `src/env/env.py:89-143`): three
+- No dynamic per-step key/value embedding beyond the precomputed static
+  cache (the old `StaticEmbedding` no-op placeholder was inlined away in
+  §14.2); all step-varying information enters through `JointMVContext`'s
+  vehicle-state features, not through re-projected node keys.
+- Feasibility mask (`env.get_action_mask`, `src/env/env.py:103-157`): three
   layers combined — (1) arc already served, (2) `(m,j)` capacity would
   exceed 1.0, (3) precedence — arc's class > current global min unserved
   class (`c_min`, computed once per step from `td['clss']` and `visited`).
@@ -302,11 +331,11 @@ Critic-free: **group-relative rank IS the advantage**, no value network.
    out the full `B*K` group inside `torch.no_grad()` — no activation graph,
    so the big `B*K` forward is memory-cheap.
 3. Compute the group advantage from the resulting `(B,K,3)` T-vectors (below).
-4. **DAPO dynamic group filtering**: a group whose K rollouts are all
-   T-tied gives an all-zero advantage (zero gradient) — such groups are
-   dropped before the gradient pass; `train/skipped_frac` logs how much was
-   skipped.
-5. **Mini-batch replay with gradient**: chunks of `mini_batch_size // K`
+   (A DAPO-style dynamic group filter — drop all-K-tied groups before the
+   gradient pass — used to sit here, but was removed in §14.2 after
+   measurement showed it essentially never fired; an all-tied group's
+   advantage is all-zero anyway.)
+4. **Mini-batch replay with gradient**: chunks of `mini_batch_size // K`
    instances at a time, `decode_type='evaluate'` replays the stored actions
    to get fresh log-likelihoods at the current policy — since θ hasn't
    changed since the rollout, this is a REINFORCE surrogate, not a PPO
@@ -320,7 +349,8 @@ is what keeps memory bounded: encode-once-with-grad at B×K=1024 sequences on
 
 ### Advantage: hierarchical soft lexicographic rank
 
-`centered_hier_rank_gpu(T, gamma=0.5)` (`grpo.py:82-99`):
+`centered_hier_rank_gpu(T, gamma=0.5)` (`grpo.py:77-88` — since §7.7 a thin
+wrapper returning phase-1's row of `centered_hier_rank_by_phase`):
 
 - For each priority level `p` independently, compute a **centered midrank**
   over the K rollouts (`_centered_midrank`, tie-aware — exact ties get the
@@ -366,18 +396,23 @@ corrected after it was flagged during the oracle-in-training investigation,
 ### Eval step
 
 Greedy rollout, logs `val/T{k}_best` per level and a Horner-encoded
-`val/lex_best` scalar (`T1*C² + T2*C + T3`, `C=1e3`) used by
-`ModelCheckpoint(monitor="val/lex_best", mode="max")` for checkpoint
-selection (`src/train.py:100-103`).
+`val/lex_best` scalar (`T1*C² + T2*C + T3`, `C=1e4` — `grpo.py::_LEX_C`)
+used by `ModelCheckpoint(monitor="val/lex_best", mode="max")` for checkpoint
+selection (`src/train.py:97-104`).
 
 ## 5. Training config & entry point
 
 `src/train.py` wires `CARPEnv` + `AttentionModelPolicy` + `GRPO` +
 Lightning `Trainer`, launched via `scripts/train.sh` (backgrounded via
-`nohup`, logs to `logs/train_<timestamp>.out`). Full-scale defaults:
-`max_epoch=1000`, `batch_size=2048` (script override), `embed_dim=128`,
-`num_encoder_layers=12`, `num_heads=8`, fleet `M ∈ {2,3,5,7,10}` sampled per
-instance, `variant=P`. Data: `data/osm_train` (20 cities) /
+`nohup`, logs to `logs/train_<timestamp>.out`). `src/train.py`'s own
+argparse defaults are `max_epoch=1000`, `batch_size=2048`, `group_size=8`,
+but production runs go through `scripts/train.sh`, whose (env-overridable)
+defaults are `MAX_EPOCH=100 BATCH_SIZE=512 MINI_BATCH_SIZE=256
+GROUP_SIZE=16 CURRICULUM=small` — the §6 runs used `MAX_EPOCH=200` on top
+of those. Fixed in both: `embed_dim=128`, `num_encoder_layers=12`,
+`num_heads=8`, fleet `M ∈ {2,3,5,7,10}` sampled per instance, `variant=P`.
+`--resume_from <ckpt>` warm-starts policy weights only (epoch/optimizer
+state reset). Data: `data/osm_train` (20 cities) /
 `data/osm_val` (chandigarh, nairobi — held out) / `data/osm_test`
 (bogota, melbourne — held out), curriculum buckets optionally restrict to
 a size subset (`--curriculum small|medium|large`, `utils.data_utils.CURRICULUM`).
@@ -404,7 +439,7 @@ absent from both train and val; full detail + repro commands in
 | Config | T1 | T2 | T3 | gap vs ILS (T2/T3) | speedup vs ILS |
 |---|---|---|---|---|---|
 | ILS (classical baseline) | 5.012 | 10.056 | 15.804 | — | 1.0x |
-| RL, raw K=100 sampling, strict lex select | 4.968-5.064 | 12.5-12.7 | 21.3-21.4 | +25-36% | 14-28x |
+| RL, raw K=100 sampling, strict lex select | 4.968-5.064 | 12.5-12.7 | 21.3-21.4 | +25-36% | 13-28x |
 | RL + eps-lex select ("bậc 0") | 5.064 | 12.669 | 21.422 | +26.0% / +35.6% | 27.9x |
 | RL + eps-lex shortlist + local search ("bậc 1", SL=10) | 4.893 | 11.210 | 18.074 | +11.5% / +14.4% | 19.9x |
 | RL + eps-lex shortlist + local search ("bậc 1", SL=25) | 4.843 | 10.934 | 17.532 | +8.7% / +10.9% | 13.5x |
@@ -439,6 +474,10 @@ advantage/loss code differs.
 - Best checkpoint by `val/lex_best`: **`outputs/checkpoints/grpo_osm_phasemask/epoch=189_saved.ckpt`**
   (renamed from `epoch=189.ckpt` after training finished — same pattern as
   the pre-existing `_saved` file in the old `grpo_osm/` checkpoint dir).
+  *(This file has since been deleted from disk; the dir retains only a
+  `last.ckpt`, which — like all pre-bậc-3 checkpoints — no longer loads
+  under today's decoder, see the Current State TL;DR. `logs/status_bm.md`'s
+  v4-v6 rows remain this run's record.)*
   Val-set vs §6.1's `epoch=183.ckpt`: T1 4.166→4.223 (~flat, -1.4%), T2
   6.946→6.829 (**+1.7% better**), T3 12.586→10.222 (**+18.8% better**) —
   exactly the predicted shape: T1 untouched, T3 (the most noise-polluted
@@ -494,7 +533,8 @@ advantage/loss code differs.
 Idea: seed ILS's initial solution from the bậc-2+1 funnel-hybrid winner
 (via `vehicles_to_action`) instead of ILS's own constructive heuristic, then
 run a much smaller ILS iteration budget on top (`RLWarmILSHCARP` in
-`src/solvers/rl.py`, `--warm_ils --ils_iters`). Measured result: "T1 not
+`src/solvers/rl.py`, `--warm_ils --ils_iters` — all since deleted in
+§14.2's cleanup, on the strength of this rejection). Measured result: "T1 not
 worse than ILS" rose from ~81.4% → ~85.9% of instances, Pareto-dominance
 25.8% → 27.0%, but speedup dropped 16.9x → 9.2x (needs `ils_iters=50` on top
 of the hybrid funnel to get there). Explicit call: **the gain is too small
@@ -517,8 +557,9 @@ without a retrain.
 
 **Implemented (§7.7), trained, and confirmed by the OOD benchmark (§6.2)** —
 this section's diagnosis (7.1-7.5) describes the *pre-fix* mechanism; it
-remains accurate as an explanation of why the old (still-current-in-§4-text)
-formula was flawed. §7.6 has been updated with the real result.
+remains accurate as an explanation of why the old formula (quoted in §7.1;
+§4's text has since been corrected to describe the fixed version) was
+flawed. §7.6 has been updated with the real result.
 
 ### 7.1 Precise mechanism: pre-bậc-2 GRPO was trajectory-level REINFORCE, not per-step
 
@@ -658,8 +699,9 @@ old combined formula) and a `variant='U'` regression guard.
     only. `centered_hier_rank_gpu` is now just `[:, 0, :]` of this (phase-1
     row = old combined formula, verified bit-identical).
   - `_train_step` (variant `P` only): stashes `td["adv_phase"]` = `(B*K, P)`
-    at the same point as the old scalar `advantage` (so DAPO group filtering
-    slices it consistently); in the mini-batch replay loop, gathers each
+    at the same point as the old scalar `advantage` (so the then-extant DAPO
+    group filtering sliced it consistently — DAPO was later removed, §14.2);
+    in the mini-batch replay loop, gathers each
     step's own phase-conditional column (`adv_phase.gather(1, phase_idx)`)
     and uses a genuinely **per-step weighted surrogate**
     (`-((ll * adv_step).sum(-1) / valid_len).mean()`) instead of the old
@@ -683,8 +725,9 @@ benchmarked (§8.6).
 - **§7.3's gap**: no per-class remaining-arc-count or current-phase signal.
 - **A second gap found by reviewing a SIGKDD 2025 paper** ("Enhancing
   Generalization in Large-Scale HCVRP: A Rank-Augmented Neural Solver",
-  Liu/Lian/Liu/Cao, `papers/2025_A Rank-Augmented Neural Solver.pdf`, code at
-  `github.com/AAI-ZZU/RANS`): `JointMVContext` has **zero inter-vehicle
+  Liu/Lian/Liu/Cao, formerly at `papers/2025_A Rank-Augmented Neural
+  Solver.pdf` — the local `papers/` copy has since been removed from the
+  repo; code at `github.com/AAI-ZZU/RANS`): `JointMVContext` has **zero inter-vehicle
   signal** — each vehicle's query is built purely from its own local state;
   vehicle `m` has no way to know what vehicle `m'≠m` is doing. RANS's
   min-max-over-vehicles objective is structurally the same shape as ours
@@ -730,8 +773,10 @@ veh_q + graph_context (broadcast) → PointerAttention(...) → logits (B,M,N+1)
 ```
 
 Actual cost: `JointMVContext.__init__(embed_dim, P=3, linear_bias=False)`
-adds `veh_attn_qkv`, `veh_attn_out`, `fuse` — measured ~+200K params on top
-of the 2.5M baseline. `AttentionModelPolicy.__init__` and `Decoder.__init__`
+adds `veh_attn_qkv`, `veh_attn_out`, `fuse` — measured **+98,816 params**
+(2,479,328 in the pre-bậc-3 `epoch=183.ckpt` → 2,578,144 now, i.e. ~+99K
+on the ~2.5M baseline; an earlier "~+200K" figure here was wrong —
+re-measured directly from both checkpoints' state dicts). `AttentionModelPolicy.__init__` and `Decoder.__init__`
 both gained a `P: int = 3` param threaded down from `src/train.py`
 (`P=env.P`). No `env.py` changes beyond what §7.7 already added — `td["phase"]`
 is reused, not re-derived. RANS's cross-attention-to-nodes path was **not**
@@ -931,6 +976,13 @@ milliseconds per instance (`src/solvers/oracle.py::t1_oracle_argmin`).
 
 ### 10.2 Design: an extra candidate arm, not a replacement
 
+*(Historical record of the original two-arm implementation. §18 has since
+collapsed it into one merged decode pool — `_decode_forced`,
+`_oracle_head_arm`, `shortlist_completions`, `t2_band_pick` and
+`oracle_union_pick` named below no longer exist; `_oracle_forced_prefix` +
+`_decode_pool` + `final_band_pick` provide the same mechanics and the same
+guarantee, validated in §18.2.)*
+
 The oracle's optimal class-1 partition is forced into the policy's decode
 as an opening prefix (`_decode_forced`, bypassing the normal sampling
 entrypoint to inject specific actions), then classes 2/3 are completed by
@@ -991,10 +1043,10 @@ average.
 ### 10.4 Scope and caveats
 
 - **Variant P only.** The oracle's forced-opening-prefix premise depends on
-  P's linear precedence; `RLHybHCARP._oracle_head_arm` explicitly declines
-  (returns `None`, falls back to the pool arm unchanged) when
-  `self.variant != 'P'`. `oracle_head` has no effect for variant U and
-  should stay off there.
+  P's linear precedence; `RLHybHCARP._oracle_head_arm` (post-§18:
+  `_oracle_forced_prefix`) explicitly declines (returns `None`, falls back
+  to the free pool unchanged) when `self.variant != 'P'`. `oracle_head`
+  has no effect for variant U and should stay off there.
 - **Applicability guard, not an assumption.** `t1_oracle_argmin` requires
   `n1 <= max_n1` (default 16; the DP is `O(2^n1 · n1²)`) and a
   capacity-feasible partition to exist; either failing returns `T1 = inf`
@@ -1007,9 +1059,11 @@ average.
 - **Backward compatible.** `oracle_head` defaults to `False`; every
   existing config, script, and prior benchmark row is unaffected. Proven by
   `tests/test_rl.py::TestOracleHeadRegression.test_disabled_is_byte_identical_to_p1`
-  (byte-identical output to the pre-P2 pipeline under a fixed seed) and
+  (byte-identical output to the pre-P2 pipeline under a fixed seed — since
+  renamed and narrowed to
+  `test_disabled_rollout_is_byte_identical_to_plain_policy`, see §18.3) and
   `test_oracle_code_not_reached_when_disabled` (the oracle path isn't even
-  invoked unless opted in).
+  invoked unless opted in — still present under that name).
 
 ## 11. Investigated and rejected: moving the oracle into training
 
@@ -1024,8 +1078,9 @@ a few hundred steps, not a full retrain) before committing to anything —
 **result: negative, don't pursue this**, kept here so it isn't re-investigated.
 
 **Mechanism tried**: mix 1-2 of each K=16 training rollouts per group with an
-oracle-forced class-1 prefix (same `_decode_forced` mechanism §10 uses at
-inference), let the policy complete classes 2/3, and feed the result through
+oracle-forced class-1 prefix (same `_decode_forced` mechanism §10 used at
+inference at the time — since replaced by §18's `_decode_pool`), let the
+policy complete classes 2/3, and feed the result through
 the *existing* GRPO machinery unchanged (phase-masked group-rank advantage,
 DAPO filtering, replay loss) — no new loss term. This is mathematically
 clean in this trainer specifically because the loss is **pure REINFORCE at
@@ -1069,18 +1124,15 @@ untested and not cheaply testable (it requires the full retrain this
 investigation was specifically designed to avoid committing to without
 evidence).
 
-**Recommendation adopted**: keep the inference-time-only P1+P2 design
-(§9-§10) as-is; it already delivers 100% T1-not-worse, 98% lex-win, 57.5%
-Pareto-dominance at 4.1x ILS speed, and the smoke evidence argues against
-spending a training cycle chasing this specific idea. If inference speed
-(4.1x) becomes the binding constraint, the right lever is tuning the
-inference budget directly (`NUM_SAMPLE`/`oracle_r`/`oracle_shortlist`) —
-orthogonal to training, cheap to re-measure, no retrain required. One cheap
-thing worth keeping from this investigation: logging "greedy/best-of-K T1
-vs exact-oracle T1" as a passive validation-time diagnostic in any future
-training run (near-zero cost, gives a calibrated T1-optimality readout and
-would be the pre-registered success metric if this idea is ever revisited
-with a from-scratch retrain).
+**Recommendation**: same bottom line as §12/§13/§16 (see §16's cross-round
+synthesis for the final, complete version across all four rejected
+rounds) — keep the inference-time-only P1+P2 design, don't spend a
+training cycle chasing this specific idea. One thing worth keeping from
+*this* investigation specifically, not restated elsewhere: logging
+"greedy/best-of-K T1 vs exact-oracle T1" as a passive validation-time
+diagnostic in any future training run (near-zero cost, gives a calibrated
+T1-optimality readout and would be the pre-registered success metric if
+this idea is ever revisited with a from-scratch retrain).
 
 ## 12. Investigated and rejected: LS-shaped training advantage (reward shaping)
 
@@ -1146,10 +1198,9 @@ LS gain against its own baseline LS-improvability rather than feeding the
 absolute post-LS value into the rank) — the contamination mechanism is
 structural, not a "needs more steps" issue, and the medium-transfer test
 (this idea's best chance to differentiate itself from §11) confirmed the
-concern rather than refuting it. Same bottom line as §11: keep the
-inference-time-only P1+P2 design (§9-§10); if inference speed is the
-actual constraint, tune the inference budget directly rather than
-retraining.
+concern rather than refuting it. Same bottom line as §11/§13/§16 (see
+§16's cross-round synthesis for the final version): keep the
+inference-time-only P1+P2 design, don't retrain on this specific idea.
 
 ## 13. Investigated and rejected: advantage-filtered ILS-imitation (diverse-target BC)
 
@@ -1228,30 +1279,15 @@ self-annealing property (imitation pressure fades once the policy
 surpasses the teacher) never had a chance to engage — pass rate stayed
 69-97% throughout.
 
-**Cross-round synthesis (§11 + §12 + §13 — read together)**: three
-independent designs, each specifically engineered to fix the previous
-round's diagnosed root cause (exact-oracle → symmetry problem → diverse
-ILS targets + policy-preferred linearization; single-canonical-target →
-min-CE-over-targets; contaminated-rank/forced-actions → full decoupling;
-"is imitation even warranted" → advantage-filtering), have now all failed
-to transfer to `medium` curriculum. The common thread is not any one fixed
-bug — it's that a heuristic-derived training signal, however faithfully
-isolated from the RL machinery, keeps teaching something that doesn't
-generalize past the scale it was computed at.
-
-**Recommendation — final for this line of investigation**: report the
-already-shipped, fully-measured inference-time hybrid (P1 wider funnel +
-P2 exact-T1-oracle arm, §9-§10 — 100% T1-not-worse, 98% lex-win, 57.5%
-Pareto-dominance, 4.1x ILS speed on the full 2858-instance OOD benchmark,
-not a smoke test) as the paper's "hybrid RL+heuristic" contribution. It is
-not a fallback chosen for lack of a better training-time story — after
-three good-faith, well-motivated, progressively-refined attempts, it is
-the strongest and most rigorously validated hybrid result available. Do
-not attempt a fourth heuristic-in-training variant without genuinely new
-information (e.g. evidence from a from-scratch retrain, which none of
-these three smoke tests constitute — all were short fine-tunes of an
-already-converged checkpoint, a caveat that applies equally to all three
-rounds and remains untested).
+**Cross-round synthesis and recommendation**: three independent designs,
+each specifically engineered to fix the previous round's diagnosed root
+cause, have now all failed to transfer to `medium` curriculum — the
+common thread is not any one fixed bug, it's that a heuristic-derived
+training signal, however faithfully isolated from the RL machinery, keeps
+teaching something that doesn't generalize past the scale it was computed
+at. A fourth round (§16) later tested one more variant of this idea (still
+negative) and provides the complete, final synthesis across all four
+rounds — see §16 rather than duplicating it here.
 
 ## 14. Codebase audit — dead code and unearned complexity removed
 
@@ -1331,7 +1367,8 @@ was reclassified as "hardcode on" (§14.2) rather than removed.
   signatures (`Encoder`→`GraphAttentionNetwork`→`MultiHeadAttentionLayer`→
   `MultiHeadAttention`) down to `encoder.py`.
 - **CLI/config surface collapsed**: `oracle_r`, `oracle_shortlist`,
-  `oracle_shortlist_eps`, `oracle_union_eps2`, `oracle_tiebreak` were never
+  `oracle_shortlist_eps`, `oracle_union_eps2`, `oracle_tiebreak` (of these,
+  `oracle_shortlist_eps` was later removed entirely in §18.3) were never
   varied from their defaults in any historical benchmark row (every row in
   `logs/status_bm.md` is reproducible from just `{num_sample, eps,
   shortlist, topk_t1, oracle_head}`) — demoted from CLI flags to
@@ -1421,13 +1458,16 @@ the comparison methodology is sound).
 
 ### 15.3 Union-based safety net still holds
 
-`oracle_union_pick` (§10.2) only inspects T-vectors, not how they were
-produced — the "extra arm can only help or tie" guarantee is structural,
-independent of whether the head arm is exact or heuristic. Directly
-verified: 12,780 union decisions built from the 284 real exact-vs-heuristic
-T1 pairs crossed with a range of pool-arm scenarios and randomized T2/T3
-draws → **0 T1-safety violations** (the union result's T1 was always ≤
-the better of the two arms, within tie-tolerance, in every case).
+`oracle_union_pick` (§10.2; since removed in §18's unification — the same
+structural argument now applies to `final_band_pick` plus the "keep post-LS
+only if lex-better" gating over the merged pool, re-validated in §18.2)
+only inspects T-vectors, not how they were produced — the "extra arm can
+only help or tie" guarantee is structural, independent of whether the head
+arm is exact or heuristic. Directly verified at the time: 12,780 union
+decisions built from the 284 real exact-vs-heuristic T1 pairs crossed with
+a range of pool-arm scenarios and randomized T2/T3 draws → **0 T1-safety
+violations** (the union result's T1 was always ≤ the better of the two
+arms, within tie-tolerance, in every case).
 
 ### 15.4 Production wiring and the resulting guarantee at scale
 
@@ -1436,12 +1476,12 @@ the better of the two arms, within tie-tolerance, in every case).
 `oracle_heuristic_intra_cutoff` (default 25) constructor parameters — not
 exposed on the CLI (§14's "don't add a flag for a knob nothing varies"
 philosophy; construct `RLHybHCARP` directly if you need to change them).
-`_oracle_head_arm` now computes `n1` once and dispatches: `n1 <=
-oracle_max_n1` → exact DP (unchanged code path, so the shipped
-small-curriculum benchmark is byte-identical to before this change); `n1
-> oracle_max_n1` and `oracle_use_heuristic` → the heuristic; otherwise
-(or if `oracle_use_heuristic=False`) → not applicable, pool arm passes
-through unchanged, exactly as before.
+`_oracle_head_arm` (post-§18: `_oracle_forced_prefix`) computes `n1` once
+and dispatches: `n1 <= oracle_max_n1` → exact DP (unchanged code path, so
+the shipped small-curriculum benchmark is byte-identical to before this
+change); `n1 > oracle_max_n1` and `oracle_use_heuristic` → the heuristic;
+otherwise (or if `oracle_use_heuristic=False`) → not applicable, the free
+pool passes through unchanged, exactly as before.
 
 **What changes about the system's "T1 guarantee" at `medium`/`large`
 scale**: at `small` (and the ~half of `medium` with n1 ≤ 16), the
@@ -1545,7 +1585,8 @@ much narrower claim than stated; false as a general-HDCARP claim.**
 
 - **"Best for HDCARP": overstated.** `t1_heuristic_argmin` solves only the
   class-1 opening-prefix partition sub-problem, consumed exclusively by
-  `RLHybHCARP._oracle_head_arm` (§10). Classes 2/3 and the full T2/T3
+  `RLHybHCARP._oracle_head_arm` (§10; post-§18 that consumer is
+  `_oracle_forced_prefix`/`_decode_pool`). Classes 2/3 and the full T2/T3
   objective are still produced by RL sampling + `intra_route_opt`/
   `inter_route_opt` (the pool arm), not by this function — it has no path
   to being "the" HDCARP solver, general-purpose or otherwise. It is not
