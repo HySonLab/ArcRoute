@@ -17,7 +17,7 @@ EMBED_DIM=128
 NUM_ENCODER_LAYERS=12
 NUM_HEADS=8
 FLEET="2,3,5,7,10"
-VARIANT=P
+VARIANT="${VARIANT:-P}"
 GROUP_SIZE="${GROUP_SIZE:-16}"
 CURRICULUM="${CURRICULUM:-small}" # small | medium | large | (empty = all)
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-outputs/checkpoints/grpo_osm}"
@@ -30,7 +30,7 @@ PATH_TEST_DATA=data/osm_test
 
 RESUME_FROM="${RESUME_FROM:-}"
 
-echo "group_size=$GROUP_SIZE | max_epoch=$MAX_EPOCH | batch=$BATCH_SIZE | layers=$NUM_ENCODER_LAYERS | fleet=$FLEET"
+echo "group_size=$GROUP_SIZE | max_epoch=$MAX_EPOCH | batch=$BATCH_SIZE | layers=$NUM_ENCODER_LAYERS | fleet=$FLEET | variant=$VARIANT"
 [ -n "$CURRICULUM" ] && echo "curriculum=$CURRICULUM" || echo "curriculum=all"
 [ -n "$RESUME_FROM" ] && echo "resume_from=$RESUME_FROM" || echo "resume_from=(none)"
 

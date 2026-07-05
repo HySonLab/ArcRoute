@@ -8,7 +8,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from utils.ops import gen_tours, convert_prob, centered_lex_rank
+from utils.ops import gen_tours, convert_prob, centered_lex_rank, deserialize_tours_batch
+from utils.local_search import ls
 from solvers.evaluator import evaluate_batch as get_Ts
 from solvers.meta import EAHCARP
 
@@ -269,6 +270,169 @@ class TestSelectionProb(unittest.TestCase):
         # ...while the rank-based probability stays smooth for the same T
         prob_rank = convert_prob(centered_lex_rank(T, gamma=0.5))
         self.assertLess(float(prob_rank.max()), 0.9)
+
+
+# --------------------------------------------------------------------------- #
+# TestMutateLexGuarded — regression for the EA-U T1 blow-up (same bug class as
+# tests/test_ils.py::TestLsLexGuarded): ``ls`` minimises total deadheading,
+# NOT the lex (T1,T2,T3) objective, and under variant U its unrestricted
+# any-class moves trade "class-1 served early" for less deadhead. mutate()
+# must therefore go through BaseHCARP.ls_lex_guarded, never raw ``ls``.
+# --------------------------------------------------------------------------- #
+def make_adversarial_instance():
+    """Depot + 3 arcs where the deadhead optimum has strictly worse T1.
+
+    Adapted verbatim from tests/test_ils.py::make_adversarial_instance, built
+    as an EAHCARP: arcs 1,2 are class 1, arc 3 is class 2; M=1; all services
+    are 1. Total deadhead of order [1,2,3] is 13, of [2,1,3] it is 6 (the
+    global minimum) — so the deadhead-only local search flips the class-1
+    pair, but the class-1 prefix gets slower: T1 goes 4 -> 6. The P-restricted
+    ls finds the same flip (same-class swaps are P-legal), so only the pre-LS
+    fallback of ls_lex_guarded protects T1 here.
+    """
+    n = 4
+    adj = np.full((n, n), 10.0)
+    np.fill_diagonal(adj, 0.0)
+    adj[0, 1] = 1.0   # depot -> a
+    adj[1, 2] = 1.0   # a -> b
+    adj[0, 2] = 2.0   # depot -> b
+    adj[2, 1] = 2.0   # b -> a
+    adj[1, 3] = 1.0   # a -> c
+    adj[3, 0] = 1.0   # c -> depot
+
+    al = EAHCARP(n_population=4)
+    al.dms = adj
+    al.P = [1, 2, 3]
+    al.M = [0]                                     # single vehicle
+    al.demands = np.array([0.0, 0.1, 0.1, 0.1], dtype=np.float32)
+    al.clss = np.array([0, 1, 1, 2], dtype=np.int32)
+    al.s = np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float64)
+    al.d = np.zeros(n, dtype=np.float64)
+    al.nv = 1
+    al.nseq = n
+    al.max_len = al.nseq + (al.nv - 2)
+    al.vars = {
+        'adj': al.dms,
+        'service_time': al.s,
+        'clss': al.clss,
+        'demand': al.demands,
+        'nv': al.nv,
+    }
+    al.has_instance = True
+    return al
+
+
+class TestMutateLexGuarded(unittest.TestCase):
+    def test_unguarded_u_ls_lex_worsens(self):
+        """Document the failure mode: plain ls(variant='U') on the adversarial
+        instance strictly lex-worsens calc_obj (it only sees deadhead) — this
+        is exactly what the old mutate() did."""
+        al = make_adversarial_instance()
+        al.variant = 'U'
+        pre = np.array([1, 2, 3], dtype=np.int32)
+        tours = ls(al.vars, variant='U', actions=[pre])
+        post = deserialize_tours_batch(tours, al.nseq)[0]
+        self.assertLess(float(al.calc_obj(post[None])[0]),
+                        float(al.calc_obj(pre[None])[0]))
+
+    def test_mutate_u_keeps_t1_adversarial(self):
+        al = make_adversarial_instance()
+        al.variant = 'U'
+        pre = np.array([1, 2, 3], dtype=np.int32)
+        out = al.mutate(pre, variant='U')
+        self.assertGreaterEqual(float(al.calc_obj(out[None])[0]),
+                                float(al.calc_obj(pre[None])[0]) - 1e-9)
+        # T1 must stay at its optimum (a then b: 1+1 + 1+1 = 4)
+        T = get_Ts(al.vars, actions=out[None], variant='U')[0]
+        self.assertAlmostEqual(float(T[0]), 4.0, places=9)
+
+    def test_mutate_never_lex_worsens_random(self):
+        """Property: for every individual and both variants, mutate's output
+        objective is >= the input's (the ls_lex_guarded guarantee)."""
+        for variant in ('P', 'U'):
+            np.random.seed(42)
+            al = make_instance(nv=3, seed=11, n_population=8)
+            al.variant = variant
+            pop = al.init_population()
+            pre = al.calc_obj(pop)
+            for ind, p in zip(pop, pre):
+                out = al.mutate(ind, variant=variant)
+                self.assertGreaterEqual(
+                    float(al.calc_obj(out[None])[0]), float(p) - 1e-9,
+                    msg=f"variant {variant}: mutate lex-worsened an individual")
+
+    def test_mutate_variant_mismatch_asserts(self):
+        """mutate scores through self.variant (set by __call__); a caller
+        passing a different variant must fail loudly, not score silently
+        with the wrong decoder."""
+        al = make_instance(nv=3, seed=5, n_population=4)
+        al.variant = 'P'
+        with self.assertRaises(AssertionError):
+            al.mutate(np.array([1, 2, 3, 0, 4, 5, 6], dtype=np.int32),
+                      variant='U')
+
+
+# --------------------------------------------------------------------------- #
+# TestGetOncePrecheck — bin-packing lower-bound shortcut in BaseHCARP.get_once.
+# When the eligible arcs' total demand exceeds the fleet's total capacity
+# (1.0/vehicle), construction is impossible; get_once must return None
+# immediately WITHOUT consuming np.random draws on doomed attempts (this
+# futile work dominated EAHCARP.cross_over on tight instances: ~96% of
+# get_once calls / ~88% of EA wall time on osm_test_small).
+# --------------------------------------------------------------------------- #
+class TestGetOncePrecheck(unittest.TestCase):
+    def setUp(self):
+        np.random.seed(21)
+        self.al = make_instance(nv=3, seed=5, n_population=4)
+
+    def test_infeasible_returns_none_without_rng(self):
+        # 6 arcs x 0.6 demand = 3.6 > 1 vehicle capacity -> deterministic fail
+        self.al.demands = np.full(7, 0.6, dtype=np.float32)
+        self.al.demands[0] = 0.0
+        state = np.random.get_state()
+        out = self.al.get_once([0], self.al.clss)
+        self.assertIsNone(out)
+        after = np.random.get_state()
+        self.assertTrue(np.array_equal(state[1], after[1]),
+                        msg="doomed get_once consumed np.random draws")
+
+    def test_feasible_still_constructs(self):
+        # total demand 6 * 0.3 = 1.8 <= 3 vehicles -> precheck must not fire
+        out = self.al.get_once(self.al.M, self.al.clss)
+        self.assertIsNotNone(out)
+        self.assertEqual(arc_multiset(out), EXPECTED_ARCS)
+        self.assertTrue(self.al.is_valid(out))
+
+    def test_zeroed_classes_excluded_from_bound(self):
+        # zero out enough arcs that the remainder fits one vehicle: the bound
+        # must only count still-eligible (clss in P) arcs.
+        clss = self.al.clss.copy()
+        clss[[1, 2, 3, 4]] = 0                       # only arcs 5, 6 left (0.6)
+        out = self.al.get_once([0], clss)
+        self.assertIsNotNone(out)
+        self.assertEqual(arc_multiset(out), Counter({5: 1, 6: 1}))
+
+
+# --------------------------------------------------------------------------- #
+# TestBatchedMutationEquivalence — EAHCARP.__call__ guards a whole
+# generation's flagged children in ONE ls_lex_guarded call. That is only
+# byte-identical to the historical per-child mutate() loop if ls_lex_guarded
+# treats every sample independently: same tours, same objectives, same
+# per-sample argmax, regardless of batch composition.
+# --------------------------------------------------------------------------- #
+class TestBatchedMutationEquivalence(unittest.TestCase):
+    def test_batched_guard_equals_per_child_mutate(self):
+        for variant in ('P', 'U'):
+            np.random.seed(31)
+            al = make_instance(nv=3, seed=9, n_population=8)
+            al.variant = variant
+            pop = al.init_population()
+            solo = [al.mutate(ind, variant=variant) for ind in pop]
+            batched, _ = al.ls_lex_guarded(list(pop))
+            for s, b in zip(solo, batched):
+                self.assertTrue(np.array_equal(s, b),
+                                msg=f"variant {variant}: batched guard diverged "
+                                    f"from per-child mutate")
 
 
 # --------------------------------------------------------------------------- #

@@ -4,7 +4,7 @@ import numpy as np
 from numpy.random import random, randint, permutation
 
 from utils.ops import import_instance, run_parallel2
-from utils.ops import gen_tours, deserialize_tours, deserialize_tours_batch, convert_prob
+from utils.ops import gen_tours, deserialize_tours, convert_prob
 from utils.ops import centered_lex_rank
 from solvers.evaluator import evaluate_batch as get_Ts
 from utils.local_search import ls
@@ -14,6 +14,10 @@ from copy import deepcopy
 class BaseHCARP:
     def __init__(self):
         self.has_instance = False
+        # Active problem variant ('P' precedence / 'U' upgrading). A sane
+        # default; every algorithm's __call__ overwrites it from its `variant`
+        # parameter so calc_obj/get_Ts score solutions with the right decoder.
+        self.variant = 'P'
 
     def _load_data(self, dms, P, M, demands, clss, s, d, edge_indxs):
         self.dms, self.P, self.M = dms, P, M
@@ -66,7 +70,7 @@ class BaseHCARP:
     LEX_C = 1e4
 
     def calc_obj(self, actions):
-        rewards = get_Ts(self.vars, actions=actions)   # (N, P), LOWER is better
+        rewards = get_Ts(self.vars, actions=actions, variant=self.variant)  # (N, P), LOWER is better
         P = rewards.shape[1]
         w = self.LEX_C ** np.arange(P - 1, -1, -1, dtype=np.float64)
         obj = rewards @ w
@@ -80,7 +84,96 @@ class BaseHCARP:
         idx = obj.argmax()
         return obj[idx], samples[idx]
     
+    def ls_lex_guarded(self, actions, max_len=None):
+        """Lex-guarded local search (cf. solvers/rl.py's hybrid funnel).
+
+        ``ls`` minimises total deadheading cost, NOT the lexicographic
+        (T1, T2, T3) objective. Under variant 'P' its class-restricted moves
+        keep routes class-sorted so the hierarchy mostly survives, but under
+        'U' the unrestricted any-class neighbourhood happily drags class-1
+        arcs deep into routes — trading T1 away for deadhead (measured on
+        osm_test_small: T1 +40..80% right after the first ``ls`` pass).
+
+        Guard: run ``ls`` and keep each sample's result only if ``calc_obj``
+        (lex-weighted, higher = better) does not get worse than the pre-LS
+        input. Under 'U' a class-restricted 'P' ``ls`` arm is tried as well —
+        every P-move is U-feasible, so variant U retains at least P's
+        local-search power even when the unrestricted arm is rejected.
+
+        Parameters
+        ----------
+        actions : list of flat 0-separated arc-order arrays (no ``None``s)
+        max_len : re-serialisation width for post-LS routes
+                  (default ``self.max_len``; warm starts may need more)
+
+        Returns
+        -------
+        (actions_list, obj_array) — per-sample lex-best over all arms; the
+        LS arms are preferred on exact ties so deadhead gains are kept.
+        """
+        if max_len is None:
+            max_len = self.max_len
+        actions = [np.asarray(a, dtype=np.int32) for a in actions]
+        variants = ('U', 'P') if self.variant == 'U' else (self.variant,)
+        arms = []
+        for var in variants:
+            tours = ls(self.vars, variant=var, actions=actions)
+            arms.append([deserialize_tours(t, max_len) for t in tours])
+        arms.append(actions)  # pre-LS fallback, last so LS arms win ties
+        objs = self._calc_obj_arms(arms)                       # (n_arms, N)
+        best = objs.argmax(axis=0)  # first max -> LS arm preferred on ties
+        idx = np.arange(len(actions))
+        return [arms[k][i] for i, k in enumerate(best)], objs[best, idx]
+
+    def _calc_obj_arms(self, arms):
+        """``calc_obj`` for several arms of the same sample batch, scoring each
+        distinct action once per sample.
+
+        Exact: the evaluator's decode depends only on an action's nonzero arc
+        order (every path in ``SolutionEvaluator`` starts from ``a[a != 0]``;
+        0-separators and padding are ignored), so two actions with the same
+        nonzero order provably receive the same T — e.g. when the U and P
+        local-search arms converge to the same tours, or an arm returns its
+        input unchanged. Values are identical to scoring every arm in full.
+        """
+        n = len(arms[0])
+        objs = np.empty((len(arms), n), dtype=np.float64)
+        memo = [{} for _ in range(n)]
+        for k, arm in enumerate(arms):
+            pending, pending_actions = [], []
+            for i, act in enumerate(arm):
+                a = np.asarray(act)
+                key = a[a != 0].astype(np.int64, copy=False).tobytes()
+                if key in memo[i]:
+                    objs[k, i] = memo[i][key]
+                else:
+                    pending.append((i, key))
+                    pending_actions.append(act)
+            if pending_actions:
+                vals = self.calc_obj(pending_actions)
+                for (i, key), val in zip(pending, vals):
+                    objs[k, i] = val
+                    memo[i][key] = val
+        return objs
+
     def get_once(self, M, clss, attemp=10):
+        # Bin-packing lower bound: if the eligible arcs' total demand exceeds
+        # the fleet's total capacity (1.0 per vehicle, demands are normalised
+        # by C), no assignment can serve them all — every attempt below would
+        # deterministically fail after burning ~attemp full construction
+        # loops. This dominates EAHCARP.cross_over on tight instances (load
+        # factor ~0.92): parents' first routes overlap, so the leftover arcs
+        # routinely exceed the len(M)-2 = 1 vehicle _cross_over gives them —
+        # measured 96% of get_once calls / 88% of EA wall time on
+        # osm_test_small before this check. Skipping is outcome-identical
+        # (the doomed calls returned None anyway); it only shortens the
+        # np.random stream those futile loops consumed, so re-seeded
+        # trajectories differ draw-by-draw but the process distribution is
+        # unchanged. The 1e-6 slack keeps borderline-feasible sums (float32
+        # summation noise) on the "try it" side.
+        eligible = np.isin(clss, self.P)
+        if self.demands[eligible].sum() > len(M) + 1e-6:
+            return None
         for _ in range(attemp):
             routes = [[0] for _ in M]
             edges = [e for p in self.P for e in permutation(np.where(clss==p)[0])]
@@ -101,14 +194,17 @@ class BaseHCARP:
 
 class InsertCheapestHCARP(BaseHCARP):
     def __call__(self, variant='P', num_sample=20):
+        self.variant = variant
         assert self.has_instance, "please import instance first"
         actions = [self.get_once(self.M, self.clss) for _ in range(num_sample)]
-        tours_batch = ls(self.vars, variant=variant, actions=actions)
-        actions = deserialize_tours_batch(tours_batch, self.nseq)
-        _, best = self.get_best(actions)
-        # print(best)
-        # print(gen_tours(best))
-        return get_Ts(self.vars, actions=best[None])
+        actions = [a for a in actions if a is not None]
+        assert actions, "construction failed to produce a feasible solution"
+        # Lex-guarded local search (see BaseHCARP.ls_lex_guarded): the raw
+        # deadhead-only ``ls`` must never lex-worsen (T1,T2,T3) — under
+        # variant U it otherwise trades T1 away for deadhead.
+        acts, objs = self.ls_lex_guarded(actions)
+        best = acts[int(objs.argmax())]
+        return get_Ts(self.vars, actions=best[None], variant=self.variant)
     
 class ILSHCARP(BaseHCARP):
     """Iterated Local Search for HDCARP.
@@ -119,6 +215,11 @@ class ILSHCARP(BaseHCARP):
     acceptance test (``'best'`` improvement-only or ``'sa'`` simulated
     annealing). The objective (``calc_obj``, higher = better) is the negated
     lexicographically-weighted (T1, T2, T3).
+
+    Every ``ls`` application goes through ``ls_lex_guarded``: the deadhead-
+    minimising local search is kept only when it does not lex-worsen the
+    solution (under variant 'U' it otherwise trades T1 for deadhead), with a
+    class-restricted P arm as an extra U-feasible neighbourhood.
     """
 
     def __init__(self, strength=3, accept_mode='best', T_init=0.05, T_final=0.001):
@@ -130,6 +231,7 @@ class ILSHCARP(BaseHCARP):
 
     def __call__(self, max_iter=200, variant='P', num_init_sample=5,
                  seed=None, verbose=False, init_action=None):
+        self.variant = variant
         assert self.has_instance, "please import instance first"
         rng = np.random.default_rng(seed)
         if seed is not None:
@@ -142,13 +244,17 @@ class ILSHCARP(BaseHCARP):
             cur_action = np.asarray(init_action, dtype=np.int32)
             cur_obj = float(self.calc_obj(cur_action[None])[0])
         else:
-            # 1. constructive seeds -> local search -> pick the best as s0
+            # 1. constructive seeds -> lex-guarded local search -> best as s0.
+            # The guard matters: unguarded, the deadhead-only ``ls`` poisons
+            # the pool before get_best ever scores the raw constructions
+            # (under U it wrecks T1), and the lex-strict acceptance below can
+            # then only ever choose among already-degraded candidates.
             samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
             samples = [s for s in samples if s is not None]
             assert samples, "construction failed to produce a feasible solution"
-            tours_batch = ls(self.vars, variant=variant, actions=samples)
-            action_batch = deserialize_tours_batch(tours_batch, self.nseq)
-            cur_obj, cur_action = self.get_best(action_batch)
+            acts, objs = self.ls_lex_guarded(samples)
+            k = int(objs.argmax())
+            cur_obj, cur_action = float(objs[k]), acts[k]
         cur_routes = gen_tours(cur_action)
 
         best_action = cur_action.copy()
@@ -159,14 +265,14 @@ class ILSHCARP(BaseHCARP):
         # cap must fit it; the default (cold-start) path is unchanged.
         max_len = max(self.max_len, len(cur_action))
 
-        # 2. ILS loop: perturb -> local search -> accept
+        # 2. ILS loop: perturb -> lex-guarded local search -> accept
         for it in range(max_iter):
             pert = perturbate(cur_routes, self.dms, self.demands, self.clss,
                               capacity, variant, rng, strength=self.strength)
             pert_action = deserialize_tours(pert, max_len)
-            tours = ls(self.vars, variant=variant, actions=[pert_action])
-            cand_action = deserialize_tours(tours[0], max_len)
-            cand_obj = float(self.calc_obj(cand_action[None])[0])
+            cands, cobjs = self.ls_lex_guarded([pert_action], max_len=max_len)
+            cand_action = cands[0]
+            cand_obj = float(cobjs[0])
 
             if accept(cur_obj, cand_obj, it, max_iter, mode=self.accept_mode,
                       T_init=self.T_init, T_final=self.T_final):
@@ -183,7 +289,7 @@ class ILSHCARP(BaseHCARP):
 
         # 3. report the hierarchical completion times of the best solution
         self._last_best_action = best_action
-        return get_Ts(self.vars, actions=best_action[None])
+        return get_Ts(self.vars, actions=best_action[None], variant=self.variant)
 
 
 class EAHCARP(BaseHCARP):
@@ -227,13 +333,30 @@ class EAHCARP(BaseHCARP):
         return p1
 
     def mutate(self, tours, variant):
-        tours = ls(self.vars, variant=variant, actions=tours[None])
-        return deserialize_tours(tours[0], self.max_len)
+        # Lex-guarded local search (see BaseHCARP.ls_lex_guarded): the raw
+        # deadhead-only ``ls`` must never lex-worsen (T1,T2,T3) — under
+        # variant U it otherwise trades T1 away for deadhead. The guard reads
+        # self.variant, which __call__ sets to the same ``variant`` threaded
+        # here through operate(); the parameter is kept for call-site
+        # compatibility and asserted consistent.
+        assert variant == self.variant, (
+            f"mutate called with variant={variant!r} but self.variant="
+            f"{self.variant!r}; ls_lex_guarded scores with self.variant")
+        acts, _ = self.ls_lex_guarded([tours])
+        return acts[0]
     
     def get_parent(self, population, prob):
         return population[self.get_idx(prob, strategy='sampling', size=self.pathnament_size)]
 
-    def operate(self, prob, population, variant):
+    def make_pair(self, prob, population):
+        """Selection + crossover for one parent pair; mutation is deferred.
+
+        Returns ``(child1, child2, do_mutate)``. The mutation gate is drawn
+        HERE (same np.random position as the historical inline ``operate``)
+        but the lex-guarded local search itself consumes no randomness, so
+        the caller may apply it later — batched across the whole generation —
+        with a byte-identical result (see __call__).
+        """
         # CROSSOVER
         parent1 = self.get_parent(population, prob)
         parent2 = self.get_parent(population, prob)
@@ -241,19 +364,23 @@ class EAHCARP(BaseHCARP):
         # default to the parents so child1/child2 are always defined
         child1, child2 = parent1, parent2
         if random() < self.crossover_rate:
-            # print(parent1, parent2)
             child1 = self.cross_over(parent1, parent2)
             child2 = self.cross_over(parent2, parent1)
 
+        return child1, child2, random() < self.mutation_rate
+
+    def operate(self, prob, population, variant):
+        child1, child2, do_mutate = self.make_pair(prob, population)
         # MUTATION
-        if random() < self.mutation_rate:
+        if do_mutate:
             child1 = self.mutate(child1, variant)
             child2 = self.mutate(child2, variant)
         return child1, child2
 
     def __call__(self, n_epoch=50, variant='P', verbose=False):
+        self.variant = variant
         assert self.has_instance, "please import instance first"
-        
+
         population = self.init_population()
         for epoch in range(n_epoch):
             # selecting two of the best options we have (elitism)
@@ -266,11 +393,29 @@ class EAHCARP(BaseHCARP):
             # centered hierarchical midrank is bounded in [-1, +1] regardless of
             # the population's absolute T spread. gamma=0.5 matches GRPO's
             # adv_gamma default — same multi-priority-combination philosophy.
-            T_population = get_Ts(self.vars, actions=population)
+            T_population = get_Ts(self.vars, actions=population, variant=self.variant)
             prob = convert_prob(centered_lex_rank(T_population, gamma=0.5))
             nb = len(population) // 2 - 1
-            new_population += [c for cs in run_parallel2(self.operate, [prob]*nb, population=population, variant=variant) 
-                               for c in cs]
+            # Build the whole generation first (selection + crossover), then
+            # lex-guard all children flagged for mutation in ONE batched
+            # ls_lex_guarded call instead of ~nb per-child calls. This is
+            # byte-identical to the historical per-pair operate() loop:
+            # make_pair draws the exact same np.random sequence (mutation
+            # never consumed randomness — ls and calc_obj are deterministic),
+            # children don't feed back into this epoch's selection, and
+            # ls_lex_guarded/_calc_obj_arms treat every sample independently.
+            # Batching only amortises the per-call Python/evaluator overhead.
+            pairs = run_parallel2(self.make_pair, [prob]*nb, population=population)
+            children, mut_idx = [], []
+            for child1, child2, do_mutate in pairs:
+                if do_mutate:
+                    mut_idx.extend((len(children), len(children) + 1))
+                children.extend((child1, child2))
+            if mut_idx:
+                acts, _ = self.ls_lex_guarded([children[k] for k in mut_idx])
+                for k, act in zip(mut_idx, acts):
+                    children[k] = act
+            new_population += children
             population = new_population
             if verbose:
                 if epoch % 10 == 0:
@@ -280,7 +425,7 @@ class EAHCARP(BaseHCARP):
 
         routes = population[self.calc_obj(population).argmax()]
         self._last_best_action = np.asarray(routes)
-        return get_Ts(self.vars, actions=routes[None])
+        return get_Ts(self.vars, actions=routes[None], variant=self.variant)
 
 class ACOHCARP(BaseHCARP):
     def __init__(self, n_ant=50, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0):
@@ -373,8 +518,9 @@ class ACOHCARP(BaseHCARP):
         return pheromones
 
     def __call__(self, n_epoch=500, variant='P', is_local_search = True, verbose=False):
+        self.variant = variant
         assert self.has_instance, "please import instance first"
-        
+
         ants, pheromones = self.init_population(variant)
         best_obj = -np.inf
         elitist_epochs = []
@@ -389,13 +535,17 @@ class ACOHCARP(BaseHCARP):
             if not elitist_ants:
                 continue
 
-            # refine tours by local search
+            # refine tours by lex-guarded local search (see
+            # BaseHCARP.ls_lex_guarded): the raw deadhead-only ``ls`` must
+            # never lex-worsen (T1,T2,T3) — under variant U it otherwise
+            # trades T1 away for deadhead. Reuse the guard's objectives for
+            # the elite pick instead of re-scoring via get_best.
             if is_local_search:
-                tours = ls(self.vars, variant=variant, actions=elitist_ants)
-                elitist_ants = deserialize_tours_batch(tours, self.nseq)
-
-            # Update pheromones
-            ant_obj, best_ants = self.get_best(elitist_ants)
+                elitist_ants, objs = self.ls_lex_guarded(elitist_ants)
+                k = int(objs.argmax())
+                ant_obj, best_ants = objs[k], elitist_ants[k]
+            else:
+                ant_obj, best_ants = self.get_best(elitist_ants)
             pheromones = self.update_pheromones(best_ants, pheromones)
 
             best_obj = max(best_obj, ant_obj)
@@ -411,4 +561,4 @@ class ACOHCARP(BaseHCARP):
         _, best_action = self.get_best(elitist_epochs)
         # F1: expose the winning arc order for downstream logging (cf. ILS/EA).
         self._last_best_action = np.asarray(best_action)
-        return get_Ts(self.vars, actions=best_action[None])
+        return get_Ts(self.vars, actions=best_action[None], variant=self.variant)

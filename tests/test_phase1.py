@@ -279,5 +279,72 @@ class TestGRPOIntegrationP1(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["entropy"]).all())
 
 
+# --------------------------------------------------------------- precedence
+class TestPrecedenceMask(unittest.TestCase):
+    """The single most load-bearing variant-U property: precedence is genuinely
+    enforced by the mask for P and genuinely bypassed for U.
+
+    P: at reset (nothing served), any arc whose class is strictly greater than
+    the min class present in the instance is infeasible for EVERY vehicle
+    (the `wrong_class`/`c_min` layer in env.get_action_mask).
+    U: the very same arcs are feasible for every vehicle with capacity --
+    only served/capacity/depot-idle/nonexistent-vehicle layers may mask."""
+
+    def _masks(self, variant, data):
+        env = _make_env(M=3, variant=variant)
+        td = env.reset(data.clone())
+        B = td.batch_size[0]
+        N1 = td["visited"].shape[-1]
+        M_max = td["used_capacity"].shape[-1]
+        mask = env.get_action_mask(td).reshape(B, M_max, N1)  # True == feasible
+        return td, mask
+
+    def test_P_masks_higher_classes_U_does_not(self):
+        torch.manual_seed(8)
+        data = _dataset(B=6, num_loc=12, M=3)
+        tdP, maskP = self._masks("P", data)
+        tdU, maskU = self._masks("U", data)
+        B, M_max, N1 = maskP.shape
+
+        clss = tdP["clss"]
+        demand = tdP["demand"]
+        checked = 0
+        for b in range(B):
+            c_min = int(clss[b, 1:].min())
+            higher = [j for j in range(1, N1) if int(clss[b, j]) > c_min]
+            if not higher:
+                continue  # degenerate single-class instance
+            checked += 1
+            for j in higher:
+                self.assertFalse(
+                    bool(maskP[b, :, j].any()),
+                    f"P: class-{int(clss[b, j])} arc {j} feasible in inst {b} "
+                    f"although c_min={c_min}")
+                if float(demand[b, j]) <= 1.0 + 1e-9:
+                    self.assertTrue(
+                        bool(maskU[b, :, j].all()),
+                        f"U: arc {j} masked in inst {b} -- precedence must not "
+                        f"restrict feasibility under U")
+        self.assertGreater(checked, 0,
+                           "no instance had >= 2 distinct classes; test vacuous")
+
+    def test_U_mask_is_exactly_served_capacity_layers(self):
+        """Under U at reset (scalar fleet -> all vehicles exist), a non-depot
+        column is feasible iff the arc fits an empty vehicle's capacity; depot
+        columns are blocked by the idle-guard (empty vehicle at depot)."""
+        torch.manual_seed(9)
+        data = _dataset(B=4, num_loc=12, M=3)
+        td, mask = self._masks("U", data)
+        B, M_max, N1 = mask.shape
+        demand = td["demand"]
+        for b in range(B):
+            for j in range(1, N1):
+                fits = float(demand[b, j]) <= 1.0 + 1e-9
+                self.assertEqual(bool(mask[b, :, j].all()), fits)
+                self.assertEqual(bool(mask[b, :, j].any()), fits)
+            # depot idle-guard: empty vehicle at depot may not pick depot again
+            self.assertFalse(bool(mask[b, :, 0].any()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

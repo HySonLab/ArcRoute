@@ -9,7 +9,10 @@ Two input modes:
 Variants:
   - 'P' (precedence): `_build_P` spreads each class across M vehicles then
     inserts capacity reloads. Routes are globally class-sorted.
-  - 'U' (upgrading): `_segment` + greedy LPT `_assign` + `_order_trips`.
+  - 'U' (upgrading): lex-better of the order-preserving segment decode
+    (`_segment` + greedy LPT `_assign` + `_order_trips`) and the `_build_P`
+    schedule — U's feasible set is a superset of P's, so the U decoder must
+    never score an action worse than the P decoder.
 
 T_k = max absolute completion time over class-k arcs (both variants).
 """
@@ -25,9 +28,11 @@ class SolutionEvaluator:
         self._svc_np = self._adj_np = self._cls_np = None
 
     def _cache_td(self, td):
-        self._adj_np = self._np(td["adj"]).astype(np.float64)
-        self._svc_np = self._np(td["service_times"]).astype(np.float64)
-        self._cls_np = self._np(td["clss"]).reshape(-1).astype(np.int64)
+        # copy=False: skip the (potentially large) matrix copies when the
+        # dtype already matches -- the evaluator only ever reads these.
+        self._adj_np = self._np(td["adj"]).astype(np.float64, copy=False)
+        self._svc_np = self._np(td["service_times"]).astype(np.float64, copy=False)
+        self._cls_np = self._np(td["clss"]).reshape(-1).astype(np.int64, copy=False)
 
     # ------------------------------------------------------------------ public
     def routes_from_joint_actions(self, actions, M, N1):
@@ -76,13 +81,22 @@ class SolutionEvaluator:
 
         if self.variant == "P":
             vehicles = self._build_P(action, td, M)
-        else:
-            trips = self._segment(action, td, M)
-            n_veh = max(len(trips), 1) if trips else 0
-            if M is not None:
-                n_veh = max(int(M), n_veh) if trips else int(M)
-            vehicles = self._assign(trips, td, n_veh)
-        return vehicles, self._completion_times(vehicles, td)
+            return vehicles, self._completion_times(vehicles, td)
+
+        # Variant U. U's scheduling freedom is a strict superset of P's:
+        # every class-sorted P schedule is U-feasible, so a correct U decoder
+        # must never score an action WORSE than the P decoder does. The
+        # segment+LPT decode alone violated that (its greedy contiguous
+        # partition + duration-LPT assignment isn't T1-aware, e.g. it can
+        # stack all class-1 arcs onto one vehicle where _build_P spreads
+        # them) — decode both ways and return the lex-better schedule.
+        vehicles_u = self._decode_U_segment(action, td, M)
+        T_u = self._completion_times(vehicles_u, td)
+        vehicles_p = self._build_P(action, td, self._fleet_size(action, td, M))
+        T_p = self._completion_times(vehicles_p, td)
+        if tuple(T_p.tolist()) < tuple(T_u.tolist()):
+            return vehicles_p, T_p
+        return vehicles_u, T_u
 
     def reward(self, action, td, M=None):
         """Scalar reward = -T_1."""
@@ -100,6 +114,25 @@ class SolutionEvaluator:
         if torch.is_tensor(x):
             return x.detach().cpu().numpy()
         return np.asarray(x)
+
+    def _fleet_size(self, action, td, M):
+        """Effective vehicle count: M when known, else #capacity segments."""
+        if M is not None:
+            return max(int(M), 1)
+        return max(len(self._segment(action, td, M)), 1)
+
+    def _decode_U_segment(self, action, td, M):
+        """Order-preserving U decode: contiguous capacity segments + LPT.
+
+        Fleet size is a hard constraint: exactly M vehicles when M is known.
+        (A previous revision used max(M, len(trips)), which gave every extra
+        capacity-reload trip its own phantom vehicle and made _assign's LPT
+        branch dead code — U objectives came out unrealistically low whenever
+        #trips > M.)
+        """
+        trips = self._segment(action, td, M)
+        n_veh = max(int(M), 1) if M is not None else max(len(trips), 1)
+        return self._assign(trips, td, n_veh)
 
     def _segment(self, action, td, M):
         """Partition arc-order into K = max(M, k_min) capacity-feasible segments."""
@@ -237,9 +270,14 @@ class SolutionEvaluator:
         """T_k = max absolute completion time over class-k arcs across all vehicles."""
         per_class = {p: [0.0] for p in self.pos_val}
         for veh_trips in vehicles:
+            # Profile each trip once and sort the cached profiles with
+            # _order_trips' exact key (lower class first, then duration) --
+            # previously each trip was profiled twice (again in the sort key).
+            profiles = [self._trip_profile(t, td) for t in veh_trips]
+            if len(profiles) > 1:
+                profiles.sort(key=lambda pr: (int(pr[0].min()), float(pr[2])))
             offset = 0.0
-            for trip in self._order_trips(veh_trips, td):
-                arc_class, arc_comp, duration = self._trip_profile(trip, td)
+            for arc_class, arc_comp, duration in profiles:
                 for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
                     if c in per_class:
                         per_class[c].append(offset + ac)
@@ -247,11 +285,12 @@ class SolutionEvaluator:
         return np.array([max(per_class[p]) for p in self.pos_val], dtype=np.float64)
 
 
-def evaluate_batch(vars, actions, pos_val=(1, 2, 3)):
+def evaluate_batch(vars, actions, pos_val=(1, 2, 3), variant='P'):
     """Compute T_k for a batch of arc-order action sequences (used by metaheuristics).
 
     vars    : dict with 'adj', 'service_time', 'clss', 'demand', optionally 'nv'.
     actions : 2D array (batch, n) — arc-index sequences with 0-separators.
+    variant : 'P' (precedence route-builder) or 'U' (segment+assign decode).
     Returns : np.ndarray shape (batch, len(pos_val)).
     """
     td = {
@@ -261,6 +300,6 @@ def evaluate_batch(vars, actions, pos_val=(1, 2, 3)):
         "demand":        vars["demand"],
     }
     M = vars.get("nv", None)
-    ev = SolutionEvaluator(pos_val=tuple(pos_val))
+    ev = SolutionEvaluator(variant=variant, pos_val=tuple(pos_val))
     return np.array([ev(np.asarray(a), td, M=M)[1] for a in actions],
                     dtype=np.float64)

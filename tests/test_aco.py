@@ -8,7 +8,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from utils.ops import gen_tours
+from utils.ops import gen_tours, deserialize_tours_batch
+from utils.local_search import ls
+from solvers.evaluator import evaluate_batch as get_Ts
 from solvers.meta import ACOHCARP
 
 
@@ -224,6 +226,100 @@ class TestUpdatePheromones(unittest.TestCase):
         # edges (0,1),(1,2),(2,3),(3,0) each got +1 then *(1-rho)
         for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)]:
             self.assertAlmostEqual(out[a, b], 1.0 * (1 - self.al.rho))
+
+
+# --------------------------------------------------------------------------- #
+# TestLocalSearchLexGuarded — regression for the ACO-U T1 blow-up (same bug
+# class as tests/test_ils.py::TestLsLexGuarded): ``ls`` minimises total
+# deadheading, NOT the lex (T1,T2,T3) objective, and under variant U its
+# unrestricted any-class moves trade "class-1 served early" for less
+# deadhead. The is_local_search refinement step in __call__ must therefore
+# go through BaseHCARP.ls_lex_guarded, never raw ``ls``.
+# --------------------------------------------------------------------------- #
+def make_adversarial_instance():
+    """Depot + 3 arcs where the deadhead optimum has strictly worse T1.
+
+    Adapted verbatim from tests/test_ils.py::make_adversarial_instance, built
+    as an ACOHCARP: arcs 1,2 are class 1, arc 3 is class 2; M=1; all services
+    are 1. Total deadhead of order [1,2,3] is 13, of [2,1,3] it is 6 (the
+    global minimum) — so the deadhead-only local search flips the class-1
+    pair, but the class-1 prefix gets slower: T1 goes 4 -> 6. The P-restricted
+    ls finds the same flip (same-class swaps are P-legal), so only the pre-LS
+    fallback of ls_lex_guarded protects T1 here.
+    """
+    n = 4
+    adj = np.full((n, n), 10.0)
+    np.fill_diagonal(adj, 0.0)
+    adj[0, 1] = 1.0   # depot -> a
+    adj[1, 2] = 1.0   # a -> b
+    adj[0, 2] = 2.0   # depot -> b
+    adj[2, 1] = 2.0   # b -> a
+    adj[1, 3] = 1.0   # a -> c
+    adj[3, 0] = 1.0   # c -> depot
+
+    al = ACOHCARP(n_ant=3)
+    al.dms = adj
+    al.P = [1, 2, 3]
+    al.M = [0]                                     # single vehicle
+    al.demands = np.array([0.0, 0.1, 0.1, 0.1], dtype=np.float32)
+    al.clss = np.array([0, 1, 1, 2], dtype=np.int32)
+    al.s = np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float64)
+    al.d = np.zeros(n, dtype=np.float64)
+    al.nv = 1
+    al.nseq = n
+    al.max_len = al.nseq + (al.nv - 2)
+    al.vars = {
+        'adj': al.dms,
+        'service_time': al.s,
+        'clss': al.clss,
+        'demand': al.demands,
+        'nv': al.nv,
+    }
+    al.has_instance = True
+    return al
+
+
+class TestLocalSearchLexGuarded(unittest.TestCase):
+    def test_unguarded_u_ls_lex_worsens(self):
+        """Document the failure mode: plain ls(variant='U') on the adversarial
+        instance strictly lex-worsens calc_obj (it only sees deadhead) — this
+        is exactly what the old is_local_search branch did."""
+        al = make_adversarial_instance()
+        al.variant = 'U'
+        pre = np.array([1, 2, 3], dtype=np.int32)
+        tours = ls(al.vars, variant='U', actions=[pre])
+        post = deserialize_tours_batch(tours, al.nseq)[0]
+        self.assertLess(float(al.calc_obj(post[None])[0]),
+                        float(al.calc_obj(pre[None])[0]))
+
+    def test_aco_u_local_search_keeps_t1(self):
+        """End-to-end __call__ under U with is_local_search=True: force every
+        ant to construct the T1-optimal order [1,2,3]; the local-search step
+        must not flip it (unguarded, T1 would come out 6)."""
+        al = make_adversarial_instance()
+        al.construct_route = (
+            lambda ant, pheromones=None, variant='P', attemp=10:
+            np.array([1, 2, 3], dtype=np.int32))
+        T = al(n_epoch=2, variant='U', is_local_search=True)
+        self.assertEqual(T.shape, (1, 3))
+        # T1 must stay at its optimum (a then b: 1+1 + 1+1 = 4)
+        self.assertAlmostEqual(float(T[0, 0]), 4.0, places=9)
+
+    def test_aco_local_search_never_lex_worsens_random(self):
+        """Property: the guarded LS step used by __call__ never lex-worsens
+        any ant, for both variants, on ACO-constructed actions."""
+        for variant in ('P', 'U'):
+            np.random.seed(24)
+            al = make_instance(nv=2, seed=5, n_ant=8)
+            al.variant = variant
+            ants, ph = al.init_population(variant)
+            elit = [al.construct_route(a, ph, variant=variant) for a in ants]
+            elit = [e for e in elit if e is not None]
+            self.assertTrue(elit)
+            pre = al.calc_obj(elit)
+            _, objs = al.ls_lex_guarded(elit)
+            self.assertTrue(np.all(objs >= pre - 1e-9),
+                            msg=f"variant {variant}: {objs} < {pre}")
 
 
 # --------------------------------------------------------------------------- #

@@ -6,15 +6,24 @@ arc-to-arc deadheading cost matrix (Floyd-Warshall shortest paths), where
 ``adj[i, j]`` is the cost of going from arc ``i`` to arc ``j``. Arc 0 is the
 depot sentinel (service_time = 0, demand = 0, clss = 0).
 
-Operators are *swap*-based: an intra-route swap exchanges the positions of two
-arcs within one route; an inter-route swap exchanges one arc of route ``r1``
-with one arc of route ``r2``. Service times never change under a swap (the same
-arcs are still served), so only deadheading cost changes -- this lets every
-delta be computed in O(1).
+Two move families are provided, both with O(1) deltas (service times never
+change under either move -- the same arcs are still served -- so only
+deadheading cost changes):
+
+  - *swap*: exchange the positions of two arcs (within one route, or one arc
+    of route ``r1`` with one arc of route ``r2``).
+  - *relocate* (Or-opt-1): remove one arc and re-insert it immediately after
+    another position (within the same route, or into another route). This is
+    the move that lets variant U actually exploit cross-class reordering --
+    e.g. pulling an arc from position 5 to position 1 in one step instead of a
+    chain of swaps.
 
 ``variant``:
-  - ``'P'`` (HDCARP-P): only arcs of the *same* priority class may be swapped.
-  - ``'U'`` (HDCARP-U): any two arcs may be swapped regardless of class.
+  - ``'P'`` (HDCARP-P): only arcs of the *same* priority class may be swapped;
+    a relocate must preserve the route's class sequence (intra: the whole span
+    between the removal and insertion points is one class; inter: the arc is
+    inserted right after an arc of its own class).
+  - ``'U'`` (HDCARP-U): any move regardless of class.
 """
 
 import numpy as np
@@ -69,44 +78,110 @@ def calc_swap_delta_intra(route, i, j, adj):
     return float(new - old)
 
 
-def _intra_delta_matrix(route, adj):
-    """Full (m, m) swap-delta matrix over interior positions ``1..n-2``.
+def _best_intra_moves(route, adj, clss, variant='P', p=None):
+    """Fused intra-route move search: best swap AND best relocate in one call.
 
-    ``D[a, b]`` (with ``a < b``) is ``calc_swap_delta_intra(route, pos[a], pos[b])``.
-    Only the strict upper triangle is meaningful; the rest is filled with +inf.
-    Returns ``(D, pos)`` where ``pos`` maps matrix rows/cols to route positions.
+    Returns ``(sd, si, sj, rd, ri, rj)`` — exactly what ``best_swap_intra``
+    and ``best_relocate_intra`` return, computed from shared gathers. All
+    deltas are the same expressions evaluated in the same elementwise order
+    (bit-identical values), and both selections keep the row-major-argmin
+    tie-breaking of the standalone searches.
+
+    Variant ``'P'``: swaps only between same-class pairs; relocates only
+    within the arc's contiguous same-class run. With ``p`` given, only
+    class-``p`` arcs are considered as moving arcs.
     """
+    no_move = (0.0, -1, -1)
+    route = np.asarray(route)
     n = len(route)
+    if n <= 3:  # [0, x, 0] or shorter -> nothing to move
+        return no_move + no_move
+
+    cl = clss[route]
     pos = np.arange(1, n - 1)
+    if variant == 'P' and p is not None:
+        pos = pos[cl[pos] == p]
+        if len(pos) == 0:
+            return no_move + no_move
+        x = route[pos]
+        prev = route[pos - 1]
+        nxt = route[pos + 1]
+        contiguous = False
+    else:
+        # unrestricted rows: use slice views instead of fancy-index copies
+        x = route[1:-1]
+        prev = route[:-2]
+        nxt = route[2:]
+        contiguous = True
     m = len(pos)
-    prev = route[pos - 1]
-    cur = route[pos]
-    nxt = route[pos + 1]
 
-    # general (non-adjacent j > i+1) case, fully broadcast:
-    #   new = adj[prev_i,cur_j] + adj[cur_j,nxt_i] + adj[prev_j,cur_i] + adj[cur_i,nxt_j]
-    A1 = adj[prev[:, None], cur[None, :]]   # adj[prev_i, cur_j]
-    A2 = adj[cur[None, :], nxt[:, None]]    # adj[cur_j, nxt_i]
-    B1 = adj[prev[None, :], cur[:, None]]   # adj[prev_j, cur_i]
-    B2 = adj[cur[:, None], nxt[None, :]]    # adj[cur_i, nxt_j]
-    old_i = adj[prev, cur] + adj[cur, nxt]
-    D = (A1 + A2 + B1 + B2) - (old_i[:, None] + old_i[None, :])
+    base = adj[route[:-1], route[1:]]      # edge costs adj[route[j], route[j+1]]
+    e_in = base[pos - 1] if not contiguous else base[:-1]    # adj[prev, x]
+    e_out = base[pos] if not contiguous else base[1:]        # adj[x, nxt]
 
-    # adjacent pairs (j == i+1) need the chained-edge formula, not the general one
+    # ---- swap (cf. best_swap_intra) ----
+    swap = no_move
     if m >= 2:
-        ai = prev[:-1]
-        bi = cur[:-1]
-        bj = cur[1:]
-        dd = route[pos[1:] + 1]
-        adj_delta = (adj[ai, bj] + adj[bj, bi] + adj[bi, dd]) - \
-                    (adj[ai, bi] + adj[bi, bj] + adj[bj, dd])
-        ii = np.arange(m - 1)
-        D[ii, ii + 1] = adj_delta
+        A1 = adj[prev[:, None], x[None, :]]
+        A2 = adj[x[None, :], nxt[:, None]]
+        B1 = adj[prev[None, :], x[:, None]]
+        B2 = adj[x[:, None], nxt[None, :]]
+        old_i = e_in + e_out
+        D = (A1 + A2 + B1 + B2) - (old_i[:, None] + old_i[None, :])
+        # route-adjacent pairs need the chained-edge formula
+        k = np.arange(m - 1) if contiguous else \
+            np.flatnonzero(pos[1:] == pos[:-1] + 1)
+        if len(k) > 0:
+            ai = prev[k]
+            bi = x[k]
+            bj = x[k + 1]
+            dd = nxt[k + 1]
+            D[k, k + 1] = (adj[ai, bj] + adj[bj, bi] + adj[bi, dd]) - \
+                          (adj[ai, bi] + adj[bi, bj] + adj[bj, dd])
+        r = np.arange(m)
+        D[r[:, None] >= r[None, :]] = np.inf
+        if variant == 'P' and p is None:
+            clp = cl[1:-1]
+            D[clp[:, None] != clp[None, :]] = np.inf
+        flat = int(D.argmin())
+        bd = float(D.flat[flat])
+        if bd < -EPS:
+            a, b = divmod(flat, m)
+            swap = (bd, int(pos[a]), int(pos[b]))
 
-    # keep only the strict upper triangle (i < j); rest is invalid
-    r = np.arange(m)
-    D[r[:, None] >= r[None, :]] = np.inf
-    return D, pos
+    # ---- relocate (cf. best_relocate_intra) ----
+    rel = no_move
+    rem = adj[prev, nxt] - e_in - e_out                     # (m,)
+    u = route[:-1]                                          # slots j = 0..n-2
+    v = route[1:]
+    D = rem[:, None] + adj[u[None, :], x[:, None]] \
+        + adj[x[:, None], v[None, :]] - base[None, :]
+
+    allowed = np.ones((m, n - 1), dtype=bool)
+    ar = np.arange(m)
+    allowed[ar, pos] = False                                # no-op targets
+    allowed[ar, pos - 1] = False
+    if variant == 'P':
+        # target slot must stay inside the arc's same-class run
+        change = np.flatnonzero(cl[1:] != cl[:-1]) + 1      # run start indices
+        starts = np.concatenate(([0], change))
+        ends = np.concatenate((change - 1, [n - 1]))
+        block = np.zeros(n, dtype=np.int64)
+        block[change] = 1
+        block = np.cumsum(block)                            # run id per position
+        lo = starts[block[pos]] - 1                         # min allowed j
+        hi = np.minimum(ends[block[pos]], n - 2)            # max allowed j
+        jpos = np.arange(0, n - 1)
+        allowed &= (jpos[None, :] >= lo[:, None]) & (jpos[None, :] <= hi[:, None])
+
+    D = np.where(allowed, D, np.inf)
+    flat = int(D.argmin())
+    bd = float(D.flat[flat])
+    if bd < -EPS:
+        a, b = divmod(flat, n - 1)
+        rel = (bd, int(pos[a]), int(b))
+
+    return swap + rel
 
 
 def best_swap_intra(route, adj, clss, variant='P', p=None):
@@ -116,42 +191,76 @@ def best_swap_intra(route, adj, clss, variant='P', p=None):
     For variant ``'P'`` only same-class pairs are considered (restricted to
     class ``p`` when given); for ``'U'`` any interior pair is considered.
     """
+    sd, si, sj, _, _, _ = _best_intra_moves(route, adj, clss, variant=variant, p=p)
+    return sd, si, sj
+
+
+def calc_relocate_delta_intra(route, i, j, adj):
+    """O(1) cost delta of removing the arc at position ``i`` and re-inserting
+    it immediately after position ``j`` (both in ORIGINAL route indexing).
+
+    Removal reconnects ``route[i-1] -> route[i+1]``; insertion splits the edge
+    ``route[j] -> route[j+1]``. The two edge deltas are additive and remain
+    exact even for the adjacent case ``j == i + 1`` (the insertion edge
+    ``(route[i+1], route[i+2])`` is untouched by the removal). The only
+    degenerate targets are ``j in (i-1, i)`` -- re-inserting where the arc
+    already sits -- which are no-ops with delta 0.
+
+    ``i`` must be interior (``1 <= i <= n-2``); ``j`` ranges ``0..n-2``
+    (``j == 0`` inserts right after the leading depot sentinel).
+    """
+    if j == i or j == i - 1:
+        return 0.0
+    prv, x, nxt = int(route[i - 1]), int(route[i]), int(route[i + 1])
+    u, v = int(route[j]), int(route[j + 1])
+    rem = adj[prv, nxt] - adj[prv, x] - adj[x, nxt]
+    ins = adj[u, x] + adj[x, v] - adj[u, v]
+    return float(rem + ins)
+
+
+def apply_relocate_intra(route, i, j):
+    """Return a new route with the arc at position ``i`` moved to sit
+    immediately after (original) position ``j``."""
     route = np.asarray(route)
-    n = len(route)
-    if n <= 3:  # [0, x, 0] or shorter -> nothing to swap
-        return 0.0, -1, -1
+    x = route[i]
+    r = np.delete(route, i)
+    if j < i:
+        return np.insert(r, j + 1, x)
+    # deletion shifted original position j to j-1; inserting at index j puts
+    # x right after it.
+    return np.insert(r, j, x)
 
-    D, pos = _intra_delta_matrix(route, adj)
 
-    cl = clss[route[pos]]
-    if variant == 'P' and p is not None:
-        # restrict to interior positions whose arc is class p
-        keep = cl == p
-        if keep.sum() < 2:
-            return 0.0, -1, -1
-        D[~keep, :] = np.inf
-        D[:, ~keep] = np.inf
-    elif variant == 'P':
-        # only same-class pairs allowed
-        D[cl[:, None] != cl[None, :]] = np.inf
+def best_relocate_intra(route, adj, clss, variant='P', p=None):
+    """Best improving intra-route relocate (Or-opt-1).
 
-    flat = int(np.argmin(D))
-    best_delta = float(D.flat[flat])
-    if best_delta < -EPS:
-        m = len(pos)
-        a, b = divmod(flat, m)
-        return best_delta, int(pos[a]), int(pos[b])
-    return 0.0, -1, -1
+    Returns ``(best_delta, best_i, best_j)`` -- move arc at position ``i`` to
+    just after position ``j`` -- or ``(0.0, -1, -1)`` if none improves.
+
+    Variant ``'P'``: a relocate is only allowed when it preserves the route's
+    class sequence, i.e. every interior position spanned by the move (``i..j``
+    when ``j > i``, ``j+1..i`` when ``j < i-1``) carries the moving arc's own
+    class. On a class-sorted route this is exactly "reorder freely within your
+    class block (incl. jumping to the block front)". With ``p`` given, only
+    class-``p`` arcs are considered. Variant ``'U'``: any ``(i, j)``.
+    """
+    _, _, _, rd, ri, rj = _best_intra_moves(route, adj, clss, variant=variant, p=p)
+    return rd, ri, rj
 
 
 def intra_route_opt(route, adj, clss, variant='P', p=None, max_iter=100):
-    """Repeatedly apply the best improving intra-route swap until convergence."""
+    """Repeatedly apply the best improving intra-route move -- swap or
+    relocate, whichever improves more -- until neither improves."""
     route = np.asarray(route).copy()
     for _ in range(max_iter):
-        delta, i, j = best_swap_intra(route, adj, clss, variant=variant, p=p)
-        if i < 0 or delta >= -EPS:
+        sd, si, sj, rd, ri, rj = _best_intra_moves(
+            route, adj, clss, variant=variant, p=p)
+        if si < 0 and ri < 0:
             break
-        route[i], route[j] = route[j], route[i]
+        if si >= 0 and (ri < 0 or sd <= rd):
+            route[si], route[sj] = route[sj], route[si]
+        else:
+            route = apply_relocate_intra(route, ri, rj)
     return route
 
 
@@ -214,7 +323,7 @@ def best_swap_inter(r1, r2, adj, demands, capacity, clss, variant='P', p=None):
         feas &= clss[x][:, None] == clss[y][None, :]
     D[~feas] = np.inf
 
-    flat = int(np.argmin(D))
+    flat = int(D.argmin())
     best_delta = float(D.flat[flat])
     if best_delta < -EPS:
         a, b = divmod(flat, len(idx2))
@@ -222,29 +331,222 @@ def best_swap_inter(r1, r2, adj, demands, capacity, clss, variant='P', p=None):
     return 0.0, -1, -1
 
 
-def inter_route_opt(routes, adj, demands, clss, capacity=1.0, variant='P', max_iter=100):
-    """Apply the best improving inter-route swap across all route pairs.
+def calc_relocate_delta_inter(r1, i, r2, j, adj):
+    """O(1) delta of moving the arc at position ``i`` of ``r1`` into ``r2``,
+    inserted immediately after position ``j``. The routes are independent, so
+    the removal delta (in ``r1``) and insertion delta (in ``r2``) are additive.
+    """
+    r1 = np.asarray(r1)
+    r2 = np.asarray(r2)
+    prv, x, nxt = int(r1[i - 1]), int(r1[i]), int(r1[i + 1])
+    u, v = int(r2[j]), int(r2[j + 1])
+    rem = adj[prv, nxt] - adj[prv, x] - adj[x, nxt]
+    ins = adj[u, x] + adj[x, v] - adj[u, v]
+    return float(rem + ins)
 
-    Greedily picks, over every ordered-unique pair of routes, the single best
-    feasible improving swap and applies it; repeats until no pair yields an
+
+def best_relocate_inter(r1, r2, adj, demands, capacity, clss, variant='P', p=None):
+    """Best improving relocate of one arc out of ``r1`` into ``r2``.
+
+    Capacity feasibility on the receiving route is checked first (``r2``'s
+    load plus the moved arc's demand must stay within ``capacity``; ``r1``
+    only loses load, so it stays feasible by construction). For variant
+    ``'P'`` the arc may only be inserted immediately after an arc of its own
+    class (so a class-sorted ``r2`` stays class-sorted); for ``'U'`` any slot
+    (including right after the leading depot) is allowed.
+
+    Returns ``(best_delta, best_i, best_j)`` -- arc at position ``i`` of
+    ``r1`` goes right after position ``j`` of ``r2`` -- or ``(0.0, -1, -1)``.
+    """
+    r1 = np.asarray(r1)
+    r2 = np.asarray(r2)
+    if len(r1) <= 2 or len(r2) < 2:
+        return 0.0, -1, -1
+
+    idx1 = get_subtour_u(r1)                 # donor positions
+    jpos = np.arange(0, len(r2) - 1)         # insert-after slots in r2
+    x = r1[idx1]
+    rem = adj[r1[idx1 - 1], r1[idx1 + 1]] - adj[r1[idx1 - 1], x] \
+        - adj[x, r1[idx1 + 1]]
+    u = r2[jpos]
+    v = r2[jpos + 1]
+    ins = (adj[u[None, :], x[:, None]] + adj[x[:, None], v[None, :]]
+           - adj[u, v][None, :])
+    D = rem[:, None] + ins
+
+    load2 = demands[r2].sum()
+    cap_ok = load2 + demands[x] <= capacity + EPS       # (len(idx1),)
+    D[~cap_ok, :] = np.inf
+    if variant == 'P':
+        same = clss[x][:, None] == clss[u][None, :]
+        if p is not None:
+            same &= (clss[x] == p)[:, None]
+        D[~same] = np.inf
+
+    flat = int(D.argmin())
+    best_delta = float(D.flat[flat])
+    if best_delta < -EPS:
+        a, b = divmod(flat, len(jpos))
+        return best_delta, int(idx1[a]), int(jpos[b])
+    return 0.0, -1, -1
+
+
+def _pair_moves(r1, r2, adj, demands, capacity, clss, variant, load1, load2):
+    """Fused per-pair inter-route move search.
+
+    Computes, in one call sharing every gather, the same three results the
+    separate searches produce for the pair (r1, r2):
+
+        (best swap r1<->r2,  best relocate r1->r2,  best relocate r2->r1)
+
+    each as ``(delta, i, j)`` with the exact formulas / argmin tie-breaking of
+    ``best_swap_inter`` / ``best_relocate_inter`` (values are bit-identical:
+    identical expressions evaluated in the same elementwise order).
+    """
+    no_move = (0.0, -1, -1)
+    swap = rel12 = rel21 = no_move
+    n1, n2 = len(r1), len(r2)
+    have1 = n1 > 2                     # r1 has at least one interior arc
+    have2 = n2 > 2
+
+    # Slice views (no fancy-index copies): interior arcs and their neighbours.
+    # base_k[j] = adj[r_k[j], r_k[j+1]] is the route's edge-cost vector; the
+    # per-arc in/out edge costs are exactly its slices (identical adj entries,
+    # so all deltas below are bit-identical to the standalone searches).
+    if have1:
+        x = r1[1:-1]
+        a1 = r1[:-2]
+        a2 = r1[2:]
+        dx = demands[x]
+        base1 = adj[r1[:-1], r1[1:]]
+        adj_a1x = base1[:-1]           # adj[a1, x]
+        adj_xa2 = base1[1:]            # adj[x, a2]
+        cx = clss[x] if variant == 'P' else None
+    if have2:
+        y = r2[1:-1]
+        b1 = r2[:-2]
+        b2 = r2[2:]
+        dy = demands[y]
+        base2 = adj[r2[:-1], r2[1:]]
+        adj_b1y = base2[:-1]           # adj[b1, y]
+        adj_yb2 = base2[1:]            # adj[y, b2]
+        cy = clss[y] if variant == 'P' else None
+
+    # ---- swap r1 <-> r2 (cf. best_swap_inter) ----
+    if have1 and have2:
+        new = (adj[a1[:, None], y[None, :]] + adj[y[None, :], a2[:, None]]
+               + adj[b1[None, :], x[:, None]] + adj[x[:, None], b2[None, :]])
+        old_i = adj_a1x + adj_xa2
+        old_j = adj_b1y + adj_yb2
+        D = new - (old_i[:, None] + old_j[None, :])
+        feas = (load1 - dx[:, None] + dy[None, :] <= capacity + EPS) & \
+               (load2 - dy[None, :] + dx[:, None] <= capacity + EPS)
+        if variant == 'P':
+            feas &= cx[:, None] == cy[None, :]
+        D[~feas] = np.inf
+        flat = int(D.argmin())
+        bd = float(D.flat[flat])
+        if bd < -EPS:
+            a, b = divmod(flat, n2 - 2)
+            swap = (bd, a + 1, b + 1)  # interior offset -> route position
+
+    # ---- relocate r1 -> r2 (cf. best_relocate_inter) ----
+    if have1 and n2 >= 2:
+        rem = adj[a1, a2] - adj_a1x - adj_xa2
+        u = r2[:-1]
+        v = r2[1:]
+        ins = (adj[u[None, :], x[:, None]] + adj[x[:, None], v[None, :]]
+               - base2[None, :]) if have2 else \
+              (adj[u[None, :], x[:, None]] + adj[x[:, None], v[None, :]]
+               - adj[u, v][None, :])
+        D = rem[:, None] + ins
+        cap_ok = load2 + dx <= capacity + EPS
+        D[~cap_ok, :] = np.inf
+        if variant == 'P':
+            D[~(cx[:, None] == clss[u][None, :])] = np.inf
+        flat = int(D.argmin())
+        bd = float(D.flat[flat])
+        if bd < -EPS:
+            a, b = divmod(flat, n2 - 1)
+            rel12 = (bd, a + 1, int(b))
+
+    # ---- relocate r2 -> r1 (symmetric) ----
+    if have2 and n1 >= 2:
+        rem = adj[b1, b2] - adj_b1y - adj_yb2
+        u = r1[:-1]
+        v = r1[1:]
+        ins = (adj[u[None, :], y[:, None]] + adj[y[:, None], v[None, :]]
+               - base1[None, :]) if have1 else \
+              (adj[u[None, :], y[:, None]] + adj[y[:, None], v[None, :]]
+               - adj[u, v][None, :])
+        D = rem[:, None] + ins
+        cap_ok = load1 + dy <= capacity + EPS
+        D[~cap_ok, :] = np.inf
+        if variant == 'P':
+            D[~(cy[:, None] == clss[u][None, :])] = np.inf
+        flat = int(D.argmin())
+        bd = float(D.flat[flat])
+        if bd < -EPS:
+            a, b = divmod(flat, n1 - 1)
+            rel21 = (bd, a + 1, int(b))
+
+    return swap, rel12, rel21
+
+
+def inter_route_opt(routes, adj, demands, clss, capacity=1.0, variant='P', max_iter=100):
+    """Apply the best improving inter-route move across all route pairs.
+
+    Greedily picks, over every route pair, the single best feasible improving
+    move -- a swap (exchange two arcs) or a relocate (move one arc from one
+    route into another) -- and applies it; repeats until no pair yields an
     improvement (or ``max_iter`` reached). The objective minimised here is the
     total deadheading cost; capacity is never violated.
+
+    Each pass computes all pair moves once via the fused ``_pair_moves``
+    (values identical to the standalone searches), then compares candidates in
+    the exact historical order -- all swaps by (ri, rj), then all relocates by
+    (ra, rb) row-major -- so tie-breaking between equal-delta moves is
+    unchanged.
     """
     routes = [np.asarray(r).copy() for r in routes]
+    nr = len(routes)
     for _ in range(max_iter):
-        best = (0.0, -1, -1, -1, -1)  # delta, ri, rj, i, j
-        for ri in range(len(routes)):
-            for rj in range(ri + 1, len(routes)):
-                d, i, j = best_swap_inter(
+        loads = [demands[r].sum() for r in routes]
+        swap_res = {}
+        rel_res = {}
+        for ri in range(nr):
+            for rj in range(ri + 1, nr):
+                s, r12, r21 = _pair_moves(
                     routes[ri], routes[rj], adj, demands, capacity, clss,
-                    variant=variant,
+                    variant, loads[ri], loads[rj],
                 )
-                if i >= 0 and d < best[0] - EPS:
-                    best = (d, ri, rj, i, j)
-        if best[1] < 0:
+                swap_res[(ri, rj)] = s
+                rel_res[(ri, rj)] = r12
+                rel_res[(rj, ri)] = r21
+
+        best_delta = 0.0
+        best_move = None                     # (kind, ra, rb, i, j)
+        for ri in range(nr):
+            for rj in range(ri + 1, nr):
+                d, i, j = swap_res[(ri, rj)]
+                if i >= 0 and d < best_delta - EPS:
+                    best_delta, best_move = d, ('swap', ri, rj, i, j)
+        for ra in range(nr):
+            for rb in range(nr):
+                if ra == rb:
+                    continue
+                d, i, j = rel_res[(ra, rb)]
+                if i >= 0 and d < best_delta - EPS:
+                    best_delta, best_move = d, ('relocate', ra, rb, i, j)
+        if best_move is None:
             break
-        _, ri, rj, i, j = best
-        routes[ri][i], routes[rj][j] = routes[rj][j], routes[ri][i]
+        kind, ra, rb, i, j = best_move
+        if kind == 'swap':
+            routes[ra][i], routes[rb][j] = routes[rb][j], routes[ra][i]
+        else:
+            x = routes[ra][i]
+            routes[rb] = np.insert(routes[rb], j + 1, x)
+            routes[ra] = np.delete(routes[ra], i)
     return routes
 
 
@@ -270,7 +572,7 @@ def ls(vars, variant='P', actions=None):
 
     adj = vars['adj']
     adj = adj.numpy() if hasattr(adj, 'numpy') else np.asarray(adj)
-    adj = adj.astype(np.float64)
+    adj = adj.astype(np.float64, copy=False)
     clss = vars['clss']
     clss = clss.numpy() if hasattr(clss, 'numpy') else np.asarray(clss)
     demands = vars['demand']
@@ -316,7 +618,7 @@ def lsRL(td, tours):
 
     adj = td['adj']
     adj = adj.numpy() if hasattr(adj, 'numpy') else np.asarray(adj)
-    adj = adj.astype(np.float64)
+    adj = adj.astype(np.float64, copy=False)
     # service time key has varied between revisions
     svc = td.get('service_times', td.get('service_time'))
     if hasattr(svc, 'numpy'):

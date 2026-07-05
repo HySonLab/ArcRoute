@@ -128,5 +128,42 @@ class TestBuildAndStep(unittest.TestCase):
             self.assertTrue(torch.isfinite(captured[k]).all())
 
 
+class TestVariantHparam(unittest.TestCase):
+    """The env's problem variant must be recorded in hparams (and hence in the
+    checkpoint's `hyper_parameters`), because run_grid.py rebuilds the env from
+    hp["variant"]. Regression: `save_hyperparameters(ignore=["env", ...])`
+    silently dropped it."""
+
+    def test_grpo_records_env_variant(self):
+        for variant in ("P", "U"):
+            env = _make_env("vector", variant=variant)
+            model = _make_model(GRPO, env, _make_policy(), f"var{variant}",
+                                GRPO_METRICS, group_size=8)
+            self.assertEqual(model.hparams["variant"], variant)
+
+    def test_variant_persists_into_checkpoint(self):
+        """End-to-end: hparams["variant"] lands in ckpt["hyper_parameters"],
+        the exact dict run_grid.py's load path reads."""
+        import tempfile
+        torch.manual_seed(0)
+        env = _make_env("vector", variant="U")
+        model = _make_model(GRPO, env, _make_policy(), "varckpt",
+                            GRPO_METRICS, group_size=8)
+        from lightning import Trainer
+        dl = _synthetic_dl(15, model.env.num_vehicle)
+        trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
+                          limit_train_batches=1, limit_val_batches=0,
+                          num_sanity_val_steps=0, enable_checkpointing=False,
+                          logger=False, enable_progress_bar=False)
+        with mock.patch.object(model.env, "dataset", side_effect=lambda *a, **kw: dl):
+            trainer.fit(model)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ckpt_variant.ckpt")
+            trainer.save_checkpoint(path)
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        hp = ckpt.get("hyper_parameters", {})
+        self.assertEqual(hp.get("variant"), "U")
+
+
 if __name__ == "__main__":
     unittest.main()

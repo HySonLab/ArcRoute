@@ -122,6 +122,11 @@ class GRPO(BaseRL):
             train_buckets=train_buckets,
         )
         self.save_hyperparameters(ignore=["env", "policy"])
+        # `env` is excluded from save_hyperparameters, so the problem variant
+        # (a property of the env, not a GRPO arg) would never reach the
+        # checkpoint's `hyper_parameters`. Record it explicitly — eval tooling
+        # (src/eval/run_grid.py) reads hp["variant"] to rebuild the env.
+        self.hparams["variant"] = env.variant
         self.automatic_optimization = False  # one explicit backward + step
 
         assert group_size >= 2, (
