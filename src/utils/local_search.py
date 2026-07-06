@@ -551,6 +551,239 @@ def inter_route_opt(routes, adj, demands, clss, capacity=1.0, variant='P', max_i
 
 
 # --------------------------------------------------------------------------- #
+# lex-safe U search (move-level acceptance)
+# --------------------------------------------------------------------------- #
+def _u_improving_moves(routes, adj, demands, capacity, loads):
+    """Enumerate EVERY structurally-legal, deadhead-improving U move across
+    ``routes``, sorted best (most negative) delta first.
+
+    Structural legality is exactly what the deadhead-greedy U kernels allow:
+    any-class swap/relocate, intra- and inter-route, with inter-route capacity
+    checked up front and no-op relocate targets excluded. The deltas are the
+    same edge-cost expressions the greedy kernels use (see
+    ``calc_swap_delta_intra`` etc.); here they are only a RANKING -- the
+    caller decides acceptance separately.
+
+    Returns a list of ``(delta, kind, ta, tb, i, j)``:
+      - ``('iswap', t, t, i, j)``: swap positions ``i < j`` within ``routes[t]``
+      - ``('irel',  t, t, i, j)``: move ``routes[t][i]`` to after position ``j``
+      - ``('xswap', ta, tb, i, j)``: swap ``routes[ta][i]`` with ``routes[tb][j]``
+      - ``('xrel',  ta, tb, i, j)``: move ``routes[ta][i]`` into ``routes[tb]``,
+        inserted after position ``j``
+    """
+    cands = []
+    nr = len(routes)
+
+    # ---- intra-route moves ----
+    for t in range(nr):
+        r = routes[t]
+        n = len(r)
+        m = n - 2
+        if m < 1:
+            continue
+        x = r[1:-1]
+        prev = r[:-2]
+        nxt = r[2:]
+        base = adj[r[:-1], r[1:]]
+        e_in = base[:-1]
+        e_out = base[1:]
+
+        if m >= 2:
+            A1 = adj[prev[:, None], x[None, :]]
+            A2 = adj[x[None, :], nxt[:, None]]
+            B1 = adj[prev[None, :], x[:, None]]
+            B2 = adj[x[:, None], nxt[None, :]]
+            old = e_in + e_out
+            D = (A1 + A2 + B1 + B2) - (old[:, None] + old[None, :])
+            k = np.arange(m - 1)                      # adjacent pairs
+            D[k, k + 1] = (adj[prev[k], x[k + 1]] + adj[x[k + 1], x[k]]
+                           + adj[x[k], nxt[k + 1]]) - \
+                          (adj[prev[k], x[k]] + adj[x[k], x[k + 1]]
+                           + adj[x[k + 1], nxt[k + 1]])
+            rr = np.arange(m)
+            D[rr[:, None] >= rr[None, :]] = np.inf
+            for a, b in np.argwhere(D < -EPS):
+                cands.append((float(D[a, b]), 'iswap', t, t,
+                              int(a) + 1, int(b) + 1))
+
+        rem = adj[prev, nxt] - e_in - e_out
+        u = r[:-1]
+        v = r[1:]
+        D = rem[:, None] + adj[u[None, :], x[:, None]] \
+            + adj[x[:, None], v[None, :]] - base[None, :]
+        ar = np.arange(m)
+        D[ar, ar + 1] = np.inf                        # j == i     (no-op)
+        D[ar, ar] = np.inf                            # j == i - 1 (no-op)
+        for a, b in np.argwhere(D < -EPS):
+            cands.append((float(D[a, b]), 'irel', t, t, int(a) + 1, int(b)))
+
+    # ---- inter-route moves ----
+    for ta in range(nr):
+        for tb in range(ta + 1, nr):
+            ra, rb = routes[ta], routes[tb]
+            ma, mb = len(ra) - 2, len(rb) - 2
+
+            if ma >= 1 and mb >= 1:                   # swap ta <-> tb
+                x = ra[1:-1]
+                a1 = ra[:-2]
+                a2 = ra[2:]
+                y = rb[1:-1]
+                b1 = rb[:-2]
+                b2 = rb[2:]
+                new = (adj[a1[:, None], y[None, :]] + adj[y[None, :], a2[:, None]]
+                       + adj[b1[None, :], x[:, None]] + adj[x[:, None], b2[None, :]])
+                old_i = adj[a1, x] + adj[x, a2]
+                old_j = adj[b1, y] + adj[y, b2]
+                D = new - (old_i[:, None] + old_j[None, :])
+                dx = demands[x]
+                dy = demands[y]
+                feas = (loads[ta] - dx[:, None] + dy[None, :] <= capacity + EPS) & \
+                       (loads[tb] - dy[None, :] + dx[:, None] <= capacity + EPS)
+                D[~feas] = np.inf
+                for a, b in np.argwhere(D < -EPS):
+                    cands.append((float(D[a, b]), 'xswap', ta, tb,
+                                  int(a) + 1, int(b) + 1))
+
+            for src, dst in ((ta, tb), (tb, ta)):     # relocate src -> dst
+                rs, rd = routes[src], routes[dst]
+                if len(rs) <= 2 or len(rd) < 2:
+                    continue
+                x = rs[1:-1]
+                p = rs[:-2]
+                q = rs[2:]
+                rem = adj[p, q] - adj[p, x] - adj[x, q]
+                u = rd[:-1]
+                v = rd[1:]
+                D = rem[:, None] + adj[u[None, :], x[:, None]] \
+                    + adj[x[:, None], v[None, :]] - adj[u, v][None, :]
+                cap_ok = loads[dst] + demands[x] <= capacity + EPS
+                D[~cap_ok, :] = np.inf
+                for a, b in np.argwhere(D < -EPS):
+                    cands.append((float(D[a, b]), 'xrel', src, dst,
+                                  int(a) + 1, int(b)))
+
+    cands.sort(key=lambda c: c[0])
+    return cands
+
+
+def u_route_opt_lex_safe(routes, owner, n_vehicles, adj, demands, veh_score,
+                         capacity=1.0, max_iter=200):
+    """Move-level lex-safe unrestricted (variant-U) local search.
+
+    Motivation (measured, data/test_bm/small.npz, production RL-P config):
+    running the deadhead-greedy U kernels (``intra_route_opt`` +
+    ``inter_route_opt``, variant='U') to convergence and lex-guarding only
+    the BUNDLED end result fired 0/100 times -- the pass finds real deadhead
+    reductions (mean -11.94/instance) but always includes at least one
+    T1-damaging move, so the whole bundle is rejected even though most of its
+    moves were T1-neutral T2/T3 wins. This search fixes that by moving the
+    lexicographic acceptance check to the INDIVIDUAL move.
+
+    Each iteration:
+      1. enumerate all deadhead-improving candidate moves (same move families
+         and capacity feasibility as the greedy U kernels -- structural
+         legality is unchanged), ranked by deadhead delta;
+      2. walk the ranking and apply the FIRST candidate whose full-solution
+         objective tuple does not lex-worsen (i.e. the best-deadhead lex-SAFE
+         move); the tuple is evaluated exactly, per touched vehicle, via
+         ``veh_score`` -- a move only alters the vehicle(s) owning the touched
+         route(s), so untouched vehicles' cached contributions are reused and
+         the check costs O(touched-vehicle arcs);
+      3. stop when no candidate is lex-safe (or nothing improves deadhead).
+
+    Guarantees (by construction):
+      - every accepted move is lex-non-worsening, so the objective tuple --
+        and in particular T1 -- is monotone non-increasing over the whole
+        pass; the final solution is lex <= the input;
+      - termination: every accepted move strictly reduces total deadheading
+        (bounded below), ``max_iter`` is only a safety cap;
+      - feasibility: identical structural legality to the greedy U kernels
+        (arcs are only permuted/relocated, single service preserved, inter-
+        route capacity checked before ranking).
+
+    Why accept lex-EQUAL moves (not only strict improvements): a deadhead
+    reduction that leaves (T1, T2, T3) untouched (e.g. on a route that does
+    not carry any class's max completion) is free progress and frequently
+    unlocks strictly-improving moves later; cycling is impossible because
+    deadhead still strictly decreases.
+
+    Parameters
+    ----------
+    routes     : list of sentinel routes ``[0, a1, ..., ak, 0]`` (the flat
+                 trip list; multiple trips may belong to one vehicle).
+    owner      : vehicle index per route (len == len(routes)).
+    n_vehicles : total vehicle count M.
+    adj        : arc-to-arc deadheading cost matrix (float64).
+    demands    : per-arc demand vector.
+    veh_score  : callable(list_of_trip_interiors) -> (P,) array: ONE vehicle's
+                 per-class max completion times (e.g. a closure over
+                 ``SolutionEvaluator._completion_times([veh_trips], td)``).
+                 The full-solution objective is the elementwise max over
+                 vehicles, which matches scoring all vehicles at once.
+    capacity   : per-trip capacity (demands are normalized to it).
+    max_iter   : safety cap on accepted moves.
+
+    Returns the optimized routes (same list structure/owners; a route may
+    become empty ``[0, 0]`` after relocates -- callers drop empty trips).
+    """
+    routes = [np.asarray(r).astype(np.int64).copy() for r in routes]
+    owner = [int(m) for m in owner]
+
+    def _veh_trips(m, override=None):
+        trips = []
+        for t, r in enumerate(routes):
+            if owner[t] != m:
+                continue
+            rr = r if override is None or t not in override else override[t]
+            if len(rr) > 2:
+                trips.append(rr[1:-1])
+        return trips
+
+    contrib = np.stack([np.asarray(veh_score(_veh_trips(m)), dtype=np.float64)
+                        for m in range(n_vehicles)])
+    cur_T = contrib.max(axis=0)
+
+    for _ in range(max_iter):
+        loads = [demands[r].sum() for r in routes]
+        cands = _u_improving_moves(routes, adj, demands, capacity, loads)
+        accepted = False
+        for delta, kind, ta, tb, i, j in cands:
+            override = {}
+            if kind == 'iswap':
+                nr_ = routes[ta].copy()
+                nr_[i], nr_[j] = nr_[j], nr_[i]
+                override[ta] = nr_
+            elif kind == 'irel':
+                override[ta] = apply_relocate_intra(routes[ta], i, j)
+            elif kind == 'xswap':
+                na_ = routes[ta].copy()
+                nb_ = routes[tb].copy()
+                na_[i], nb_[j] = nb_[j], na_[i]
+                override[ta] = na_
+                override[tb] = nb_
+            else:                                     # 'xrel'
+                xarc = routes[ta][i]
+                override[tb] = np.insert(routes[tb], j + 1, xarc)
+                override[ta] = np.delete(routes[ta], i)
+
+            new_contrib = contrib.copy()
+            for m in sorted({owner[t] for t in override}):
+                new_contrib[m] = np.asarray(
+                    veh_score(_veh_trips(m, override)), dtype=np.float64)
+            new_T = new_contrib.max(axis=0)
+            if tuple(new_T.tolist()) <= tuple(cur_T.tolist()):
+                for t, rr in override.items():
+                    routes[t] = rr
+                contrib = new_contrib
+                cur_T = new_T
+                accepted = True
+                break
+        if not accepted:
+            break
+    return routes
+
+
+# --------------------------------------------------------------------------- #
 # main entry points
 # --------------------------------------------------------------------------- #
 def ls(vars, variant='P', actions=None):

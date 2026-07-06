@@ -139,14 +139,27 @@ class RLHybHCARP(RLHCARP):
     in that case, so the default `oracle_head=False` path's rollout is
     unchanged from before the unification).
 
+    A single deterministic GREEDY rollout is appended to the pool as an
+    anchor row (always shortlisted, decoded after the sampling pool via
+    argmax so no RNG is consumed): the pool is otherwise all sampled
+    rollouts, and on OOD instances a policy with a flat sampled distribution
+    can have every sample decode worse than its own greedy argmax (measured
+    for variant U on osm_test_small -- see the comment in `__call__`), which
+    used to make the funnel worse than a plain greedy decode. With the
+    anchor the funnel is provably no worse than greedy as well.
+
     Local search (`utils.local_search`) then runs on a shortlist spanning the
     whole pool -- `eps_lex_select` over everything, `topk_t1` over the free
-    rows (a T1-only hedge against an imperfect forced prefix), and a
-    guaranteed lane of the best forced rows by (T2, T3) when forcing engaged
-    -- and only keeps a candidate's post-LS T-vector if it's lex-better than
-    pre-LS, so the hybrid is provably no worse than plain `RLHCARP`. The
-    final `final_band_pick` (T1 tie-band -> T2 eps-band -> min T3) picks the
-    winner, re-evaluated through the float64 `SolutionEvaluator`.
+    rows (a T1-only hedge against an imperfect forced prefix), a guaranteed
+    lane of the best forced rows by (T2, T3) when forcing engaged, plus the
+    greedy anchor -- and only keeps a candidate's post-LS T-vector if it's
+    lex-better than pre-LS, so the hybrid is provably no worse than plain
+    `RLHCARP`. Under variant U, `_local_search_one` runs BOTH the
+    unrestricted U arm and the class-restricted P arm and keeps the
+    lex-better (every P-legal move is U-legal -- same free win as
+    `BaseHCARP.ls_lex_guarded`). The final `final_band_pick` (T1 tie-band ->
+    T2 eps-band -> min T3) picks the winner, re-evaluated through the
+    float64 `SolutionEvaluator`.
 
     Unified (see `docs/grpo.md` §17/§18) from an earlier two-arm design
     (separate pool-arm and oracle-head-arm decodes, joined by a since-removed
@@ -185,7 +198,7 @@ class RLHybHCARP(RLHCARP):
                  oracle_union_eps2=0.02,
                  oracle_tiebreak=True, oracle_max_n1=None,
                  oracle_use_heuristic=True, oracle_heuristic_time_budget=None,
-                 oracle_heuristic_intra_cutoff=None):
+                 oracle_heuristic_intra_cutoff=None, upgrade_to_u=False):
         super().__init__(pw, variant, device=device)
         self.shortlist = shortlist
         self.eps = eps
@@ -209,9 +222,37 @@ class RLHybHCARP(RLHCARP):
         self.oracle_heuristic_intra_cutoff = oracle_heuristic_intra_cutoff
         from solvers.evaluator import SolutionEvaluator
         self.evaluator = SolutionEvaluator(variant=variant)
+        # upgrade_to_u: zero-training variant-U answer from the variant-P
+        # pipeline. After the normal funnel picks its final winner, ONE extra
+        # unrestricted (variant-U) local-search pass runs on that winner --
+        # any-class swap/relocate moves that P's own class-restricted search
+        # was never allowed to make -- with MOVE-LEVEL lex-safety (each move
+        # is accepted only if the full (T1,T2,T3) does not lex-worsen; see
+        # `u_route_opt_lex_safe`), re-scored as a U solution and kept only
+        # if lex-better (guard: can only help or tie, never hurt). Off by
+        # default: the flag-off path is byte-identical to before (no extra
+        # code runs, no RNG consumed). See `_upgrade_winner_to_u`.
+        self.upgrade_to_u = upgrade_to_u
+        self.last_upgrade_info = None
+        if upgrade_to_u:
+            # The upgraded routes may interleave classes, so they must be
+            # scored as a U solution. (`_completion_times` itself is variant-
+            # agnostic -- it scores whatever vehicle/trip structure it is
+            # given -- but keep a dedicated U evaluator so the scoring intent
+            # is explicit and survives any future variant-dependent scoring.)
+            self._u_evaluator = SolutionEvaluator(variant='U')
 
     def _local_search_one(self, vehicles, td0, M, adj, clss, demands, classes):
         """Run intra/inter local search on a decoded vehicles structure.
+
+        Variant P runs the class-restricted arm. Variant U runs BOTH the
+        unrestricted U arm and the class-restricted P arm and keeps the
+        lex-better result (U arm preferred on exact ties) -- mirroring
+        `BaseHCARP.ls_lex_guarded` (solvers/meta.py): every P-legal move is
+        also U-legal, so this is a free win. Without it, the unrestricted arm
+        often trades T1 away for deadhead, the caller's lex guard rejects it
+        outright, and a U candidate gets NO local-search benefit at all where
+        a P candidate would have kept its class-safe T2/T3 gains.
 
         Returns (T_vec, new_vehicles), or (None, None) when there is nothing
         to optimize.
@@ -225,21 +266,85 @@ class RLHybHCARP(RLHCARP):
                 owner.append(m)
         if not trips:
             return None, None
-        if self.variant == 'P':
-            for i, route in enumerate(trips):
-                for p in classes:
-                    route = intra_route_opt(route, adj, clss, variant='P', p=p)
-                trips[i] = route
-        else:
-            trips = [intra_route_opt(r, adj, clss, variant='U') for r in trips]
-        trips = inter_route_opt(trips, adj, demands, clss, capacity=1.0, variant=self.variant)
 
+        def _arm(variant):
+            # `trips` is never mutated (intra/inter both copy), so each arm
+            # starts from the same pre-LS routes.
+            if variant == 'P':
+                new_trips = []
+                for route in trips:
+                    for p in classes:
+                        route = intra_route_opt(route, adj, clss, variant='P', p=p)
+                    new_trips.append(route)
+            else:
+                new_trips = [intra_route_opt(r, adj, clss, variant='U')
+                             for r in trips]
+            new_trips = inter_route_opt(new_trips, adj, demands, clss,
+                                        capacity=1.0, variant=variant)
+            new_vehicles = [[] for _ in range(M)]
+            for m, route in zip(owner, new_trips):
+                trip = route[1:-1]
+                if len(trip):
+                    new_vehicles[m].append(trip)
+            return self.evaluator._completion_times(new_vehicles, td0), new_vehicles
+
+        best_T, best_vehicles = _arm(self.variant)
+        if self.variant == 'U':
+            p_T, p_vehicles = _arm('P')
+            if tuple(p_T.tolist()) < tuple(best_T.tolist()):
+                best_T, best_vehicles = p_T, p_vehicles
+        return best_T, best_vehicles
+
+    def _upgrade_winner_to_u(self, vehicles, td0, M, adj, clss, demands):
+        """Move-level lex-safe unrestricted (variant-U) local-search pass over
+        an already-final winner (see `upgrade_to_u` in `__init__`):
+        `u_route_opt_lex_safe` with the variant-U evaluator supplying the
+        per-vehicle objective. The caller still applies the whole-route lex
+        guard as a final safety net; this only produces the candidate.
+
+        Why not the plain deadhead-greedy U kernels (`intra_route_opt` +
+        `inter_route_opt`, variant='U'): measured on data/test_bm/small.npz
+        under the production config, that pass reduced total deadhead on
+        100/100 instances (mean -11.94) yet the caller's guard rejected it
+        100/100 times because it always bundled at least one T1-worsening
+        move (T1 worse on 100/100, often 2-3x) with the harmless ones. The
+        lex-safe search accepts/rejects each MOVE on the full (T1, T2, T3)
+        tuple instead, so T1 is monotone non-increasing across the pass by
+        construction and the T1-neutral T2/T3 headroom becomes reachable.
+
+        Mechanism ceiling (by construction): this reorders/relocates arcs
+        within (and between) the trips the P decode already produced -- it
+        cannot discover a fundamentally different vehicle-arc assignment that
+        only a genuinely U-aware decode would reach.
+
+        Returns (T_vec, new_vehicles), or (None, None) when there is nothing
+        to optimize.
+        """
+        from utils.local_search import u_route_opt_lex_safe
+
+        trips, owner = [], []
+        for m, veh_trips in enumerate(vehicles):
+            for trip in veh_trips:
+                trips.append(np.concatenate([[0], trip, [0]]).astype(np.int64))
+                owner.append(m)
+        if not trips:
+            return None, None
+
+        self._u_evaluator._cache_td(td0)
+
+        def veh_score(veh_trips):
+            # ONE vehicle's per-class max completion times; the elementwise
+            # max over vehicles equals scoring the whole solution at once.
+            return self._u_evaluator._completion_times([veh_trips], td0)
+
+        new_trips = u_route_opt_lex_safe(trips, owner, M, adj, demands,
+                                         veh_score, capacity=1.0)
         new_vehicles = [[] for _ in range(M)]
-        for m, route in zip(owner, trips):
+        for m, route in zip(owner, new_trips):
             trip = route[1:-1]
             if len(trip):
                 new_vehicles[m].append(trip)
-        return self.evaluator._completion_times(new_vehicles, td0), new_vehicles
+        return self._u_evaluator._completion_times(new_vehicles, td0), new_vehicles
 
     def _oracle_forced_prefix(self, td0, N1, adj, clss, demands, M):
         """Compute the oracle's forced class-1 opening-prefix flat actions,
@@ -349,9 +454,39 @@ class RLHybHCARP(RLHCARP):
         reward, actions, n_forced = self._decode_pool(num_sample, forced)
         B = reward.shape[0]
 
+        # ---- greedy anchor row ---------------------------------------------
+        # One deterministic greedy rollout appended to the pool (and always
+        # shortlisted), so the funnel is provably no worse than a plain greedy
+        # decode. Rationale: the pool is otherwise all SAMPLED rollouts, and a
+        # policy whose sampled distribution is flat on OOD instances can have
+        # every one of its samples decode worse than its own greedy argmax --
+        # measured for the variant-U checkpoint on osm_test_small: greedy
+        # T1=5.97 vs min-of-400-samples T1=7.00, making the un-anchored funnel
+        # lex-worse than greedy on 37/48 diagnostic instances. This mirrors
+        # what the oracle head already gives variant P (its forced lane
+        # carries a greedy-completion row). Decoded AFTER the sampling pool
+        # and via argmax (no RNG consumed), so the sampled rows' RNG stream --
+        # and `_decode_pool`'s byte-identical-to-plain-policy guarantee -- are
+        # untouched.
+        with torch.inference_mode():
+            g_out = self.policy(batchify(self.td, 1), env=self.env,
+                                decode_type='greedy')
+        g_reward = g_out["reward"].cpu().numpy().astype(np.float64)
+        g_actions = g_out["actions"].cpu().numpy().astype(np.int64)
+        S = max(actions.shape[1], g_actions.shape[1])
+
+        def _pad(a):
+            # flat action 0 = (vehicle 0, depot): a no-op trip separator for
+            # `routes_from_joint_actions`, safe as right-padding.
+            return np.pad(a, ((0, 0), (0, S - a.shape[1])))
+
+        reward = np.concatenate([reward, g_reward], axis=0)
+        actions = np.concatenate([_pad(actions), _pad(g_actions)], axis=0)
+
         # ---- ONE shortlist over the combined pool --------------------------
         keep = set(int(i) for i in
                    eps_lex_select(reward, eps=self.eps, shortlist=self.shortlist))
+        keep.add(B)                            # greedy anchor: always a candidate
         if self.topk_t1 > 0:
             # T1-only hedge lane, free rows only: forced rows all share one
             # T1, so ranking them by T1 is meaningless and would just crowd
@@ -378,10 +513,20 @@ class RLHybHCARP(RLHCARP):
         self.evaluator._cache_td(td0)
 
         # ---- ONE local-search funnel + ONE final comparator ----------------
+        # Every shortlisted candidate -- pre-LS included -- is scored through
+        # the same float64 `SolutionEvaluator._completion_times` local search
+        # uses and the final answer is reported in. Scoring pre-LS candidates
+        # with the decode-time fp32 env reward instead (as before) made the
+        # lex guard and `final_band_pick` compare apples to oranges: the env
+        # scores a vehicle's trips in decode order while the evaluator
+        # class-sorts them, so a candidate could win selection on its env
+        # reward yet re-evaluate lex-worse than a candidate it beat (measured
+        # under variant U: 8/48 diagnostic instances still came out worse
+        # than the greedy anchor that was sitting in the same pool).
         cands = []                                  # (T_vec, vehicles)
         for idx in keep:
-            pre_T = np.asarray(reward[idx], dtype=np.float64)
             pre_vehicles = self.evaluator.routes_from_joint_actions(actions[idx], M, N1)
+            pre_T = self.evaluator._completion_times(pre_vehicles, td0)
             ls_T, ls_vehicles = self._local_search_one(
                 pre_vehicles, td0, M, adj, clss, demands, classes)
             # local search optimizes total deadhead (a proxy for T_k), so only
@@ -393,12 +538,31 @@ class RLHybHCARP(RLHCARP):
         Ts = np.stack([c[0] for c in cands])
         j = final_band_pick(Ts, self.oracle_union_eps2)
 
-        # Re-evaluate the winner at float64 (same evaluator path local search
-        # uses) so the returned T-vector -- and the T1 optimality guarantee
-        # when the winner came from the forced lane -- hold at full
+        # cands[j][0] is already the winner's float64 evaluator score (the
+        # same basis every candidate was compared on), so the T1 optimality
+        # guarantee when the winner came from the forced lane holds at full
         # precision, not just the decode-time fp32 reward's.
-        best_T = self.evaluator._completion_times(cands[j][1], td0)
-        return np.asarray(best_T, dtype=np.float64)[None, :]           # (1, P)
+        best_T = np.asarray(cands[j][0], dtype=np.float64)
+
+        # ---- optional zero-training U upgrade (see __init__) ---------------
+        # Runs AFTER the funnel's final pick, on the winner only. Deterministic
+        # (no RNG), guarded (kept only if lex-better), and skipped entirely
+        # when the flag is off -- the default path above is untouched.
+        if self.upgrade_to_u:
+            up_T, _ = self._upgrade_winner_to_u(
+                cands[j][1], td0, M, adj, clss, demands)
+            fired = (up_T is not None
+                     and tuple(up_T.tolist()) < tuple(best_T.tolist()))
+            self.last_upgrade_info = {
+                "fired": fired,
+                "pre_T": best_T.copy(),
+                "post_T": (np.asarray(up_T, dtype=np.float64)
+                           if fired else best_T.copy()),
+            }
+            if fired:
+                best_T = np.asarray(up_T, dtype=np.float64)
+
+        return best_T[None, :]                                         # (1, P)
 
 
 def parse_args():
@@ -433,6 +597,12 @@ def parse_args():
                              'not exposed on the CLI -- historical sweeps never varied '
                              'them from RLHybHCARP\'s defaults; construct RLHybHCARP '
                              'directly if you need to.')
+    parser.add_argument('--upgrade_to_u', action='store_true',
+                        help='hybrid mode: after the funnel picks its final winner, '
+                             'run ONE unrestricted (variant-U) local-search pass on '
+                             'it and keep the result only if lex-better -- a zero-'
+                             'training variant-U answer from a variant-P decode '
+                             '(default: off, no behavior change)')
     return parser.parse_args()
 
 
@@ -538,7 +708,8 @@ if __name__ == "__main__":
         if args.hybrid:
             al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
                             eps=args.eps, topk_t1=args.topk_t1,
-                            oracle_head=args.oracle_head)
+                            oracle_head=args.oracle_head,
+                            upgrade_to_u=args.upgrade_to_u)
         else:
             al = RLHCARP(ckpt_path, args.variant)
         for f in files:

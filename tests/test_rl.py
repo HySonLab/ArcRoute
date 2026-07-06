@@ -468,5 +468,100 @@ class TestOracleHeadRegression(unittest.TestCase):
                         f"union T1 {out[0, 0]} != oracle {res['T1']}")
 
 
+class TestUpgradeToU(unittest.TestCase):
+    """`upgrade_to_u`: the zero-training post-processing pass that runs the
+    unrestricted (variant-U) local-search kernels on the funnel's FINAL
+    variant-P winner and keeps the result only if lex-better.
+
+    Pins down the two contract points:
+      1. default-off is byte-identical to before -- the upgrade code is never
+         entered, so the flag-off output on a fixed seed equals the output of
+         a solver constructed without the flag at all;
+      2. the guard never lex-worsens -- on the same seed, the flag-on output
+         is lex<= the flag-off output, and `last_upgrade_info` faithfully
+         records whether the pass fired.
+    """
+    SEED = 123
+    K = 16
+
+    def test_default_off_and_code_not_reached(self):
+        al = _make_hyb(shortlist=4, eps=0.01)
+        self.assertFalse(al.upgrade_to_u)
+        with mock.patch.object(al, "_upgrade_winner_to_u",
+                               side_effect=AssertionError("must not run")) as m:
+            torch.manual_seed(self.SEED)
+            al(num_sample=self.K)
+        m.assert_not_called()
+        self.assertIsNone(al.last_upgrade_info)
+
+    def test_default_off_output_identical(self):
+        """Flag off (default) vs flag off explicitly: same seed -> byte-equal
+        output (there is no code path difference at all)."""
+        al0 = _make_hyb(shortlist=4, eps=0.01)
+        torch.manual_seed(self.SEED)
+        out0 = al0(num_sample=self.K)
+
+        al1 = _make_hyb(shortlist=4, eps=0.01, upgrade_to_u=False)
+        torch.manual_seed(self.SEED)
+        out1 = al1(num_sample=self.K)
+        self.assertTrue(np.array_equal(out0, out1))
+
+    def test_guard_never_lex_worsens(self):
+        """Same seed, flag on vs flag off: the upgrade pass consumes no RNG
+        (deterministic local search after the final pick), so the two runs
+        share the same pure-P winner -- the flag-on output must be lex<= it.
+        `last_upgrade_info` must agree: pre_T == the flag-off output, post_T
+        == the flag-on output, and `fired` iff they differ."""
+        al_off = _make_hyb(shortlist=4, eps=0.01)
+        torch.manual_seed(self.SEED)
+        out_off = al_off(num_sample=self.K)[0]
+
+        al_on = _make_hyb(shortlist=4, eps=0.01, upgrade_to_u=True)
+        torch.manual_seed(self.SEED)
+        out_on = al_on(num_sample=self.K)[0]
+
+        self.assertLessEqual(tuple(out_on.tolist()), tuple(out_off.tolist()))
+        info = al_on.last_upgrade_info
+        self.assertIsNotNone(info)
+        self.assertTrue(np.array_equal(info["pre_T"], out_off))
+        self.assertTrue(np.array_equal(info["post_T"], out_on))
+        self.assertEqual(info["fired"],
+                         tuple(out_on.tolist()) < tuple(out_off.tolist()))
+
+    def test_upgrade_kept_only_if_lex_better(self):
+        """Force the upgrade candidate to be lex-WORSE than the winner: the
+        guard must reject it (output = the pure flag-off winner, fired=False).
+        The reference comes from a flag-off run: the real (lex-safe) upgrade
+        pass can genuinely fire on this instance, so a flag-on run's output
+        is not the pure winner the mocked-away pass should fall back to."""
+        al_off = _make_hyb(shortlist=4, eps=0.01)
+        torch.manual_seed(self.SEED)
+        out_ref = al_off(num_sample=self.K)[0]
+
+        al = _make_hyb(shortlist=4, eps=0.01, upgrade_to_u=True)
+        worse = out_ref + 1.0
+        with mock.patch.object(al, "_upgrade_winner_to_u",
+                               return_value=(worse, None)):
+            torch.manual_seed(self.SEED)
+            out = al(num_sample=self.K)[0]
+        self.assertTrue(np.array_equal(out, out_ref))
+        self.assertFalse(al.last_upgrade_info["fired"])
+
+    def test_upgrade_kept_when_lex_better(self):
+        """Force a lex-better upgrade candidate: it must be returned and
+        recorded as fired."""
+        al = _make_hyb(shortlist=4, eps=0.01, upgrade_to_u=True)
+        torch.manual_seed(self.SEED)
+        out_ref = al(num_sample=self.K)[0]
+
+        better = out_ref - 0.5
+        with mock.patch.object(al, "_upgrade_winner_to_u",
+                               return_value=(better, None)):
+            torch.manual_seed(self.SEED)
+            out = al(num_sample=self.K)[0]
+        self.assertTrue(np.allclose(out, better))
+        self.assertTrue(al.last_upgrade_info["fired"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
