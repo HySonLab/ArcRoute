@@ -186,50 +186,63 @@ batch of B instances (curriculum "small": 20_30/20_40, M random in {2,3,5,7,10})
 
 ### 2.3 Inference-time pipeline (current best config)
 
-Checkpoint `epoch=159.ckpt`, `HYBRID=1 NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01
-TOPK_T1=100 ORACLE_HEAD=1`.
+Checkpoint `epoch=159.ckpt`, `HYBRID=1 NUM_SAMPLE=150 SHORTLIST=25 EPS=0.01
+TOPK_T1=100 ORACLE_HEAD=1 ORACLE_K=3` (P3, §19 — `NUM_SAMPLE`/`ORACLE_K`
+defaults changed from the pre-P3 `NUM_SAMPLE=400` single-candidate config;
+see §19 for why).
 
 `src/solvers/rl.py::RLHybHCARP`. Same encoder/decoder as §2.2 (weights
 frozen, `eval()` mode) — everything below is inference-time search wrapped
-around it, none of it changes what the policy learned. As of §18, this is
-**one merged decode over one candidate pool**, not two separately-decoded
-arms joined afterward:
+around it, none of it changes what the policy learned. As of §18, one
+prefix candidate's funnel is **one merged decode over one candidate pool**,
+not two separately-decoded arms joined afterward; as of §19, that whole
+funnel runs once per K class-1 prefix candidates and the lex-best of the K
+outputs is kept:
 
 ```
 .npz instance
       │
       ▼  encoder (§2.1), once per instance
       │
-      ▼  _oracle_forced_prefix (variant P only, §10):
-      │    t1_oracle_argmin (`solvers/oracle.py`, Held-Karp + partition DP
-      │    over class-1 arcs, n1<=max_n1=16) or, above that, the
-      │    t1_heuristic_argmin fallback (§15) → exact-or-near-optimal T1 +
-      │    witnessing per-vehicle class-1 prefix. Guard (n1>max_n1 with the
-      │    heuristic off, or no capacity-feasible partition) → None: no
-      │    prefix is forced, the pool below is 100% free rows (§17/§18).
+      ▼  _oracle_forced_prefixes (variant P only, §19; superseded §10):
+      │    t1_heuristic_candidates (`solvers/oracle.py`) — t1_heuristic_argmin
+      │    under oracle_k=3 different seeds, deduped by resulting partition
+      │    → up to 3 candidate (T1, per-vehicle class-1 prefix) pairs. No
+      │    n1 guard/branch any more — one heuristic path at every n1 (§19
+      │    replaced the exact Held-Karp DP §10 described here). Every
+      │    seed capacity-infeasible (rare) → `[None]`: no prefix is forced,
+      │    the pool below is 100% free rows for that (only) candidate.
       │
-      ▼  _decode_pool(num_free=400, forced): ONE batched §2.1 decode loop,
-      │  B = 400 + (1 + oracle_r=64) rows if a prefix was found, else B=400:
-      │    rows[0:400]      free samples, decode_type='sampling'
-      │    row 400          forced class-1 prefix, greedy completion
-      │    rows[401:465]    forced class-1 prefix, sampled completion
-      │  forced rows get their prefix action overridden onto the batch's
-      │  action tensor each step (env.step is row-parallel); free rows and
-      │  forced-row completions decode normally. `forced=None` → this whole
-      │  step degenerates to calling `policy.forward` directly (byte-
-      │  identical rollout to the pre-oracle-head/pre-P1 default path).
+      ▼  for EACH candidate prefix (or the one `None` case), run the SAME
+      │  single-prefix funnel (`_run_funnel_once`, unchanged from §18):
       │
-      ▼  ONE shortlist over the combined pool:
-      │    eps_lex_select(eps=0.01, shortlist=25)         [near-best-T1, any row]
-      │    ∪ top-100-by-raw-T1 among FREE rows only        [topk_t1=100, T1 hedge]
-      │    ∪ {greedy forced row} ∪ best-8-by-(T2,T3) among forced rows
-      │      (oracle_shortlist=8, only when a prefix was forced — all forced
-      │       rows share one T1, so this is a pure (T2,T3) ranking)
+      │    _decode_pool(num_free=150, forced): ONE batched §2.1 decode loop,
+      │    │  B = 150 + (1 + oracle_r=64) rows if a prefix was found, else
+      │    │  B=150:
+      │    │    rows[0:150]      free samples, decode_type='sampling'
+      │    │    row 150          forced class-1 prefix, greedy completion
+      │    │    rows[151:215]    forced class-1 prefix, sampled completion
+      │    │  forced rows get their prefix action overridden onto the batch's
+      │    │  action tensor each step (env.step is row-parallel); free rows
+      │    │  and forced-row completions decode normally. `forced=None` →
+      │    │  this whole step degenerates to calling `policy.forward`
+      │    │  directly (byte-identical rollout to the pre-oracle-head/pre-P1
+      │    │  default path).
+      │    │
+      │    ▼  ONE shortlist over this candidate's pool:
+      │    │    eps_lex_select(eps=0.01, shortlist=25)     [near-best-T1, any row]
+      │    │    ∪ top-100-by-raw-T1 among FREE rows only    [topk_t1=100, T1 hedge]
+      │    │    ∪ {greedy forced row} ∪ best-8-by-(T2,T3) among forced rows
+      │    │      (oracle_shortlist=8, only when a prefix was forced — all
+      │    │       forced rows share one T1, so this is a pure (T2,T3) ranking)
+      │    │
+      │    ▼  local search (intra/inter route) per shortlisted candidate,
+      │    │  keep only if strictly lex-better than pre-LS
+      │    ▼  final_band_pick(eps2=0.02): T1 tie-band (tie_tol=1e-6) → among
+      │       those, T2 eps-band → min T3.  =>  this candidate's (T1,T2,T3)
       │
-      ▼  local search (intra/inter route) per shortlisted candidate, keep
-      │  only if strictly lex-better than pre-LS
-      ▼  final_band_pick(eps2=0.02): T1 tie-band (tie_tol=1e-6) → among
-      │  those, T2 eps-band → min T3.  =>  winner (T1,T2,T3) + route
+      ▼  lex-best across the (up to 3) candidates' funnel outputs — same
+      │  take-the-argmax-over-arms pattern as `ls_lex_guarded`/`upgrade_to_u`
       ▼  re-evaluate the winner via the float64 SolutionEvaluator (same
       │  precision path local search already uses — the T1 guarantee holds
       │  at full precision, not just decode-time float32)
@@ -237,14 +250,19 @@ arms joined afterward:
   output: (T1, T2, T3) + winning route
 ```
 
-Summary: one encode, one decode over a pool that mixes free rollouts with
-(when applicable) oracle-forced-prefix rollouts, one shortlist, one local-
-search funnel, one selection rule. Before §18 this was two separately-
-decoded arms (a "pool funnel" and an "oracle head") merged afterward by a
-bespoke union comparator — functionally equivalent (validated on 820 real
-instances, §18.2), but the merged-pool version is what's in production now.
-Everything past the encoder/decoder is inference-time compute, not learned
-weights — §2.2's training never sees any of it.
+Summary: one encode, K independent decodes (one per class-1 prefix
+candidate, K=3 default), each a pool that mixes free rollouts with
+oracle-forced-prefix rollouts through one shortlist + one local-search
+funnel + one selection rule, then one lex-best-of-K pick. Before §18 a
+single candidate's funnel was two separately-decoded arms merged by a
+bespoke union comparator (functionally equivalent to today's single-prefix
+funnel, §18.2). Before §19 there was only one class-1 candidate, produced
+by an exact DP below `n1<=16` (§10) or the same heuristic above it (§15) —
+§19 replaced that whole dispatch with K heuristic-seeded candidates and a
+lex-best pick, at the cost of K independent encoder passes (not yet
+batched into one, §19.3). Everything past the encoder/decoder is
+inference-time compute, not learned weights — §2.2's training never sees
+any of it.
 
 ## 3. Policy architecture
 
@@ -954,6 +972,17 @@ guarantee.
 
 ## 10. "P2" — an exact T1 oracle closes the remaining gap to literal 100%
 
+*HISTORICAL — superseded by P3 (§19). The exact Held-Karp + partition DP
+this section describes (`t1_oracle_argmin`) was removed from
+`src/solvers/oracle.py` in P3: a due-diligence check (§19.1) found the
+heuristic fallback this section calls "P1.5" (§15) already matched this
+exact DP's optimum on 30/30 real n1<=16 instances, so the DP's "literal
+100%" guarantee below is no longer backed by exact-DP code — it is backed
+by that empirical match instead. Kept as the design record for WHY an exact
+class-1 solve was worth building in the first place (§10.1's argument and
+§10.3's inverted-risk finding are still the right way to think about *why*
+forcing a good class-1 prefix helps T2/T3, independent of exact-vs-heuristic).*
+
 ### 10.1 Why P1 still isn't 100%, and what makes 100% possible at all
 
 P1's 94.89% is fundamentally a sampling result: K=400 rollouts almost always
@@ -1044,18 +1073,22 @@ average.
 
 - **Variant P only.** The oracle's forced-opening-prefix premise depends on
   P's linear precedence; `RLHybHCARP._oracle_head_arm` (post-§18:
-  `_oracle_forced_prefix`) explicitly declines (returns `None`, falls back
-  to the free pool unchanged) when `self.variant != 'P'`. `oracle_head`
-  has no effect for variant U and should stay off there.
-- **Applicability guard, not an assumption.** `t1_oracle_argmin` requires
-  `n1 <= max_n1` (default 16; the DP is `O(2^n1 · n1²)`) and a
-  capacity-feasible partition to exist; either failing returns `T1 = inf`
-  and the caller falls back to the pool arm with no crash. This benchmark's
-  actual max `n1` is 10 — comfortably inside the guard — but the guard is
-  enforced, not assumed, for future data with larger class-1 counts.
-  Scaling to noticeably larger `n1` would need a different, likely
-  approximate, method for the class-1 subproblem — the guard is exactly
-  the tripwire for when that becomes necessary.
+  `_oracle_forced_prefix`; post-§19: `_oracle_forced_prefixes`, plural)
+  explicitly declines (returns `None`/`[None]`, falls back to the free pool
+  unchanged) when `self.variant != 'P'`. `oracle_head` has no effect for
+  variant U and should stay off there. Unchanged by §19.
+- **Applicability guard, not an assumption — AS OF P2/§10-15; removed in
+  P3/§19.** `t1_oracle_argmin` required `n1 <= max_n1` (default 16; the DP
+  was `O(2^n1 · n1²)`) and a capacity-feasible partition to exist; either
+  failing returned `T1 = inf` and the caller fell back to the pool arm with
+  no crash. This benchmark's actual max `n1` was 10 at the time — comfortably
+  inside the guard — but the guard being enforced rather than assumed is
+  exactly what made §19's later finding checkable: with the DP gone, there
+  is no more `n1` branch or guard at all, just `t1_heuristic_argmin`
+  unconditionally (§19) — the tripwire this bullet anticipated ("scaling to
+  larger n1 would need a different method for the class-1 subproblem") is
+  what happened, just resolved by widening the heuristic's role rather than
+  building a second exact method.
 - **Backward compatible.** `oracle_head` defaults to `False`; every
   existing config, script, and prior benchmark row is unaffected. Proven by
   `tests/test_rl.py::TestOracleHeadRegression.test_disabled_is_byte_identical_to_p1`
@@ -1325,7 +1358,10 @@ here; this doesn't block any decision above since both are clearly
 load-bearing either way.) `oracle_tiebreak` (§10) was also kept as-is —
 its own P2 investigation already measured a small, real, positive
 contribution (+1.4pp T2-not-worse, +1.5pp Pareto) at negligible cost; it
-was reclassified as "hardcode on" (§14.2) rather than removed.
+was reclassified as "hardcode on" (§14.2) rather than removed. (P3/§19
+update: `oracle_tiebreak` and the exact DP it tie-broke within were later
+removed entirely — superseded by K-seed hedging producing several candidate
+class-1 prefixes instead of exactly tie-breaking within one.)
 
 ### 14.2 What was cut (all verified before removal, all behavior-neutral or explicitly signed off)
 
@@ -1368,15 +1404,18 @@ was reclassified as "hardcode on" (§14.2) rather than removed.
   `MultiHeadAttention`) down to `encoder.py`.
 - **CLI/config surface collapsed**: `oracle_r`, `oracle_shortlist`,
   `oracle_shortlist_eps`, `oracle_union_eps2`, `oracle_tiebreak` (of these,
-  `oracle_shortlist_eps` was later removed entirely in §18.3) were never
-  varied from their defaults in any historical benchmark row (every row in
-  `logs/status_bm.md` is reproducible from just `{num_sample, eps,
-  shortlist, topk_t1, oracle_head}`) — demoted from CLI flags to
-  constructor-only keyword arguments (still directly testable, e.g.
-  `tests/test_rl.py`'s oracle tests construct `RLHybHCARP`/
-  `t1_oracle_argmin` directly). `--ckpt`/`--cpkt` (two flags for the same
-  path, merged via `ckpt_path = args.ckpt or args.cpkt` regardless of
-  mode) unified to `--ckpt` everywhere, including `scripts/bm.sh`.
+  `oracle_shortlist_eps` was later removed entirely in §18.3, and
+  `oracle_tiebreak` — along with `t1_oracle_argmin` itself — later removed
+  entirely in P3/§19) were never varied from their defaults in any
+  historical benchmark row (every row in `logs/status_bm.md` is reproducible
+  from just `{num_sample, eps, shortlist, topk_t1, oracle_head}`) — demoted
+  from CLI flags to constructor-only keyword arguments (at the time, still
+  directly testable via `tests/test_rl.py`'s oracle tests constructing
+  `RLHybHCARP`/`t1_oracle_argmin` directly; post-§19, `oracle_k` reversed
+  this for the one knob that turned out to matter enough to vary — it's a
+  CLI flag, §19.3). `--ckpt`/`--cpkt` (two flags for the same path, merged
+  via `ckpt_path = args.ckpt or args.cpkt` regardless of mode) unified to
+  `--ckpt` everywhere, including `scripts/bm.sh`.
 
 Net: ~215 lines removed across `src/trainers/grpo.py`,
 `src/solvers/rl.py`, `src/policy/decoder.py`, `src/policy/encoder.py`,
@@ -1387,6 +1426,13 @@ suite green: 213 tests, 0 failures, 7 pre-existing skips; the production
 config re-run end-to-end after the change to confirm no regression).
 
 ## 15. Extending P2 past `max_n1`: a local-search heuristic for `medium`/`large`
+
+*Still current (unlike §10): `t1_heuristic_argmin`, described below, is the
+class-1 solver P3 (§19) kept and made unconditional — only its relationship
+to the (now-removed) exact DP is historical. Read "past `max_n1`" below as
+"above n1=16" in the sense of where this section's original quality-gap
+measurements were taken, not as a currently-enforced guard — P3 removed the
+guard/branch, this heuristic now runs at every n1.*
 
 P2 (§10) only helps where the exact T1 oracle is computationally applicable
 (`n1 <= max_n1`, default 16 — comfortably covers `small`, roughly half of
@@ -1400,12 +1446,15 @@ local-search heuristic, scoped to exactly the same subproblem.
 
 ### 15.1 Design (`src/solvers/oracle.py::t1_heuristic_argmin`)
 
-Same interface/contract as `t1_oracle_argmin` (drop-in: same `T1`/`parts`
-return shape, `inf`/`None` on infeasibility) but `O(restarts * n1^2)`-ish
-per local-search sweep bounded by a wall-clock `time_budget`, not
-`O(2^n1 * n1^2)` — runtime stays under ~1s across the whole tested n1
-range (10-35) regardless of problem size, trading the exact guarantee for
-an empirically-measured optimality gap instead.
+Returns the same `T1`/`parts` shape as the removed exact DP did (`inf`/`None`
+on infeasibility — originally specced as a drop-in for `t1_oracle_argmin`,
+which P3/§19 later deleted, leaving this as the only class-1 solver rather
+than a fallback for one). `O(restarts * n1^2)`-ish per local-search sweep
+bounded by a wall-clock `time_budget`, not the old DP's `O(2^n1 * n1^2)` —
+runtime stays under ~1s across the whole tested n1 range (10-35) regardless
+of problem size, trading an exact guarantee for an empirically-measured
+optimality gap instead (§19.1 re-measured this gap at n1<=16 specifically,
+after the DP was gone: 0.000% across 30 real instances).
 
 - **Construction**: farthest-point-dispersion seeding (one arc per
   vehicle, maximizing min distance to already-chosen seeds) + greedy
@@ -1471,30 +1520,34 @@ arms, within tie-tolerance, in every case).
 
 ### 15.4 Production wiring and the resulting guarantee at scale
 
-`RLHybHCARP` (`src/solvers/rl.py`) gains `oracle_use_heuristic` (default
-`True`), `oracle_heuristic_time_budget` (default 0.5s), and
+*Superseded by P3/§19 — kept as the record of the P2-era dispatch this
+replaced.* `RLHybHCARP` gained `oracle_use_heuristic` (default `True`),
+`oracle_heuristic_time_budget` (default 0.5s), and
 `oracle_heuristic_intra_cutoff` (default 25) constructor parameters — not
-exposed on the CLI (§14's "don't add a flag for a knob nothing varies"
-philosophy; construct `RLHybHCARP` directly if you need to change them).
-`_oracle_head_arm` (post-§18: `_oracle_forced_prefix`) computes `n1` once
-and dispatches: `n1 <= oracle_max_n1` → exact DP (unchanged code path, so
-the shipped small-curriculum benchmark is byte-identical to before this
-change); `n1 > oracle_max_n1` and `oracle_use_heuristic` → the heuristic;
-otherwise (or if `oracle_use_heuristic=False`) → not applicable, the free
-pool passes through unchanged, exactly as before.
+exposed on the CLI at the time (§14's "don't add a flag for a knob nothing
+varies" philosophy). `_oracle_head_arm` (post-§18: `_oracle_forced_prefix`)
+computed `n1` once and dispatched: `n1 <= oracle_max_n1` → exact DP;
+`n1 > oracle_max_n1` and `oracle_use_heuristic` → the heuristic; otherwise
+(or if `oracle_use_heuristic=False`) → not applicable, the free pool passed
+through unchanged. **This entire dispatch no longer exists in the code**
+(§19): `oracle_max_n1`/`oracle_use_heuristic`/`oracle_heuristic_intra_cutoff`
+as an n1-branch condition are gone, `_oracle_forced_prefix` is
+`_oracle_forced_prefixes` (plural, K candidates), and the heuristic runs
+unconditionally at every n1. `oracle_heuristic_time_budget`/
+`oracle_heuristic_intra_cutoff` survive as plain forwarded tuning knobs for
+the (now sole) heuristic call, not as a guard threshold.
 
-**What changes about the system's "T1 guarantee" at `medium`/`large`
-scale**: at `small` (and the ~half of `medium` with n1 ≤ 16), the
-guarantee is unchanged — literal 100% T1-not-worse-than-ILS, exact. Above
-that, it degrades gracefully (never regresses below "no oracle-head arm
-at all", per §15.3) to **"empirically within roughly 0.2-6% of the best
-solution found, in well under a second"** rather than "provably optimal"
-— an honest, measured claim, not the same mathematical guarantee, but
-still a real improvement over having no head arm at all for that
-instance range. A full benchmark run on real `medium`/`large` curriculum
-data (analogous to `logs/status_bm.md`'s small-curriculum rows) has not
-yet been done — this section documents the component-level validation
-that makes such a run possible, not a new end-to-end benchmark result.
+**What the system's "T1 guarantee" was claimed to be at `medium`/`large`
+scale, at the time**: at `small` (and the ~half of `medium` with n1 ≤ 16),
+literal 100% T1-not-worse-than-ILS, exact (backed by the exact DP). Above
+that, "empirically within roughly 0.2-6% of the best solution found, in
+well under a second" rather than provably optimal. §19.1 re-ran the n1<=16
+comparison after deleting the DP and found the heuristic alone already hit
+0.000% mean gap on 30 real instances at that scale — so in practice the
+"exact" and "empirical" regimes described here turned out to coincide
+closely enough that removing the DP branch cost nothing measurable, which
+is the finding that made deleting this dispatch (rather than keeping it
+as a belt-and-suspenders exact path) an acceptable simplification.
 
 ## 16. Investigated and rejected (4th and final round): staged imitate-then-RL-cleanup
 
@@ -1606,12 +1659,15 @@ much narrower claim than stated; false as a general-HDCARP claim.**
   benchmark result."*
 
 **Correct framing going forward**: `t1_heuristic_argmin` is the best
-*currently-implemented* answer to the class-1 sub-problem once n1 exceeds
-the exact oracle's guard (16) — a real, useful, cheap fallback — but it is
-neither a general HDCARP solver nor validated (only "applicable") at
-`large` scale. Don't cite it as "solving HDCARP" or as scale-proven beyond
-n1≈35 without first running the still-outstanding end-to-end
-`medium`/`large` benchmark (§15.4).
+*currently-implemented* answer to the class-1 sub-problem — a real, useful,
+cheap solver — but it is neither a general HDCARP solver nor validated at
+`large` scale beyond the K-seed-hedged spot checks in §19. Don't cite it as
+"solving HDCARP" or as scale-proven beyond n1≈35 without first running the
+still-outstanding end-to-end `medium`/`large` benchmark (§15.4). (Written
+when this was a fallback beyond the exact oracle's n1<=16 guard — P3/§19
+later removed that guard entirely and made this the only class-1 solver at
+every n1, which sharpens rather than weakens the caution here: there is no
+exact fallback left to lean on at any scale, only K-seed hedging, §19.)
 
 ## 18. Unifying the pool arm and oracle-head arm into one single-pool pipeline
 
@@ -1695,3 +1751,132 @@ plain policy call when no prefix is forced (proven directly), while the
 strict-lex argmin (no longer asserted byte-for-byte; validated empirically
 instead, per §18.2) — full suite (`uv run python -m unittest discover -s
 tests -p "test_*.py"`) passes, 219 tests, no regressions.
+
+## 19. "P3" — deleting the exact class-1 DP for K-seed heuristic hedging
+
+Production change (commit `3e1ee4e`): removed the exact Held-Karp +
+partition DP (`t1_oracle_argmin`, §10) from `src/solvers/oracle.py`
+entirely, in favor of one unconditional heuristic path
+(`t1_heuristic_argmin`, §15, now runs at every n1 — no more
+`n1 <= max_n1` branch) plus K independently-seeded candidates
+(`t1_heuristic_candidates`) fed through K full funnel runs in
+`RLHybHCARP`, lex-best kept. Goal: a clean, single-code-path design for the
+paper writeup, aimed at `large`-scale instances where the exact DP was
+never applicable anyway (§10.4/§17: `large`'s mean/max n1 is 30/35, the DP's
+guard was 16).
+
+### 19.1 Due diligence before deleting the DP
+
+Before removing a mechanism that used to carry a literal-100%-T1 guarantee
+(§10.3) below n1<=16, checked what the heuristic alone gives up in exactly
+that regime: on 30 real `data/test_bm/medium.npz` instances with n1<=16, a
+single `t1_heuristic_argmin` call (default `time_budget=0.5s`) matched the
+former exact optimum EXACTLY on 30/30 (0.000% mean/median/max gap); K=3/5/10
+seed hedging found nothing further to close — there was no gap left. This
+is an empirical finding on one benchmark, not a formal exactness proof (the
+heuristic has none), but it means the refactor's measured T1 cost in the
+regime the DP used to exclusively cover is zero. Above n1=16, nothing
+changes — `t1_heuristic_argmin` was already the only option there
+(§15.2's degradation curve, ~1.7%/2.7%/5.6% mean gap at n1~25/31/35, is
+unaffected by this refactor).
+
+### 19.2 K-candidate design
+
+`t1_heuristic_candidates(adj, svc, clss, demands, M, K, seed_base=0,
+**kwargs)`: the simplest possible generator per explicit instruction — K
+independent `t1_heuristic_argmin` calls under seeds `seed_base..seed_base+
+K-1`, deduped by ACTUAL resulting partition (not T1 value alone — two
+different partitions can tie on T1, so a T1-only dedup would silently
+undercount diversity), sorted best-T1-first. No changes to the heuristic's
+own search logic — a thin wrapper.
+
+`RLHybHCARP._oracle_forced_prefixes` (was `_oracle_forced_prefix`, singular)
+calls this and returns a list of forced-action arrays (`[None]` when not
+applicable — variant U, `oracle_head=False`, or every seed capacity-
+infeasible). `__call__` runs the *existing, unchanged* single-prefix funnel
+(`_run_funnel_once`, extracted verbatim from the old `__call__` body) once
+per candidate, then takes the lex-best `(T1,T2,T3)` across all K funnel
+outputs — `min(results, key=lambda r: tuple(r[0].tolist()))`, the same
+take-the-argmax-over-arms pattern as `ls_lex_guarded`/`upgrade_to_u`/ACO's
+P-anchor arm, one more dimension (K prefixes) instead of a fixed arm set.
+`oracle_k=1` reproduces the single-candidate funnel exactly (same seed=0
+heuristic call the old default path made) — the funnel mechanics
+themselves are a strict generalization, not a behavior change; the actual
+behavior change is that class-1 candidates now always come from the
+heuristic, which K-candidate hedging exists to compensate for.
+`upgrade_to_u` (§ upgrade-to-U note in RLHybHCARP's docstring) still runs
+once, after the K-way pick, on the overall winner only.
+
+### 19.3 Why K over "just widen num_sample": measured, not assumed
+
+Tested (K, num_sample-per-candidate) pairs at matched total sample budget
+on real instances (`curriculum_medium/epoch=246.ckpt`, 5-instance probes,
+`data/test_bm`), and specifically isolated whether a T1 gain comes from
+prefix DIVERSITY or just from more free samples:
+
+| Config | large.npz T1/T2/T3 | time/inst |
+|---|---|---|
+| K=1, ns=400 (old default) | 13.428/30.407/47.140 | 1.57s |
+| K=1, ns=600 (more samples, same 1 prefix) | 13.428/30.610/46.821 | 1.55s |
+| K=3, ns=200 (~1.5x budget, more prefixes) | **13.197/29.757/46.475** | 4.39s |
+| K=3, ns=133 (strict-matched ~400 total) | 13.197/30.296/48.285 | 4.39s |
+| K=10, ns=40 (strict-matched ~400 total) | 13.197/29.771/49.998 | 8.89s |
+
+**K=1 at ns=600 does not close the T1 gap** (13.428, unchanged from
+ns=400) — a single wider sample cannot fix a structurally suboptimal
+forced prefix; only a genuinely different prefix can. **K=3 at ns=200
+does** (13.197) and improves T1 AND T2 AND T3 together. Strictly matching
+total sample count down as K grows (K=10 at ns=40) was measured WORSE on
+T2/T3 than the modest-budget-growth setting — cutting each candidate's own
+`num_sample` too aggressively hurts that candidate's funnel more than the
+extra prefixes recover. On `medium.npz` (n1 mostly inside the old exact-DP
+range), K has no T1 effect (already saturated at K=1) and is a small
+T2 win / T3 wash.
+
+Chosen default: **`oracle_k=3`**, with `scripts/bm.sh`'s `NUM_SAMPLE`
+default lowered `400→150` (~1.1x the old total sample count, not a strict
+match — matching too strictly measured worse, §19.3 above). Sequential (not
+batched) K encoder passes mean wall-clock grows faster than the nominal
+sample-budget ratio (large.npz: 1.57s→4.68s at production settings, §19.4)
+— batching K prefixes into one GPU batch is a flagged, not-yet-implemented
+follow-up (correctness prioritized first, per explicit instruction).
+
+### 19.4 Before/after benchmark
+
+Same 15-instance-per-tier sample, same checkpoint (`curriculum_medium/
+epoch=246.ckpt`) for both tiers (avoids confounding with the checkpoint
+swap `large`'s earlier ad-hoc zero-shot check used, §"RL zero-shot
+size-generalization check" in `logs/status_bm.md`):
+
+| | medium T1/T2/T3 | time/inst | large T1/T2/T3 | time/inst |
+|---|---|---|---|---|
+| BEFORE (exact-DP+heuristic, K=1 implicit, ns=400) | 5.972/11.979/19.608 | 0.58s | 12.222/27.371/43.030 | 1.66s |
+| AFTER (heuristic-only, K=3, ns=150) | 5.972/11.955/19.017 | 1.05s | **12.043**/27.073/43.438 | 4.68s |
+
+Zero T1 regressions on either tier (matches §19.1's prediction). Large:
+11/15 lex-wins vs before, 3 ties, 1 loss — a clear net gain from the
+K-candidate hedge recovering T1 headroom the single heuristic call left on
+the table above n1=16. Medium: 5/15 win, 6/15 tie, 4/15 lose — essentially
+neutral, as expected since medium's n1 was mostly already inside the old
+exact-DP range (§19.1). `logs/status_bm.md`'s existing RL rows predate this
+refactor and should be read as pre-P3 history, not the current pipeline's
+behavior.
+
+### 19.5 Scope
+
+- Variant P only, unchanged (§10.4's bullet still applies: `oracle_head`
+  has no effect under variant U).
+- `oracle_k` is a CLI flag (`--oracle_k`, `scripts/bm.sh`'s `ORACLE_K`,
+  default 3) — deliberately NOT following §14's "constructor-only, don't
+  expose a knob nothing varies" precedent, because §19.3 is exactly a case
+  where this knob DOES need varying (matched-budget K=10 measured worse
+  than K=3; the right choice is data/scale-dependent, not a fixed default
+  every caller should inherit blindly).
+- `oracle_r`/`oracle_shortlist` remain per-candidate, constructor-only
+  (unaffected by K — each candidate's funnel still uses the same forced-row
+  sampling depth §18 established).
+- Full test suite green after the change (275 tests incl. new
+  `TestT1HeuristicCandidates` and rewritten oracle/forced-decode/
+  oracle-head-regression tests in `tests/test_rl.py`; the previously-284-
+  test count differs from earlier sections' counts because of accumulated
+  unrelated test additions between P2 and P3, not a P3-specific figure).
