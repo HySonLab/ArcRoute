@@ -1,29 +1,32 @@
-"""Tests for the RL hybrid solver (`solvers.rl`) and the exact T1 oracle
-head (`solvers.oracle`, P2). Also covers the P2->single-pool unification
-(docs/grpo.md §17/§18): the old two-arm design (separate pool-arm and
-oracle-head-arm decodes joined by `oracle_union_pick`) was replaced by one
-batched decode (`_decode_pool`) over a combined free+forced-row pool, with
-one final selection rule (`final_band_pick`).
+"""Tests for the RL hybrid solver (`solvers.rl`) and the heuristic class-1
+opening-prefix generator (`solvers.oracle`, P3). Also covers the P2
+single-pool unification (docs/grpo.md §17/§18) and the P3 K-candidate
+refactor (exact class-1 DP removed; `t1_heuristic_argmin` is now the only
+class-1 solver, hedged by `t1_heuristic_candidates`'s K-seed generation and
+`RLHybHCARP`'s lex-best-of-K-funnels).
 
 Covers:
-  1. TestT1OracleArgmin      — oracle T1 matches brute force; `parts` are
-     internally consistent (coverage, capacity, completion formula);
-     tiebreak preserves T1 and never worsens the secondary; guards
-     (max_n1, capacity-infeasible, no class-1 arcs) return "not applicable".
+  1. TestT1HeuristicArgmin    — heuristic parts are internally consistent
+     (coverage, capacity, completion formula) and never *below* a brute-force
+     reference on tiny instances; guards (capacity-infeasible, no class-1
+     arcs) return "not applicable".
+  1b. TestT1HeuristicCandidates — K-seed generation dedups by actual
+     partition (not T1 value alone), returns >=1 entry even when every seed
+     is infeasible, and reproduces the single-call result at K=1.
   2. TestFinalBandPick       — the single post-unification selection rule
      (replaces the old shortlist_completions/t2_band_pick/oracle_union_pick
      split) reduces to argmin-T1 absent a genuine tie, and to a (T2, T3)
      choice within a T1 tie-band.
-  3. TestForcedDecode        — forcing the oracle's `parts` through
-     `_decode_pool`'s merged batch reproduces the oracle T1 (fp32 tolerance).
+  3. TestForcedDecode        — forcing a heuristic candidate's `parts`
+     through `_decode_pool`'s merged batch reproduces that candidate's own
+     T1 (fp32 tolerance) -- a decode-pipeline consistency check, not a claim
+     that the candidate is globally T1-optimal (P3: no exact oracle exists
+     to compare against any more).
   4. TestOracleHeadRegression — oracle_head=False (default) still delegates
      to the plain policy rollout unchanged (`_decode_pool`'s byte-identical
-     fallback when no prefix is forced); the guard fallback does too;
-     oracle_head=True returns a T1-optimal answer end-to-end. (The final
-     SELECTION step is no longer asserted byte-identical to the frozen pre-
-     unification pipeline -- it intentionally now uses `final_band_pick`
-     instead of strict-lex argmin; see docs/grpo.md §17/§18 for the
-     empirical validation that this doesn't regress quality.)
+     fallback when no prefix is forced); oracle_head=True with oracle_k=1
+     reproduces a single-candidate funnel exactly; oracle_k>1 runs K
+     independent funnels and keeps the lex-best.
 
 Run: uv run python -m unittest tests.test_rl -v
 """
@@ -113,8 +116,15 @@ def _make_hyb(**kw):
     return al
 
 
-# ----------------------------------------------------------------------- 1
-class TestT1OracleArgmin(unittest.TestCase):
+# ------------------------------------------------------------------- 1
+class TestT1HeuristicArgmin(unittest.TestCase):
+    """`t1_heuristic_argmin` -- the ONLY class-1 solver (P3: the former exact
+    DP, `t1_oracle_argmin`, was removed -- see `solvers.oracle`'s module
+    docstring for the due-diligence quality check behind that decision).
+    These tests check it's never *below* a brute-force reference on tiny
+    instances, produces internally consistent (coverage/capacity/completion-
+    formula) parts, and degrades to `inf`/`None` gracefully."""
+
     def setUp(self):
         adj, _, veh, demands, clss, svc, _, _ = _hand_instance()
         self.adj = adj.astype(np.float64)
@@ -124,88 +134,13 @@ class TestT1OracleArgmin(unittest.TestCase):
         self.M = len(veh)
 
     def test_matches_brute_force_and_parts_consistent(self):
-        from solvers.oracle import t1_oracle_argmin
-        for tiebreak in (False, True):
-            res = t1_oracle_argmin(self.adj, self.svc, self.clss, self.dem,
-                                   self.M, tiebreak=tiebreak)
-            brute = _brute_T1(self.adj, self.svc, self.clss, self.dem, self.M)
-            self.assertAlmostEqual(res["T1"], brute, places=9)
-
-            parts = res["parts"]
-            self.assertEqual(len(parts), self.M)
-            # coverage: class-1 arcs exactly once, nothing else
-            served = [a for p in parts for a in p]
-            self.assertEqual(sorted(served),
-                             sorted(np.where(self.clss == 1)[0].tolist()))
-            # capacity feasibility per part
-            for p in parts:
-                if p:
-                    self.assertLessEqual(self.dem[p].sum(), 1.0 + 1e-9)
-            # T1 == max per-part completion under the stated formula
-            comp = max(_completion(self.adj, self.svc, p) for p in parts if p)
-            self.assertAlmostEqual(res["T1"], comp, places=9)
-
-    def test_tiebreak_never_worsens_secondary(self):
-        from solvers.oracle import t1_oracle_argmin
-        res = t1_oracle_argmin(self.adj, self.svc, self.clss, self.dem,
-                               self.M, tiebreak=True)
-        self.assertLessEqual(res["secondary"], res["sec_plain"] + 1e-9)
-        self.assertAlmostEqual(res["tie_gain"],
-                               res["sec_plain"] - res["secondary"], places=9)
-
-    def test_max_n1_guard(self):
-        from solvers.oracle import t1_oracle_argmin
-        res = t1_oracle_argmin(self.adj, self.svc, self.clss, self.dem,
-                               self.M, max_n1=2)          # n1 = 3 > 2
-        self.assertEqual(res["T1"], float("inf"))
-        self.assertIsNone(res["parts"])
-
-    def test_capacity_infeasible_returns_inf(self):
-        from solvers.oracle import t1_oracle_argmin
-        dem = self.dem.copy()
-        dem[1] = 1.5                                       # class-1 arc > cap
-        res = t1_oracle_argmin(self.adj, self.svc, self.clss, dem, self.M)
-        self.assertEqual(res["T1"], float("inf"))
-        self.assertIsNone(res["parts"])
-
-    def test_no_class1_arcs(self):
-        from solvers.oracle import t1_oracle_argmin
-        clss = self.clss.copy()
-        clss[clss == 1] = 2
-        res = t1_oracle_argmin(self.adj, self.svc, clss, self.dem, self.M)
-        self.assertEqual(res["T1"], 0.0)
-        self.assertEqual(res["parts"], [[] for _ in range(self.M)])
-
-    def test_forced_flat_actions(self):
-        from solvers.oracle import forced_flat_actions
-        self.assertEqual(forced_flat_actions([[2, 1], [], [3]], N1=7),
-                         [2, 1, 2 * 7 + 3])
-
-
-# ------------------------------------------------------------------- 1b
-class TestT1HeuristicArgmin(unittest.TestCase):
-    """`t1_heuristic_argmin` -- the large-n1 fallback for `t1_oracle_argmin`
-    (P2's medium/large-curriculum extension). Never claims exactness; these
-    tests check it's never *below* the exact optimum, produces internally
-    consistent (coverage/capacity/completion-formula) parts, and degrades
-    to `inf`/`None` gracefully exactly like the oracle does."""
-
-    def setUp(self):
-        adj, _, veh, demands, clss, svc, _, _ = _hand_instance()
-        self.adj = adj.astype(np.float64)
-        self.svc = svc.astype(np.float64)
-        self.clss = clss.astype(np.int64)
-        self.dem = demands.astype(np.float64)
-        self.M = len(veh)
-
-    def test_matches_exact_and_parts_consistent(self):
-        from solvers.oracle import t1_heuristic_argmin, t1_oracle_argmin
-        exact = t1_oracle_argmin(self.adj, self.svc, self.clss, self.dem, self.M)
+        from solvers.oracle import t1_heuristic_argmin
+        brute = _brute_T1(self.adj, self.svc, self.clss, self.dem, self.M)
         res = t1_heuristic_argmin(self.adj, self.svc, self.clss, self.dem, self.M,
                                   time_budget=0.2, seed=0)
-        # never beats the exact optimum; on this tiny instance should match it.
-        self.assertGreaterEqual(res["T1"], exact["T1"] - 1e-6)
-        self.assertAlmostEqual(res["T1"], exact["T1"], places=6)
+        # never beats the true optimum; on this tiny instance should match it.
+        self.assertGreaterEqual(res["T1"], brute - 1e-6)
+        self.assertAlmostEqual(res["T1"], brute, places=6)
 
         parts = res["parts"]
         self.assertEqual(len(parts), self.M)
@@ -237,10 +172,10 @@ class TestT1HeuristicArgmin(unittest.TestCase):
         self.assertEqual(res["parts"], [[] for _ in range(self.M)])
 
     def test_cross_validates_on_larger_random_instance(self):
-        """On a bigger synthetic instance (n1=12, still exact-DP-tractable),
-        the heuristic should land within a small margin of the true optimum
-        -- never below it."""
-        from solvers.oracle import t1_heuristic_argmin, t1_oracle_argmin
+        """On a bigger synthetic instance (n1=12, small enough to brute-force
+        with a coarser sample of assignments), the heuristic should land
+        within a small margin of the true optimum -- never below it."""
+        from solvers.oracle import t1_heuristic_argmin
         rng = np.random.RandomState(7)
         n1 = 12
         N1 = n1 + 5
@@ -252,18 +187,23 @@ class TestT1HeuristicArgmin(unittest.TestCase):
         svc = rng.uniform(0.1, 0.3, size=N1)
         svc[0] = 0.0
         M = 3
-        exact = t1_oracle_argmin(adj, svc, clss, dem, M, tiebreak=True)
+        # n1=12 with M=3 is too large for `_brute_T1`'s full enumeration
+        # (3^12 assignments x permutations) -- take the best of many
+        # heuristic restarts across independent seeds as the reference
+        # instead of a true exact optimum (still catches a real quality
+        # regression, e.g. a construction/local-search bug reintroduced).
+        ref = min(t1_heuristic_argmin(adj, svc, clss, dem, M, time_budget=0.3,
+                                      seed=s)["T1"] for s in range(20))
         heur = t1_heuristic_argmin(adj, svc, clss, dem, M, time_budget=0.3, seed=1)
         self.assertTrue(np.isfinite(heur["T1"]))
-        self.assertGreaterEqual(heur["T1"], exact["T1"] - 1e-6)
-        rel_gap = (heur["T1"] - exact["T1"]) / exact["T1"]
+        rel_gap = (heur["T1"] - ref) / ref
         # Smoke-level regression bound, not a tight quality claim (single
         # random instance/seed) -- measured mean gap at this n1 range is
         # <0.1-2% depending on budget (docs/grpo.md), so 5% leaves headroom
         # against single-instance variance while still catching a real
-        # regression (e.g. a construction/local-search bug reintroduced).
-        self.assertLess(rel_gap, 0.05, "heuristic unexpectedly far from exact "
-                                       "on an easily-DP-tractable n1=12 instance")
+        # regression.
+        self.assertLess(rel_gap, 0.05, "heuristic unexpectedly far from the "
+                                       "best-of-20-seeds reference on n1=12")
 
     def test_intra_cutoff_does_not_break_feasibility(self):
         """Both the 'full' (intra-route 2-opt/Or-opt) and lighter
@@ -280,6 +220,76 @@ class TestT1HeuristicArgmin(unittest.TestCase):
             for p in res["parts"]:
                 if p:
                     self.assertLessEqual(self.dem[p].sum(), 1.0 + 1e-9)
+
+    def test_forced_flat_actions(self):
+        from solvers.oracle import forced_flat_actions
+        self.assertEqual(forced_flat_actions([[2, 1], [], [3]], N1=7),
+                         [2, 1, 2 * 7 + 3])
+
+
+# ------------------------------------------------------------------- 1b
+class TestT1HeuristicCandidates(unittest.TestCase):
+    """`t1_heuristic_candidates` -- the K-seed hedge wrapper (P3) around
+    `t1_heuristic_argmin`. A thin wrapper: no new search logic, just K seeded
+    calls + dedup-by-actual-partition + sort-by-T1."""
+
+    def setUp(self):
+        adj, _, veh, demands, clss, svc, _, _ = _hand_instance()
+        self.adj = adj.astype(np.float64)
+        self.svc = svc.astype(np.float64)
+        self.clss = clss.astype(np.int64)
+        self.dem = demands.astype(np.float64)
+        self.M = len(veh)
+
+    def test_k1_matches_single_call(self):
+        from solvers.oracle import t1_heuristic_argmin, t1_heuristic_candidates
+        cands = t1_heuristic_candidates(self.adj, self.svc, self.clss, self.dem,
+                                        self.M, K=1, seed_base=0)
+        single = t1_heuristic_argmin(self.adj, self.svc, self.clss, self.dem,
+                                     self.M, seed=0)
+        self.assertEqual(len(cands), 1)
+        self.assertAlmostEqual(cands[0]["T1"], single["T1"], places=9)
+        self.assertEqual(cands[0]["parts"], single["parts"])
+
+    def test_returns_at_most_k_and_sorted_by_t1(self):
+        from solvers.oracle import t1_heuristic_candidates
+        cands = t1_heuristic_candidates(self.adj, self.svc, self.clss, self.dem,
+                                        self.M, K=8, seed_base=0)
+        self.assertGreaterEqual(len(cands), 1)
+        self.assertLessEqual(len(cands), 8)
+        t1s = [c["T1"] for c in cands]
+        self.assertEqual(t1s, sorted(t1s))
+
+    def test_dedups_by_partition_not_just_t1(self):
+        """Two different seeds landing on the SAME partition must collapse to
+        one candidate -- verified directly by checking every returned
+        partition is unique (dedup by T1 value alone would under-detect: two
+        DIFFERENT partitions can tie on T1, and this asserts the converse
+        never silently duplicates one partition)."""
+        from solvers.oracle import t1_heuristic_candidates
+        cands = t1_heuristic_candidates(self.adj, self.svc, self.clss, self.dem,
+                                        self.M, K=8, seed_base=0)
+        keys = [tuple(tuple(p) for p in c["parts"]) for c in cands]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_capacity_infeasible_returns_one_inf_entry(self):
+        from solvers.oracle import t1_heuristic_candidates
+        dem = self.dem.copy()
+        dem[1] = 1.5                                       # class-1 arc > cap
+        cands = t1_heuristic_candidates(self.adj, self.svc, self.clss, dem,
+                                        self.M, K=5, seed_base=0)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["T1"], float("inf"))
+        self.assertIsNone(cands[0]["parts"])
+
+    def test_no_class1_arcs_returns_one_trivial_entry(self):
+        from solvers.oracle import t1_heuristic_candidates
+        clss = self.clss.copy()
+        clss[clss == 1] = 2
+        cands = t1_heuristic_candidates(self.adj, self.svc, clss, self.dem,
+                                        self.M, K=5, seed_base=0)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["T1"], 0.0)
 
 
 # ----------------------------------------------------------------------- 2
@@ -320,12 +330,16 @@ class TestFinalBandPick(unittest.TestCase):
 
 # ----------------------------------------------------------------------- 3
 class TestForcedDecode(unittest.TestCase):
-    def test_forced_prefix_reproduces_oracle_T1(self):
-        """Forcing the oracle's `parts` through `_decode_pool`'s merged batch
-        (`num_free=0` -> every row is a forced row: 1 greedy + `oracle_r`
-        sampled completions) yields decode-time T1 == oracle T1 (fp32
-        arithmetic tolerance), for the greedy row and every sampled one."""
-        from solvers.oracle import forced_flat_actions, t1_oracle_argmin
+    def test_forced_prefix_reproduces_heuristic_T1(self):
+        """Forcing a heuristic candidate's `parts` through `_decode_pool`'s
+        merged batch (`num_free=0` -> every row is a forced row: 1 greedy +
+        `oracle_r` sampled completions) yields decode-time T1 == that
+        candidate's OWN T1 (fp32 arithmetic tolerance), for the greedy row
+        and every sampled one. A decode-pipeline consistency check (does
+        forcing correctly reproduce whatever partition it's given?), not a
+        claim that the candidate is globally T1-optimal -- P3 removed the
+        exact oracle there would be nothing to compare against."""
+        from solvers.oracle import forced_flat_actions, t1_heuristic_argmin
         torch.manual_seed(11)
         al = _make_hyb(shortlist=4, eps=0.01, oracle_r=7)
         td0 = al.td[0]
@@ -336,14 +350,14 @@ class TestForcedDecode(unittest.TestCase):
         dem = td0["demand"].cpu().numpy().astype(np.float64)
         M = int(td0["num_vehicle"])
 
-        res = t1_oracle_argmin(adj, svc, clss, dem, M, tiebreak=True)
+        res = t1_heuristic_argmin(adj, svc, clss, dem, M, seed=0)
         self.assertTrue(np.isfinite(res["T1"]))
         forced = forced_flat_actions(res["parts"], N1)
 
         reward, actions, n_forced = al._decode_pool(0, forced)
         self.assertEqual(n_forced, 1 + al.oracle_r)
         self.assertTrue(np.allclose(reward[:, 0], res["T1"], rtol=1e-5),
-                        f"decode T1 {reward[:, 0]} != oracle {res['T1']}")
+                        f"decode T1 {reward[:, 0]} != heuristic {res['T1']}")
         # forced opening is verbatim in every row's action sequence
         self.assertEqual(actions[:, :len(forced)].tolist(),
                          [forced] * actions.shape[0])
@@ -361,21 +375,19 @@ class TestOracleHeadRegression(unittest.TestCase):
     def test_oracle_code_not_reached_when_disabled(self):
         import solvers.oracle as oracle_mod
         al = _make_hyb(shortlist=4, eps=0.01)
-        with mock.patch.object(oracle_mod, "t1_oracle_argmin",
-                               side_effect=AssertionError("must not run")) as m1, \
-             mock.patch.object(oracle_mod, "t1_heuristic_argmin",
-                               side_effect=AssertionError("must not run")) as m2:
+        with mock.patch.object(oracle_mod, "t1_heuristic_argmin",
+                               side_effect=AssertionError("must not run")) as m:
             torch.manual_seed(self.SEED)
             al(num_sample=self.K)
-        m1.assert_not_called()
-        m2.assert_not_called()
+        m.assert_not_called()
 
     def test_disabled_rollout_is_byte_identical_to_plain_policy(self):
         """Backward-compat guarantee for the default path, updated for the
-        single-pool unification: with oracle_head=False, `_oracle_forced_prefix`
-        returns None, so `_decode_pool` delegates straight to
-        `AttentionModelPolicy.forward` -- the ROLLOUT (reward/actions) is
-        byte-identical to a plain policy call on an identical RNG seed.
+        single-pool unification: with oracle_head=False,
+        `_oracle_forced_prefixes` returns `[None]`, so `_decode_pool`
+        delegates straight to `AttentionModelPolicy.forward` -- the ROLLOUT
+        (reward/actions) is byte-identical to a plain policy call on an
+        identical RNG seed.
 
         (The final SELECTION among the shortlist now uses `final_band_pick`
         instead of strict-lex argmin -- see `TestFinalBandPick` for why that
@@ -399,23 +411,24 @@ class TestOracleHeadRegression(unittest.TestCase):
         self.assertTrue(np.array_equal(ref_reward, got_reward))
         self.assertTrue(np.array_equal(ref_actions, got_actions))
 
-    def test_guard_fallback_rollout_is_byte_identical_when_heuristic_disabled(self):
-        """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic
-        explicitly disabled too -> `_oracle_forced_prefix` returns None (no
-        solver applicable), so the rollout falls back to the plain policy
-        call unchanged, exactly as when oracle_head=False (neither solver
-        runs, no extra RNG consumed)."""
+    def test_guard_fallback_rollout_is_byte_identical_when_infeasible(self):
+        """oracle_head=True but every class-1 arc is capacity-infeasible (a
+        single arc's own demand exceeds capacity) -> `t1_heuristic_candidates`
+        returns nothing usable for every seed, so `_oracle_forced_prefixes`
+        degrades to `[None]` (no solver applicable), and the rollout falls
+        back to the plain policy call unchanged, exactly as when
+        oracle_head=False (no extra RNG consumed)."""
         from utils.ops import batchify
-        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2,
-                       oracle_use_heuristic=False)
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_k=3)
         td0 = al.td[0]
         N1 = td0["service_times"].shape[0]
         adj = td0["adj"].cpu().numpy().astype(np.float64)
         clss = td0["clss"].cpu().numpy().astype(np.int64)
         demands = td0["demand"].cpu().numpy().astype(np.float64)
+        demands[1] = 1.5                                    # class-1 arc > cap
         M = int(td0["num_vehicle"])
-        forced = al._oracle_forced_prefix(td0, N1, adj, clss, demands, M)
-        self.assertIsNone(forced)
+        forced_list = al._oracle_forced_prefixes(td0, N1, adj, clss, demands, M)
+        self.assertEqual(forced_list, [None])
 
         torch.manual_seed(self.SEED)
         td = batchify(al.td, self.K)
@@ -424,40 +437,41 @@ class TestOracleHeadRegression(unittest.TestCase):
         ref_reward = ref_out["reward"].cpu().numpy().astype(np.float64)
 
         torch.manual_seed(self.SEED)
-        got_reward, got_actions, n_forced = al._decode_pool(self.K, forced)
+        got_reward, got_actions, n_forced = al._decode_pool(self.K, forced_list[0])
         self.assertEqual(n_forced, 0)
         self.assertTrue(np.array_equal(ref_reward, got_reward))
 
-    def test_heuristic_fallback_engages_above_max_n1(self):
-        """oracle_head=True, DP not applicable (max_n1 exceeded), heuristic
-        enabled (the default) -> the heuristic actually runs (not skipped)
-        and the union winner is still a valid, finite T-vector."""
+    def test_heuristic_runs_k_times(self):
+        """oracle_head=True, oracle_k=K -> `t1_heuristic_argmin` is called
+        exactly K times (one per candidate seed) and the funnel's output is
+        a valid, finite T-vector."""
         import solvers.oracle as oracle_mod
-        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_max_n1=2,
-                       oracle_heuristic_time_budget=0.05)
-        self.assertTrue(al.oracle_use_heuristic)
+        K_CANDIDATES = 3
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True,
+                       oracle_k=K_CANDIDATES, oracle_heuristic_time_budget=0.05)
         with mock.patch.object(oracle_mod, "t1_heuristic_argmin",
                                wraps=oracle_mod.t1_heuristic_argmin) as spy:
             torch.manual_seed(self.SEED)
             out = al(num_sample=self.K)
-        spy.assert_called()
+        self.assertEqual(spy.call_count, K_CANDIDATES)
         self.assertEqual(out.shape, (1, 3))
         self.assertTrue(np.isfinite(out).all())
 
-    def test_enabled_end_to_end_reaches_oracle_T1(self):
-        """oracle_head=True end-to-end: valid (1, 3) float64 output whose T1
-        equals the exact optimum (neither arm can beat the oracle; the union
-        winner is re-evaluated at float64)."""
-        from solvers.oracle import t1_oracle_argmin
-        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_r=8,
-                       oracle_shortlist=3)
+    def test_k1_end_to_end_reaches_heuristic_T1(self):
+        """oracle_head=True, oracle_k=1 (single candidate, the pre-K-candidate
+        design): valid (1, 3) float64 output whose T1 equals that one
+        heuristic candidate's own T1 (no free/greedy row can beat a
+        T1-feasible forced lane; the winner is re-evaluated at float64)."""
+        from solvers.oracle import t1_heuristic_argmin
+        al = _make_hyb(shortlist=4, eps=0.01, oracle_head=True, oracle_k=1,
+                       oracle_r=8, oracle_shortlist=3)
         td0 = al.td[0]
-        res = t1_oracle_argmin(
+        res = t1_heuristic_argmin(
             td0["adj"].cpu().numpy().astype(np.float64),
             td0["service_times"].cpu().numpy().astype(np.float64),
             td0["clss"].cpu().numpy().astype(np.int64),
             td0["demand"].cpu().numpy().astype(np.float64),
-            int(td0["num_vehicle"]), tiebreak=True)
+            int(td0["num_vehicle"]), seed=0)
 
         torch.manual_seed(self.SEED)
         out = al(num_sample=self.K)
@@ -465,7 +479,38 @@ class TestOracleHeadRegression(unittest.TestCase):
         self.assertEqual(out.dtype, np.float64)
         self.assertTrue(np.isfinite(out).all())
         self.assertTrue(np.isclose(out[0, 0], res["T1"], rtol=1e-5),
-                        f"union T1 {out[0, 0]} != oracle {res['T1']}")
+                        f"funnel T1 {out[0, 0]} != heuristic {res['T1']}")
+
+    def test_k_greater_than_1_is_lex_no_worse_than_any_single_candidate(self):
+        """oracle_head=True, oracle_k=K>1: the overall output must be lex <=
+        each individual candidate's own single-funnel (oracle_k=1) output --
+        the K-candidate design is `min` over K independent funnel runs, so
+        this is true by construction, not just empirically; this test
+        catches a wiring bug (e.g. picking the FIRST candidate instead of
+        the lex-best) rather than a quality claim. (`_hand_instance`'s
+        class-1 subproblem is small enough that its K candidates often
+        collapse to one distinct partition after dedup -- the invariant
+        below holds either way, trivially so when there's only one.)"""
+        K_CANDIDATES = 3
+        al_k = _make_hyb(shortlist=4, eps=0.01, oracle_head=True,
+                         oracle_k=K_CANDIDATES)
+        torch.manual_seed(self.SEED)
+        out_k = al_k(num_sample=self.K)[0]
+
+        td0 = al_k.td[0]
+        N1 = td0["service_times"].shape[0]
+        adj = td0["adj"].cpu().numpy().astype(np.float64)
+        clss = td0["clss"].cpu().numpy().astype(np.int64)
+        demands = td0["demand"].cpu().numpy().astype(np.float64)
+        M = int(td0["num_vehicle"])
+        forced_list = al_k._oracle_forced_prefixes(td0, N1, adj, clss, demands, M)
+
+        classes = [c for c in np.unique(clss) if c != 0]
+        for forced in forced_list:
+            torch.manual_seed(self.SEED)
+            T_single, _ = al_k._run_funnel_once(td0, M, N1, adj, clss, demands,
+                                                classes, forced, self.K)
+            self.assertLessEqual(tuple(out_k.tolist()), tuple(T_single.tolist()))
 
 
 class TestUpgradeToU(unittest.TestCase):

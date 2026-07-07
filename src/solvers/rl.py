@@ -121,23 +121,43 @@ class RLHCARP:
 
 
 class RLHybHCARP(RLHCARP):
-    """Single-pool funnel hybrid: one batched decode produces a combined pool
-    of free-sampled rollouts plus (when applicable) oracle-forced-prefix
-    rollouts, then ONE shortlist + local-search + selection funnel picks the
-    final answer -- no separate arms, no bespoke union comparator.
+    """K-candidate-prefix funnel hybrid (P3 architecture -- see
+    `docs/grpo.md` and `solvers.oracle`'s module docstring): generate K
+    class-1 opening-prefix candidates, run the SAME single-pool funnel
+    (free-sampled rollouts + prefix-forced rollouts + greedy anchor + local
+    search + `final_band_pick`) once per candidate, then take the lex-best
+    (T1, T2, T3) across all K funnel outputs -- same take-the-argmax-over-
+    arms pattern as `ls_lex_guarded`/`upgrade_to_u`/ACO's P-anchor arm, one
+    more dimension (K prefixes) instead of a fixed set of named arms.
 
-    `_oracle_forced_prefix` computes a (provably-optimal-when-exact,
-    empirically-near-optimal-when-heuristic) class-1 opening prefix per
-    vehicle (variant P only); `_decode_pool` decodes `num_sample` free rows
-    plus, when a prefix is available, `1 + oracle_r` prefix-forced rows
-    (1 greedy + `oracle_r` sampled completions) in a SINGLE batched decode
-    loop -- rows with an unconsumed forced action get it overridden each
-    step, all other rows sample normally. Degenerate cases (variant U, no
-    capacity-feasible class-1 partition, or an oracle/env mask mismatch mid-
-    decode) collapse to 0 forced rows, i.e. exactly the plain pool funnel
-    (and `_decode_pool` delegates straight to `AttentionModelPolicy.forward`
-    in that case, so the default `oracle_head=False` path's rollout is
-    unchanged from before the unification).
+    `_oracle_forced_prefixes` generates the K candidates via
+    `solvers.oracle.t1_heuristic_candidates` (K independently-seeded
+    heuristic calls, deduped by resulting partition -- see that module for
+    why the former exact class-1 DP was removed) and returns their
+    `forced_flat_actions` (variant P only; `[None]` under variant U or when
+    `oracle_head=False`, degenerating every candidate's funnel run to the
+    plain pool). `_run_funnel_once` is the single-prefix funnel body (decode
+    pool -> greedy anchor -> shortlist -> local search -> `final_band_pick`),
+    unchanged in substance from the pre-K-candidate design; `__call__` now
+    just loops it over the K forced-prefix candidates (or the one `None`
+    degenerate case) and keeps the lex-best result. `oracle_k=1` reproduces
+    the single-candidate funnel exactly (same heuristic seed=0 call as
+    before), so this is a strict generalization, not a behavior change, of
+    the funnel mechanics themselves -- the actual behavior change is that
+    class-1 candidates now ALWAYS come from the heuristic (no more exact-DP
+    branch below a class-1 arc-count guard), which the K-candidate hedge is
+    specifically there to compensate for.
+
+    `_decode_pool` decodes `num_sample` free rows plus, when a prefix is
+    available, `1 + oracle_r` prefix-forced rows (1 greedy + `oracle_r`
+    sampled completions) in a SINGLE batched decode loop -- rows with an
+    unconsumed forced action get it overridden each step, all other rows
+    sample normally. Degenerate cases (variant U, no capacity-feasible
+    class-1 partition, or an oracle/env mask mismatch mid-decode) collapse
+    to 0 forced rows, i.e. exactly the plain pool funnel (and `_decode_pool`
+    delegates straight to `AttentionModelPolicy.forward` in that case, so the
+    default `oracle_head=False` path's rollout is unchanged from before the
+    unification).
 
     A single deterministic GREEDY rollout is appended to the pool as an
     anchor row (always shortlisted, decoded after the sampling pool via
@@ -172,7 +192,12 @@ class RLHybHCARP(RLHCARP):
     ~8-20% faster (one shared encoder pass instead of two).
 
     Historical validation this design carries forward (`data/osm_test_small`,
-    2858 instances, same checkpoint, see `logs/status_bm.md`):
+    2858 instances, same checkpoint, see `logs/status_bm.md`). PRE-P3: this
+    predates the K-candidate refactor and the exact-DP removal -- the
+    `oracle_max_n1`/`oracle_use_heuristic` knobs it refers to no longer
+    exist, but the measured shape (each layer helps, forcing only ever helps
+    or ties) is exactly what the P3 due-diligence check re-confirmed for the
+    heuristic-only path (see `solvers.oracle`'s module docstring):
     - `topk_t1` (T1-only hedge lane): raising `num_sample` 100->400 and
       adding `topk_t1=100` moved "T1 not worse than ILS" 82.75%->95.31%, "T2
       not worse" 44.2%->53.1%, lex-win 69.3%->86.4%, Pareto-dominance
@@ -194,26 +219,44 @@ class RLHybHCARP(RLHCARP):
     """
 
     def __init__(self, pw, variant, device='cuda', shortlist=10, eps=0.005, topk_t1=0,
-                 oracle_head=False, oracle_r=64, oracle_shortlist=8,
+                 oracle_head=False, oracle_k=3, oracle_r=64, oracle_shortlist=8,
                  oracle_union_eps2=0.02,
-                 oracle_tiebreak=True, oracle_max_n1=None,
-                 oracle_use_heuristic=True, oracle_heuristic_time_budget=None,
+                 oracle_heuristic_time_budget=None,
                  oracle_heuristic_intra_cutoff=None, upgrade_to_u=False):
         super().__init__(pw, variant, device=device)
         self.shortlist = shortlist
         self.eps = eps
         self.topk_t1 = topk_t1
         self.oracle_head = oracle_head
+        # oracle_k: number of class-1 opening-prefix candidates (P3 -- see
+        # `solvers.oracle`'s module docstring for why the exact DP that used
+        # to make one candidate "the" T1 optimum was replaced by K heuristic
+        # seeds + lex-best-of-K-funnels). oracle_r/oracle_shortlist are
+        # PER-CANDIDATE (unchanged meaning from the single-prefix design);
+        # `__call__` runs K independent funnels (each its own encoder pass --
+        # not batched together, see `__call__`'s docstring), so total cost
+        # scales with K x num_sample-per-call, not just num_sample.
+        #
+        # K=3 default (measured, `docs/grpo.md`): on `data/test_bm/large.npz`
+        # (n1 above the old exact-DP range, where a single heuristic seed
+        # measurably leaves T1 on the table), K=1-at-ns=600 does NOT close
+        # the gap a single wider sample can't fix a structurally-suboptimal
+        # forced prefix -- but K=3-at-ns=200 (same ~1.5x total sample count)
+        # does, AND improves T1/T2/T3 together (13.428/30.407/47.140 ->
+        # 13.197/29.757/46.475 on a 5-instance probe). On
+        # `data/test_bm/medium.npz` (n1 mostly inside the old exact-DP
+        # range), a single heuristic seed already reaches the same T1 no
+        # amount of K changes it -- K=3 there is a small T2 win, wash on T3.
+        # Strictly matching TOTAL sample count to the K=1/400 baseline (e.g.
+        # K=10 at ns=40) was measured WORSE on T2/T3 than this modest-growth
+        # setting -- cutting num_sample-per-candidate too aggressively hurts
+        # each candidate's own funnel more than extra prefixes recover.
+        self.oracle_k = oracle_k
         self.oracle_r = oracle_r
         self.oracle_shortlist = oracle_shortlist
         self.oracle_union_eps2 = oracle_union_eps2
-        self.oracle_tiebreak = oracle_tiebreak
         from solvers.oracle import (HEURISTIC_INTRA_CUTOFF_DEFAULT,
-                                    HEURISTIC_TIME_BUDGET_DEFAULT, MAX_N1_DEFAULT)
-        if oracle_max_n1 is None:
-            oracle_max_n1 = MAX_N1_DEFAULT
-        self.oracle_max_n1 = oracle_max_n1
-        self.oracle_use_heuristic = oracle_use_heuristic
+                                    HEURISTIC_TIME_BUDGET_DEFAULT)
         if oracle_heuristic_time_budget is None:
             oracle_heuristic_time_budget = HEURISTIC_TIME_BUDGET_DEFAULT
         self.oracle_heuristic_time_budget = oracle_heuristic_time_budget
@@ -346,37 +389,30 @@ class RLHybHCARP(RLHCARP):
                 new_vehicles[m].append(trip)
         return self._u_evaluator._completion_times(new_vehicles, td0), new_vehicles
 
-    def _oracle_forced_prefix(self, td0, N1, adj, clss, demands, M):
-        """Compute the oracle's forced class-1 opening-prefix flat actions,
-        or None when not applicable (variant U, `oracle_head=False`, n1 too
-        large with the heuristic disabled, or no capacity-feasible partition
-        exists). Exact DP (`t1_oracle_argmin`) when n1 <= `oracle_max_n1`;
-        otherwise `t1_heuristic_argmin` if `oracle_use_heuristic` (see the
-        class docstring for the measured quality/speed tradeoff of that
-        fallback).
+    def _oracle_forced_prefixes(self, td0, N1, adj, clss, demands, M):
+        """Compute up to `oracle_k` forced class-1 opening-prefix flat-action
+        candidates (P3 -- see `solvers.oracle`'s module docstring), or
+        `[None]` when not applicable (variant U, `oracle_head=False`, or
+        every seed hit a capacity-infeasible/empty partition).
+
+        Every candidate comes from `t1_heuristic_argmin` (no more exact-DP
+        branch -- see `solvers.oracle`); `t1_heuristic_candidates` runs it
+        under `oracle_k` different seeds and dedups by resulting partition,
+        so this can return fewer than `oracle_k` entries.
         """
-        from solvers.oracle import (forced_flat_actions, t1_heuristic_argmin,
-                                    t1_oracle_argmin)
+        from solvers.oracle import forced_flat_actions, t1_heuristic_candidates
         if not self.oracle_head or self.variant != 'P':
             # The oracle's premise (class-1 arcs form a forced opening prefix)
             # only holds under variant P's precedence; decline otherwise.
-            return None
+            return [None]
         svc = td0["service_times"].cpu().numpy().astype(np.float64)
-        n1 = int((clss == 1).sum())
-        if n1 <= self.oracle_max_n1:
-            res = t1_oracle_argmin(adj, svc, clss, demands, M,
-                                   tiebreak=self.oracle_tiebreak,
-                                   max_n1=self.oracle_max_n1)
-        elif self.oracle_use_heuristic:
-            res = t1_heuristic_argmin(
-                adj, svc, clss, demands, M,
-                time_budget=self.oracle_heuristic_time_budget,
-                intra_cutoff=self.oracle_heuristic_intra_cutoff)
-        else:
-            return None
-        if not np.isfinite(res["T1"]) or res["parts"] is None:
-            return None                       # not applicable / infeasible
-        return forced_flat_actions(res["parts"], N1)
+        cands = t1_heuristic_candidates(
+            adj, svc, clss, demands, M, self.oracle_k,
+            time_budget=self.oracle_heuristic_time_budget,
+            intra_cutoff=self.oracle_heuristic_intra_cutoff)
+        forced_list = [forced_flat_actions(res["parts"], N1) for res in cands
+                       if np.isfinite(res["T1"]) and res["parts"] is not None]
+        return forced_list if forced_list else [None]  # not applicable / infeasible
 
     @torch.inference_mode()
     def _decode_pool(self, num_free, forced):
@@ -441,16 +477,17 @@ class RLHybHCARP(RLHCARP):
         actions = torch.stack(acts, 1).cpu().numpy().astype(np.int64)
         return reward, actions, (n_forced if forced_ok else 0)
 
-    def __call__(self, num_sample=100):
-        td0 = self.td[0]
-        M = int(td0["num_vehicle"])
-        N1 = td0["service_times"].shape[0]
-        adj = td0["adj"].cpu().numpy().astype(np.float64)
-        clss = td0["clss"].cpu().numpy().astype(np.int64)
-        demands = td0["demand"].cpu().numpy().astype(np.float64)
-        classes = [c for c in np.unique(clss) if c != 0]
+    def _run_funnel_once(self, td0, M, N1, adj, clss, demands, classes,
+                         forced, num_sample):
+        """One prefix candidate's full funnel: decode pool -> greedy anchor
+        -> shortlist -> local search -> `final_band_pick`. Unchanged in
+        substance from the pre-K-candidate design (see class docstring) --
+        `__call__` runs this once per `_oracle_forced_prefixes` candidate
+        (or once with `forced=None` when the oracle isn't applicable) and
+        keeps the lex-best result across all calls.
 
-        forced = self._oracle_forced_prefix(td0, N1, adj, clss, demands, M)
+        Returns (best_T (float64, shape (P,)), best_vehicles).
+        """
         reward, actions, n_forced = self._decode_pool(num_sample, forced)
         B = reward.shape[0]
 
@@ -543,14 +580,36 @@ class RLHybHCARP(RLHCARP):
         # guarantee when the winner came from the forced lane holds at full
         # precision, not just the decode-time fp32 reward's.
         best_T = np.asarray(cands[j][0], dtype=np.float64)
+        return best_T, cands[j][1]
+
+    def __call__(self, num_sample=100):
+        td0 = self.td[0]
+        M = int(td0["num_vehicle"])
+        N1 = td0["service_times"].shape[0]
+        adj = td0["adj"].cpu().numpy().astype(np.float64)
+        clss = td0["clss"].cpu().numpy().astype(np.int64)
+        demands = td0["demand"].cpu().numpy().astype(np.float64)
+        classes = [c for c in np.unique(clss) if c != 0]
+
+        # ---- K forced-prefix candidates -> one funnel run each -> lex-best -
+        # Same take-the-argmax-over-arms pattern as `ls_lex_guarded`/
+        # `upgrade_to_u`/ACO's P-anchor arm (see class docstring). Degenerate
+        # case (oracle not applicable, or variant U): `forced_list == [None]`,
+        # a single funnel run, identical to the pre-K-candidate design.
+        forced_list = self._oracle_forced_prefixes(td0, N1, adj, clss, demands, M)
+        results = [self._run_funnel_once(td0, M, N1, adj, clss, demands,
+                                         classes, forced, num_sample)
+                   for forced in forced_list]
+        best_T, best_vehicles = min(results, key=lambda r: tuple(r[0].tolist()))
 
         # ---- optional zero-training U upgrade (see __init__) ---------------
-        # Runs AFTER the funnel's final pick, on the winner only. Deterministic
-        # (no RNG), guarded (kept only if lex-better), and skipped entirely
-        # when the flag is off -- the default path above is untouched.
+        # Runs AFTER the K-candidate funnel's overall winner is picked, on
+        # that winner only. Deterministic (no RNG), guarded (kept only if
+        # lex-better), and skipped entirely when the flag is off -- the
+        # default path above is untouched.
         if self.upgrade_to_u:
             up_T, _ = self._upgrade_winner_to_u(
-                cands[j][1], td0, M, adj, clss, demands)
+                best_vehicles, td0, M, adj, clss, demands)
             fired = (up_T is not None
                      and tuple(up_T.tolist()) < tuple(best_T.tolist()))
             self.last_upgrade_info = {
@@ -593,10 +652,20 @@ def parse_args():
                         help='hybrid mode: add oracle-forced-prefix rows (variant P) '
                              'into the same decode pool as the free rollouts '
                              '(default: off, no behavior change). Sub-tunables '
-                             '(sample count, shortlist sizes, eps-bands, tiebreak) are '
-                             'not exposed on the CLI -- historical sweeps never varied '
-                             'them from RLHybHCARP\'s defaults; construct RLHybHCARP '
-                             'directly if you need to.')
+                             '(shortlist sizes, eps-bands) are not exposed on the '
+                             'CLI -- historical sweeps never varied them from '
+                             'RLHybHCARP\'s defaults; construct RLHybHCARP directly '
+                             'if you need to.')
+    parser.add_argument('--oracle_k', type=int, default=3,
+                        help='oracle_head mode: number of class-1 opening-prefix '
+                             'candidates (P3 K-seed hedge over the heuristic '
+                             'class-1 solver -- see solvers.oracle); the funnel '
+                             'runs once per candidate and keeps the lex-best. '
+                             'Total sample cost scales with K x num_sample, so '
+                             'reduce --num_sample when raising K (see RLHybHCARP\'s '
+                             'docstring for the measured K/num_sample tradeoff '
+                             'behind this default). 1 = single-candidate funnel '
+                             '(no hedge).')
     parser.add_argument('--upgrade_to_u', action='store_true',
                         help='hybrid mode: after the funnel picks its final winner, '
                              'run ONE unrestricted (variant-U) local-search pass on '
@@ -713,7 +782,7 @@ if __name__ == "__main__":
         if args.hybrid:
             al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
                             eps=args.eps, topk_t1=args.topk_t1,
-                            oracle_head=args.oracle_head,
+                            oracle_head=args.oracle_head, oracle_k=args.oracle_k,
                             upgrade_to_u=args.upgrade_to_u)
         else:
             al = RLHCARP(ckpt_path, args.variant)

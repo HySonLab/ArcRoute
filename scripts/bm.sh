@@ -43,7 +43,9 @@
 #   RL
 #     CKPT        checkpoint .ckpt file  (required for rl -- no default: silently
 #                 defaulting to the P checkpoint would mislead a VARIANT=U run)
-#     NUM_SAMPLE  beam width             (default: 400 -- production value, see below)
+#     NUM_SAMPLE  beam width, PER ORACLE_K CANDIDATE funnel run (default: 150 --
+#                 production value, see below; P3 note: total sample cost is
+#                 ORACLE_K x NUM_SAMPLE, not just NUM_SAMPLE)
 #     EPS         eps-lex T1 tolerance for shortlisting (default: 0.01 = 1%)
 #     HYBRID      1 = two-tier funnel: eps-lex shortlist + local search on it (default: 1)
 #     SHORTLIST   HYBRID=1 only: #candidates that get local search (default: 25)
@@ -51,21 +53,33 @@
 #                 on top of the eps-lex shortlist (default: 100). Measured 82.75%->
 #                 95.31% "T1 not worse than ILS" on the old osm_test_small sweep,
 #                 see git history of logs/status_bm.md.
-#     ORACLE_HEAD HYBRID=1 only: 1 = add the exact-T1-oracle forced-prefix arm
+#     ORACLE_HEAD HYBRID=1 only: 1 = add heuristic class-1 forced-prefix rows
 #                 (variant P only -- correctly a no-op under VARIANT=U, safe to
-#                 leave on) unioned with the pool arm (default: 1).
-#                 Sub-tunables (sample count, shortlist sizes, eps-bands, tiebreak)
-#                 aren't exposed here -- historical sweeps never varied them from
-#                 RLHybHCARP's defaults; construct it directly in Python if needed.
+#                 leave on) into the pool, ORACLE_K candidates at a time,
+#                 lex-best kept (default: 1). P3: class-1 candidates now
+#                 ALWAYS come from the heuristic (no more exact-DP branch --
+#                 see solvers/oracle.py); ORACLE_K is the compensating hedge.
+#     ORACLE_K    HYBRID=1, ORACLE_HEAD=1 only: number of class-1 heuristic-seed
+#                 candidates, one full funnel run each, lex-best kept (default: 3).
+#                 Measured (data/test_bm, 5-instance probe): on large.npz (n1
+#                 above the old exact-DP range), K=3 at a ~1.5x total-sample
+#                 budget beats K=1 at the SAME total budget on T1 AND T2 AND
+#                 T3 -- a single wider K=1 sample can't fix a structurally
+#                 suboptimal forced prefix, only more prefixes can. On
+#                 medium.npz (n1 mostly inside the old exact-DP range) K=3 is
+#                 a wash (T1 unaffected, small T2 win, T3 flat-to-worse).
+#                 Sub-tunables (oracle_r, oracle_shortlist) aren't exposed
+#                 here -- construct RLHybHCARP directly in Python if needed.
 #     UPGRADE_TO_U HYBRID=1, VARIANT=P only: 1 = also derive a zero-training
 #                 variant-U answer from the P pipeline's own winning route via a
 #                 move-level lex-safe local search (default: 0). Measured on
 #                 data/test_bm/small.npz: fires 77/100 instances, 0 T1 regressions,
 #                 T2/T3 improve -- see logs/status_bm.md.
 #
-# Defaults above (NUM_SAMPLE=400 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1)
-# are the production-recommended RL config as of the data/test_bm benchmark --
-# override per-var if you need the old lighter-weight settings (NUM_SAMPLE=100
+# Defaults above (NUM_SAMPLE=150 SHORTLIST=25 EPS=0.01 TOPK_T1=100 ORACLE_HEAD=1
+# ORACLE_K=3) are the production-recommended RL config as of the P3 refactor
+# (see docs/grpo.md) -- override per-var if you need the old single-candidate
+# config (NUM_SAMPLE=400 ORACLE_K=1 was the pre-P3 production default; NUM_SAMPLE=100
 # EPS=0.005 SHORTLIST=10 TOPK_T1=0 ORACLE_HEAD=0 HYBRID=0 was the pre-P1/P2 default).
 #
 # Output:
@@ -113,13 +127,14 @@ THREADS="${THREADS:-8}"
 
 # ── rl ────────────────────────────────────────────────────────────────────────
 CKPT="${CKPT:-}"
-NUM_SAMPLE="${NUM_SAMPLE:-400}"
+NUM_SAMPLE="${NUM_SAMPLE:-150}" # PER ORACLE_K candidate funnel run (P3: total ~= ORACLE_K x NUM_SAMPLE)
 EPS="${EPS:-0.01}"
 HYBRID="${HYBRID:-1}"          # 1 = two-tier funnel (eps-lex shortlist + local search)
 SHORTLIST="${SHORTLIST:-25}"   # HYBRID=1 only: #candidates that get local search
 TOPK_T1="${TOPK_T1:-100}"      # HYBRID=1 only: extra #candidates by raw T1 rank, LS'd too
                                 # (0 = disabled; production default is "bậc 3 + P1")
-ORACLE_HEAD="${ORACLE_HEAD:-1}"                    # HYBRID=1 only: exact-T1-oracle arm (variant P only; no-op under U)
+ORACLE_HEAD="${ORACLE_HEAD:-1}"                    # HYBRID=1 only: heuristic class-1 forced-prefix arm (variant P only; no-op under U)
+ORACLE_K="${ORACLE_K:-3}"                          # HYBRID=1, ORACLE_HEAD=1 only: # class-1 heuristic-seed candidates (P3)
 UPGRADE_TO_U="${UPGRADE_TO_U:-0}"                  # HYBRID=1, variant P only: zero-training U answer via lex-safe post-process
 
 # ── output ────────────────────────────────────────────────────────────────────
@@ -208,7 +223,7 @@ case "$SOLVER" in
     fi
     HYBRID_ARGS=()
     [[ "$HYBRID" == "1" ]] && HYBRID_ARGS=(--hybrid --shortlist "$SHORTLIST" --topk_t1 "$TOPK_T1")
-    [[ "$ORACLE_HEAD" == "1" ]] && HYBRID_ARGS+=(--oracle_head)
+    [[ "$ORACLE_HEAD" == "1" ]] && HYBRID_ARGS+=(--oracle_head --oracle_k "$ORACLE_K")
     [[ "$UPGRADE_TO_U" == "1" ]] && HYBRID_ARGS+=(--upgrade_to_u)
     uv run python -m solvers.rl \
         --seed "$SEED" --variant "$VARIANT" \
