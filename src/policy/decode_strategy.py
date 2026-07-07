@@ -123,16 +123,9 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         self.actions = []
         self.logprobs = []
 
-    def reset(self):
-        self.actions = []
-        self.logprobs = []
-
     @abc.abstractmethod
     def _step(self, logprobs,mask,td,action = None,**kwargs):
         raise NotImplementedError("Must be implemented by subclass")
-
-    def pre_decoder_hook(self, td, env, action = None):
-        pass
 
     def post_decoder_hook(self, td, env):
         assert (

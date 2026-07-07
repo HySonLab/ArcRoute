@@ -1,6 +1,5 @@
 from tensordict.tensordict import TensorDict
 import torch
-import numpy as np
 from env.generator import SizeBucketBatchSampler
 from utils.ops import gather_by_index
 from torch.utils.data import DataLoader

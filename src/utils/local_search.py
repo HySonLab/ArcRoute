@@ -34,13 +34,6 @@ EPS = 1e-9
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def get_subtour_p(route, clss, p):
-    """Interior indices of ``route`` whose arc has priority class ``p``."""
-    route = np.asarray(route)
-    idx = np.arange(1, len(route) - 1)
-    return idx[clss[route[idx]] == p]
-
-
 def get_subtour_u(route):
     """All interior (non-sentinel) indices of ``route``."""
     return np.arange(1, len(np.asarray(route)) - 1)
@@ -282,55 +275,6 @@ def calc_swap_delta_inter(r1, i, r2, j, adj):
     return float(new - old)
 
 
-def best_swap_inter(r1, r2, adj, demands, capacity, clss, variant='P', p=None):
-    """Best improving inter-route swap between ``r1`` and ``r2``.
-
-    Capacity feasibility is checked *first* for each candidate (a swap that
-    would push either route over ``capacity`` is rejected before computing the
-    delta). Returns ``(best_delta, best_i, best_j)`` or ``(0.0, -1, -1)``.
-    """
-    r1 = np.asarray(r1)
-    r2 = np.asarray(r2)
-    if len(r1) <= 2 or len(r2) <= 2:
-        return 0.0, -1, -1
-
-    load1 = demands[r1].sum()
-    load2 = demands[r2].sum()
-
-    idx1 = get_subtour_u(r1)
-    idx2 = get_subtour_u(r2)
-
-    a1 = r1[idx1 - 1]
-    x = r1[idx1]
-    a2 = r1[idx1 + 1]
-    b1 = r2[idx2 - 1]
-    y = r2[idx2]
-    b2 = r2[idx2 + 1]
-
-    dx = demands[x]
-    dy = demands[y]
-
-    #   new = adj[a1_i,y_j]+adj[y_j,a2_i] + adj[b1_j,x_i]+adj[x_i,b2_j]
-    new = (adj[a1[:, None], y[None, :]] + adj[y[None, :], a2[:, None]]
-           + adj[b1[None, :], x[:, None]] + adj[x[:, None], b2[None, :]])
-    old_i = adj[a1, x] + adj[x, a2]
-    old_j = adj[b1, y] + adj[y, b2]
-    D = new - (old_i[:, None] + old_j[None, :])
-
-    feas = (load1 - dx[:, None] + dy[None, :] <= capacity + EPS) & \
-           (load2 - dy[None, :] + dx[:, None] <= capacity + EPS)
-    if variant == 'P':
-        feas &= clss[x][:, None] == clss[y][None, :]
-    D[~feas] = np.inf
-
-    flat = int(D.argmin())
-    best_delta = float(D.flat[flat])
-    if best_delta < -EPS:
-        a, b = divmod(flat, len(idx2))
-        return best_delta, int(idx1[a]), int(idx2[b])
-    return 0.0, -1, -1
-
-
 def calc_relocate_delta_inter(r1, i, r2, j, adj):
     """O(1) delta of moving the arc at position ``i`` of ``r1`` into ``r2``,
     inserted immediately after position ``j``. The routes are independent, so
@@ -399,9 +343,11 @@ def _pair_moves(r1, r2, adj, demands, capacity, clss, variant, load1, load2):
 
         (best swap r1<->r2,  best relocate r1->r2,  best relocate r2->r1)
 
-    each as ``(delta, i, j)`` with the exact formulas / argmin tie-breaking of
-    ``best_swap_inter`` / ``best_relocate_inter`` (values are bit-identical:
-    identical expressions evaluated in the same elementwise order).
+    each as ``(delta, i, j)`` with the exact per-move delta formulas of
+    ``calc_swap_delta_inter`` / ``calc_relocate_delta_inter`` and the
+    row-major argmin tie-breaking of ``best_relocate_inter`` (values are
+    bit-identical: identical expressions evaluated in the same elementwise
+    order).
     """
     no_move = (0.0, -1, -1)
     swap = rel12 = rel21 = no_move
@@ -432,7 +378,7 @@ def _pair_moves(r1, r2, adj, demands, capacity, clss, variant, load1, load2):
         adj_yb2 = base2[1:]            # adj[y, b2]
         cy = clss[y] if variant == 'P' else None
 
-    # ---- swap r1 <-> r2 (cf. best_swap_inter) ----
+    # ---- swap r1 <-> r2 (cf. calc_swap_delta_inter) ----
     if have1 and have2:
         new = (adj[a1[:, None], y[None, :]] + adj[y[None, :], a2[:, None]]
                + adj[b1[None, :], x[:, None]] + adj[x[:, None], b2[None, :]])
@@ -794,7 +740,7 @@ def ls(vars, variant='P', actions=None):
 
     Returns a list of route-lists (one per member); each route-list is what
     ``gen_tours`` produces (routes with sentinel 0s). ``meta.py`` feeds the
-    result to ``deserialize_tours_batch`` / ``deserialize_tours``.
+    result to ``deserialize_tours``.
 
     Pipeline per member:
       1. parse flat actions into routes (gen_tours)
@@ -837,56 +783,3 @@ def ls(vars, variant='P', actions=None):
                                  capacity=1.0, variant=variant)
         out.append(routes)
     return out
-
-
-def lsRL(td, tours):
-    """Legacy entry point for the RL trainer / HRDA inference.
-
-    ``tours``: 2-D int tensor/array of shape ``(M, max_len)``; each row is a
-    route of arc indices, zero-padded. Applies intra-route swap optimisation
-    (U-variant: the RL policy already partitions by class via the Scheduler) to
-    each non-trivial row in place and returns ``tours`` in its original type.
-    """
-    is_tensor = hasattr(tours, 'numpy')
-
-    adj = td['adj']
-    adj = adj.numpy() if hasattr(adj, 'numpy') else np.asarray(adj)
-    adj = adj.astype(np.float64, copy=False)
-    # service time key has varied between revisions
-    svc = td.get('service_times', td.get('service_time'))
-    if hasattr(svc, 'numpy'):
-        svc = svc.numpy()
-    svc = np.asarray(svc)
-    clss = td['clss']
-    clss = clss.numpy() if hasattr(clss, 'numpy') else np.asarray(clss)
-
-    # adj/clss may carry a leading batch dim of 1 (from RLHCARP); squeeze it.
-    if adj.ndim == 3 and adj.shape[0] == 1:
-        adj = adj[0]
-    if clss.ndim == 2 and clss.shape[0] == 1:
-        clss = clss[0]
-
-    tours_np = tours.numpy() if is_tensor else np.asarray(tours)
-    tours_np = tours_np.copy()
-
-    for r in range(tours_np.shape[0]):
-        row = tours_np[r]
-        # treat the row as a route; strip trailing padding but keep the leading
-        # depot. A row is [0, a1, a2, ..., 0, 0, ...]; the meaningful part runs
-        # up to the last non-zero arc, plus a closing sentinel.
-        nz = np.nonzero(row)[0]
-        if len(nz) == 0:
-            continue
-        last = int(nz[-1])
-        # route with closing sentinel
-        route = np.concatenate([row[:last + 1], np.array([0], dtype=row.dtype)])
-        if len(route) <= 3:
-            continue
-        route = intra_route_opt(route, adj, clss, variant='U')
-        # write back the interior (drop the closing sentinel we added)
-        tours_np[r, :last + 1] = route[:last + 1]
-
-    if is_tensor:
-        import torch
-        return torch.as_tensor(tours_np, dtype=tours.dtype)
-    return tours_np

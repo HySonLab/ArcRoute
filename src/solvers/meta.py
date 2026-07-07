@@ -1,9 +1,9 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import numpy as np
-from numpy.random import random, randint, permutation
+from numpy.random import random, permutation
 
-from utils.ops import import_instance, run_parallel2
+from utils.ops import run_parallel2
 from utils.ops import gen_tours, deserialize_tours, convert_prob
 from utils.ops import centered_lex_rank
 from solvers.evaluator import evaluate_batch as get_Ts
@@ -230,39 +230,32 @@ class ILSHCARP(BaseHCARP):
         self.T_final = T_final
 
     def __call__(self, max_iter=200, variant='P', num_init_sample=5,
-                 seed=None, verbose=False, init_action=None):
+                 seed=None, verbose=False):
         self.variant = variant
         assert self.has_instance, "please import instance first"
         rng = np.random.default_rng(seed)
         if seed is not None:
             np.random.seed(seed)
 
-        if init_action is not None:
-            # 1'. warm start: skip constructive seeding, start the ILS loop
-            # from a caller-supplied flat 0-separated arc-order action
-            # (e.g. the winner of the RL hybrid funnel, see solvers/rl.py).
-            cur_action = np.asarray(init_action, dtype=np.int32)
-            cur_obj = float(self.calc_obj(cur_action[None])[0])
-        else:
-            # 1. constructive seeds -> lex-guarded local search -> best as s0.
-            # The guard matters: unguarded, the deadhead-only ``ls`` poisons
-            # the pool before get_best ever scores the raw constructions
-            # (under U it wrecks T1), and the lex-strict acceptance below can
-            # then only ever choose among already-degraded candidates.
-            samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
-            samples = [s for s in samples if s is not None]
-            assert samples, "construction failed to produce a feasible solution"
-            acts, objs = self.ls_lex_guarded(samples)
-            k = int(objs.argmax())
-            cur_obj, cur_action = float(objs[k]), acts[k]
+        # 1. constructive seeds -> lex-guarded local search -> best as s0.
+        # The guard matters: unguarded, the deadhead-only ``ls`` poisons
+        # the pool before get_best ever scores the raw constructions
+        # (under U it wrecks T1), and the lex-strict acceptance below can
+        # then only ever choose among already-degraded candidates.
+        samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
+        samples = [s for s in samples if s is not None]
+        assert samples, "construction failed to produce a feasible solution"
+        acts, objs = self.ls_lex_guarded(samples)
+        k = int(objs.argmax())
+        cur_obj, cur_action = float(objs[k]), acts[k]
         cur_routes = gen_tours(cur_action)
 
         best_action = cur_action.copy()
         best_obj = cur_obj
         capacity = 1.0
-        # A warm start may carry more trips than vehicles (capacity reloads →
-        # multiple 0-separated segments per vehicle), so the re-serialisation
-        # cap must fit it; the default (cold-start) path is unchanged.
+        # Defensive: never re-serialise narrower than the current action (the
+        # constructive path always yields exactly self.max_len, so this is a
+        # no-op there).
         max_len = max(self.max_len, len(cur_action))
 
         # 2. ILS loop: perturb -> lex-guarded local search -> accept
@@ -428,6 +421,17 @@ class EAHCARP(BaseHCARP):
         return get_Ts(self.vars, actions=routes[None], variant=self.variant)
 
 class ACOHCARP(BaseHCARP):
+    # Small positive floor added to the pheromone trail before raising it to
+    # `alpha`. Pheromones start at exact zero (see `init_population`), so
+    # without this floor `tau**alpha == 0` for every candidate on the very
+    # first construction pass, which would silently fall back to visibility-
+    # only (or, before this fix existed, to a uniform draw) regardless of how
+    # `alpha`/`beta` are tuned.
+    TAU0 = 1.0
+    # Deadheading-cost floor so eta = 1/adj stays finite for zero-distance
+    # arc pairs (colocated arcs / immediate depot hops).
+    ETA_EPS = 1e-6
+
     def __init__(self, n_ant=50, alpha=1.0, beta=1.0, rho=0.5, del_tau=1.0):
         super().__init__()
         self.n_ant = n_ant
@@ -456,9 +460,37 @@ class ACOHCARP(BaseHCARP):
         return ants, pheromones
 
     def get_next(self, t, mask, attemp=10):
+        """Sample the next arc via the standard ACO transition rule
+
+            p_ij ∝ tau_ij**alpha * eta_ij**beta
+
+        ``mask`` is the pheromone row `tau` for the ant's current position
+        (``-inf`` entries are structurally forbidden -- class-mask/priority-
+        frontier/visited exclusions already baked in by the caller) and
+        ``eta = 1 / adj`` is the inverse-deadheading-cost heuristic, read
+        from the same distance matrix (``self.dms``) `ls`/the evaluator use
+        elsewhere -- no new distance representation. Previously this
+        softmaxed the raw pheromone row alone (`alpha`/`beta` were dead
+        fields): with ~100+ candidate arcs at large.npz scale and pheromone
+        counts confined to a narrow range by evaporation, that is close to a
+        uniform random draw and never sharpens (see the flat epoch-best
+        traces in the investigation this fixes). Mixing in `eta` gives
+        construction an actual cost signal from epoch 0.
+        """
+        from_arc = int(t[-1])
+        eta = 1.0 / (np.asarray(self.dms[from_arc], dtype=np.float64) + self.ETA_EPS)
         for _ in range(attemp):
-            if (mask < 0).all(): return None
-            next = self.get_idx(convert_prob(mask), size=1, strategy='sampling')
+            allowed = mask >= 0
+            if not allowed.any():
+                return None
+            # Dummy positive fill (log=0) at forbidden slots -- discarded by
+            # the np.where below, just avoids a log(-inf)/log(negative)
+            # RuntimeWarning on values we never use.
+            tau = np.where(allowed, mask + self.TAU0, 1.0)
+            logits = np.where(allowed,
+                               self.alpha * np.log(tau) + self.beta * np.log(eta),
+                               -np.inf)
+            next = self.get_idx(convert_prob(logits), size=1, strategy='sampling')
             if self.is_valid_once(t + [next]):
                 return next
             mask[next] = -np.inf
@@ -517,10 +549,17 @@ class ACOHCARP(BaseHCARP):
         pheromones *= (1 - self.rho)
         return pheromones
 
-    def __call__(self, n_epoch=500, variant='P', is_local_search = True, verbose=False):
-        self.variant = variant
-        assert self.has_instance, "please import instance first"
+    def _search(self, n_epoch, variant, is_local_search, verbose):
+        """Core ant-colony loop for one variant; returns the winning flat action.
 
+        Factored out of ``__call__`` so the variant-U P-anchor arm (see
+        ``__call__``) can run a genuine ACO-P search -- construction,
+        pheromone feedback and elite selection all scored consistently as
+        'P' via ``self.variant`` -- without duplicating this loop or
+        entangling it with the outer variant. Callers must set
+        ``self.variant`` to ``variant`` before calling (``ls_lex_guarded``/
+        ``get_best`` read it).
+        """
         ants, pheromones = self.init_population(variant)
         best_obj = -np.inf
         elitist_epochs = []
@@ -559,6 +598,44 @@ class ACOHCARP(BaseHCARP):
         # elitist_epochs is a list of (possibly ragged) 1-D flat actions; get_best
         # -> calc_obj -> get_Ts iterates element-wise, so ragged lengths are fine.
         _, best_action = self.get_best(elitist_epochs)
+        return np.asarray(best_action)
+
+    def __call__(self, n_epoch=500, variant='P', is_local_search = True, verbose=False):
+        self.variant = variant
+        assert self.has_instance, "please import instance first"
+
+        best_action = self._search(n_epoch, variant, is_local_search, verbose)
+        best_T = get_Ts(self.vars, actions=best_action[None], variant=self.variant)
+
+        if variant == 'U':
+            # P-anchor arm (cf. BaseHCARP.ls_lex_guarded's LS arms and
+            # RLHybHCARP's greedy-anchor arm in solvers/rl.py): variant U's
+            # construction drops both the pheromone class-mask and the
+            # priority frontier that P's construction relies on (see
+            # `init_population`/`_construct_route`), so at scale it is much
+            # closer to an unguided random-permutation search and can end up
+            # lex-WORSE than a plain ACO-P run on the same instance (measured
+            # on data/test_bm/large.npz[71] pre-fix: ACO-U 22.16/50.56/86.51
+            # vs ACO-P 17.11/44.33/69.46 -- and ACO-P's own winning action
+            # rescored under the U evaluator reproduces its own score
+            # exactly). Run the real ACO-P search as a second arm -- same
+            # construction/pheromone/elitism loop, `self.variant` flipped to
+            # 'P' for the duration so it is a faithful standalone ACO-P run,
+            # not a hybrid scored under U -- then rescore its winning action
+            # under the U evaluator. U's decode is provably >= as good as P's
+            # decode of the same action (`SolutionEvaluator.__call__`'s U
+            # branch returns the lex-better of its own segment+LPT decode and
+            # `_build_P`), so this arm can never push the final answer below
+            # what a standalone ACO-P call would report. Take the lex-best of
+            # the two arms -- the same take-the-argmax-over-arms pattern as
+            # `ls_lex_guarded`/`upgrade_to_u`.
+            self.variant = 'P'
+            p_action = self._search(n_epoch, 'P', is_local_search, verbose)
+            self.variant = 'U'
+            p_as_u_T = get_Ts(self.vars, actions=p_action[None], variant='U')
+            if tuple(p_as_u_T[0].tolist()) < tuple(best_T[0].tolist()):
+                best_action, best_T = p_action, p_as_u_T
+
         # F1: expose the winning arc order for downstream logging (cf. ILS/EA).
-        self._last_best_action = np.asarray(best_action)
-        return get_Ts(self.vars, actions=best_action[None], variant=self.variant)
+        self._last_best_action = best_action
+        return best_T

@@ -15,13 +15,9 @@ from utils.local_search import (
     best_swap_intra,
     best_relocate_intra,
     intra_route_opt,
-    best_swap_inter,
     best_relocate_inter,
     inter_route_opt,
-    get_subtour_p,
-    get_subtour_u,
     ls,
-    lsRL,
 )
 from utils.ops import gen_tours, deserialize_tours
 
@@ -196,25 +192,6 @@ class TestEndToEnd(unittest.TestCase):
         vars = self._make_instance()
         out = ls(vars, variant='P', actions=[None])
         self.assertEqual(out, [[]])
-
-    def test_lsRL_runs_and_conserves(self):
-        vars = self._make_instance()
-        td = {
-            'adj': vars['adj'],
-            'service_times': vars['service_time'],
-            'clss': vars['clss'],
-        }
-        # tours as a padded (M, max_len) array
-        tours = np.array([
-            [0, 1, 2, 3, 0, 0],
-            [0, 4, 5, 6, 0, 0],
-        ], dtype=np.int32)
-        before = sorted([int(a) for row in tours for a in row if a != 0])
-        out = lsRL(td, tours)
-        self.assertEqual(out.shape, tours.shape)
-        after = sorted([int(a) for row in out for a in row if a != 0])
-        self.assertEqual(before, after)
-
 
 class TestNbUtils(unittest.TestCase):
     def test_gen_tours_roundtrip(self):

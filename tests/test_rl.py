@@ -470,8 +470,9 @@ class TestOracleHeadRegression(unittest.TestCase):
 
 class TestUpgradeToU(unittest.TestCase):
     """`upgrade_to_u`: the zero-training post-processing pass that runs the
-    unrestricted (variant-U) local-search kernels on the funnel's FINAL
-    variant-P winner and keeps the result only if lex-better.
+    move-level lex-safe unrestricted (variant-U) local search
+    (`u_route_opt_lex_safe`) on the funnel's FINAL variant-P winner and keeps
+    the result only if lex-better.
 
     Pins down the two contract points:
       1. default-off is byte-identical to before -- the upgrade code is never

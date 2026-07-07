@@ -704,7 +704,12 @@ if __name__ == "__main__":
         print(f"Saved -> {sol_path}")
     else:
         # ── batch benchmark mode ───────────────────────────────────────────
-        files = sorted(glob(args.path + '/*/*.npz'))
+        # --path may be: a single .npz file, a flat dir of .npz files (e.g.
+        # data/test_bm), or a nested city/bucket.npz dir (osm_test*).
+        if args.path.endswith('.npz') and os.path.isfile(args.path):
+            files = [args.path]
+        else:
+            files = sorted(glob(args.path + '/*/*.npz')) or sorted(glob(args.path + '/*.npz'))
         if args.hybrid:
             al = RLHybHCARP(ckpt_path, args.variant, shortlist=args.shortlist,
                             eps=args.eps, topk_t1=args.topk_t1,

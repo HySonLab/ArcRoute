@@ -113,8 +113,3 @@ class BaseRL(LightningModule):
 
     def test_step(self, batch, batch_idx, dataloader_idx=None):
         return self.shared_step(batch, batch_idx, phase="test", dataloader_idx=dataloader_idx)
-
-    def on_train_epoch_end(self):
-        sch = self.lr_schedulers()
-        if isinstance(sch, torch.optim.lr_scheduler.MultiStepLR):
-            sch.step()

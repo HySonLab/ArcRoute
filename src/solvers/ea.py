@@ -91,7 +91,12 @@ if __name__ == "__main__":
         print(f"Saved -> {sol_path}")
     else:
         # ── batch benchmark mode ───────────────────────────────────────────
-        files = sorted(glob(args.path + '/*/*.npz'))
+        # --path may be: a single .npz file, a flat dir of .npz files (e.g.
+        # data/test_bm), or a nested city/bucket.npz dir (osm_test*).
+        if args.path.endswith('.npz') and os.path.isfile(args.path):
+            files = [args.path]
+        else:
+            files = sorted(glob(args.path + '/*/*.npz')) or sorted(glob(args.path + '/*.npz'))
         tasks = [
             (f if i == 0 else f"{f}[{i}]", data, args.n_population, args.n_epoch, args.variant)
             for f in files for i, data in enumerate(iter_instances(f, M=args.M))

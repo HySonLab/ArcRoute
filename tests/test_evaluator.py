@@ -1,4 +1,4 @@
-"""SolutionEvaluator variant-U decode path (_segment + _assign + _order_trips).
+"""SolutionEvaluator variant-U decode path (_segment + _assign).
 
 Until the evaluate_batch variant fix, the metaheuristics never exercised this
 path (everything was silently scored through the P route-builder), so it had

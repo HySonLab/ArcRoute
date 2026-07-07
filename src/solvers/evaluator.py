@@ -10,9 +10,9 @@ Variants:
   - 'P' (precedence): `_build_P` spreads each class across M vehicles then
     inserts capacity reloads. Routes are globally class-sorted.
   - 'U' (upgrading): lex-better of the order-preserving segment decode
-    (`_segment` + greedy LPT `_assign` + `_order_trips`) and the `_build_P`
-    schedule — U's feasible set is a superset of P's, so the U decoder must
-    never score an action worse than the P decoder.
+    (`_segment` + greedy LPT `_assign`) and the `_build_P` schedule — U's
+    feasible set is a superset of P's, so the U decoder must never score an
+    action worse than the P decoder.
 
 T_k = max absolute completion time over class-k arcs (both variants).
 """
@@ -97,11 +97,6 @@ class SolutionEvaluator:
         if tuple(T_p.tolist()) < tuple(T_u.tolist()):
             return vehicles_p, T_p
         return vehicles_u, T_u
-
-    def reward(self, action, td, M=None):
-        """Scalar reward = -T_1."""
-        _, T = self.__call__(action, td, M)
-        return -float(T[0])
 
     # ------------------------------------------------------------- internals
     def _capacity(self, td):
@@ -237,20 +232,6 @@ class SolutionEvaluator:
             loads[v] += durations[idx]
         return vehicles
 
-    def _order_trips(self, veh_trips, td):
-        """Sort a vehicle's trips: lower class first, then by duration."""
-        if len(veh_trips) <= 1:
-            return veh_trips
-        if self._cls_np is None:
-            self._cache_td(td)
-        clss = self._cls_np
-
-        def key(trip):
-            cs = clss[np.asarray(trip, dtype=np.int64)]
-            return (int(cs.min()), float(self._trip_profile(trip, td)[2]))
-
-        return sorted(veh_trips, key=key)
-
     def _trip_profile(self, trip, td):
         """Return (arc_class, arc_completion, duration) for one trip."""
         if self._svc_np is None:
@@ -270,9 +251,9 @@ class SolutionEvaluator:
         """T_k = max absolute completion time over class-k arcs across all vehicles."""
         per_class = {p: [0.0] for p in self.pos_val}
         for veh_trips in vehicles:
-            # Profile each trip once and sort the cached profiles with
-            # _order_trips' exact key (lower class first, then duration) --
-            # previously each trip was profiled twice (again in the sort key).
+            # Profile each trip once, then order a vehicle's trips lower class
+            # first, then by duration (sorting the cached profiles avoids
+            # re-profiling every trip inside the sort key).
             profiles = [self._trip_profile(t, td) for t in veh_trips]
             if len(profiles) > 1:
                 profiles.sort(key=lambda pr: (int(pr[0].min()), float(pr[2])))
