@@ -7,9 +7,8 @@ import numpy as np
 import argparse
 from env.env import CARPEnv
 from policy.policy import AttentionModelPolicy
-from trainers.grpo import GRPO
+from trainers.grpo import GRPO, LexBestCheckpoint
 from lightning import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 def parse_args():
@@ -94,13 +93,14 @@ if __name__ == "__main__":
         train_buckets=train_buckets,
     )
 
-    checkpoint_callback = ModelCheckpoint(
+    # Exact lexicographic checkpoint selection on the per-level validation
+    # means (val/T1_best, ..., val/TP_best), keeping one best epoch + last.ckpt.
+    # Replaces ModelCheckpoint(monitor="val/lex_best"): that Horner-folded
+    # scalar can silently misorder near-ties, so it is logged as a diagnostic
+    # curve only and no longer decides which checkpoint survives.
+    checkpoint_callback = LexBestCheckpoint(
         dirpath=args.checkpoint_dir,
-        filename="{epoch:03d}",
-        save_top_k=1,
         save_last=True,
-        monitor="val/lex_best",
-        mode="max",
     )
 
     trainer = Trainer(

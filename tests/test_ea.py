@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from utils.ops import gen_tours, convert_prob, centered_lex_rank, deserialize_tours_batch
 from utils.local_search import ls
 from solvers.evaluator import evaluate_batch as get_Ts
-from solvers.meta import EAHCARP
+from solvers.meta import EAHCARP, lex_key
 
 
 def make_symmetric_adj(n, seed=0):
@@ -239,8 +239,8 @@ class TestGetParent(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestSelectionProb(unittest.TestCase):
     """EA's parent-selection probabilities are softmax over centered_lex_rank
-    (bounded [-1, +1]) rather than over the exact-lex calc_obj scalar, whose
-    LEX_C-scale dynamic range would collapse softmax to near-one-hot."""
+    (bounded [-1, +1]) rather than over any lex-folded scalar objective, whose
+    priority-scale dynamic range would collapse softmax to near-one-hot."""
 
     def setUp(self):
         np.random.seed(5)
@@ -256,15 +256,15 @@ class TestSelectionProb(unittest.TestCase):
         self.assertGreater(float(prob.min()), 0.0)
 
     def test_selection_prob_raw_lex_obj_would_degenerate(self):
-        # contrast: softmax over the exact-lex objective IS near-one-hot for a
+        # contrast: softmax over a lex-folded scalar (the retired Horner
+        # objective, obj = -sum_p T_p * C**(P-1-p)) IS near-one-hot for a
         # population whose individuals meaningfully differ (deterministic
         # hand-built T spread) — the reason EA must rank before softmaxing.
         T = np.array([[5.0, 10.0, 10.0],
                       [5.2,  9.0,  9.0],
                       [6.0,  8.0,  8.0],
                       [7.0,  7.0,  7.0]], dtype=np.float64)
-        with mock.patch('solvers.meta.get_Ts', return_value=T):
-            obj = self.al.calc_obj(np.zeros((4, 3), dtype=np.int32))
+        obj = -(T @ (1e4 ** np.arange(2, -1, -1, dtype=np.float64)))
         prob_raw = convert_prob(obj)
         self.assertGreater(float(prob_raw.max()), 0.99)
         # ...while the rank-based probability stays smooth for the same T
@@ -325,40 +325,41 @@ def make_adversarial_instance():
 class TestMutateLexGuarded(unittest.TestCase):
     def test_unguarded_u_ls_lex_worsens(self):
         """Document the failure mode: plain ls(variant='U') on the adversarial
-        instance strictly lex-worsens calc_obj (it only sees deadhead) — this
-        is exactly what the old mutate() did."""
+        instance strictly lex-worsens the T-vector (it only sees deadhead) —
+        this is exactly what the old mutate() did."""
         al = make_adversarial_instance()
         al.variant = 'U'
         pre = np.array([1, 2, 3], dtype=np.int32)
         tours = ls(al.vars, variant='U', actions=[pre])
         post = deserialize_tours_batch(tours, al.nseq)[0]
-        self.assertLess(float(al.calc_obj(post[None])[0]),
-                        float(al.calc_obj(pre[None])[0]))
+        self.assertGreater(lex_key(al.calc_Ts(post[None])[0]),
+                           lex_key(al.calc_Ts(pre[None])[0]))
 
     def test_mutate_u_keeps_t1_adversarial(self):
         al = make_adversarial_instance()
         al.variant = 'U'
         pre = np.array([1, 2, 3], dtype=np.int32)
         out = al.mutate(pre, variant='U')
-        self.assertGreaterEqual(float(al.calc_obj(out[None])[0]),
-                                float(al.calc_obj(pre[None])[0]) - 1e-9)
+        self.assertLessEqual(lex_key(al.calc_Ts(out[None])[0]),
+                             lex_key(al.calc_Ts(pre[None])[0]))
         # T1 must stay at its optimum (a then b: 1+1 + 1+1 = 4)
         T = get_Ts(al.vars, actions=out[None], variant='U')[0]
         self.assertAlmostEqual(float(T[0]), 4.0, places=9)
 
     def test_mutate_never_lex_worsens_random(self):
         """Property: for every individual and both variants, mutate's output
-        objective is >= the input's (the ls_lex_guarded guarantee)."""
+        T-vector is lex better-or-equal to the input's (the ls_lex_guarded
+        guarantee)."""
         for variant in ('P', 'U'):
             np.random.seed(42)
             al = make_instance(nv=3, seed=11, n_population=8)
             al.variant = variant
             pop = al.init_population()
-            pre = al.calc_obj(pop)
+            pre = al.calc_Ts(pop)
             for ind, p in zip(pop, pre):
                 out = al.mutate(ind, variant=variant)
-                self.assertGreaterEqual(
-                    float(al.calc_obj(out[None])[0]), float(p) - 1e-9,
+                self.assertLessEqual(
+                    lex_key(al.calc_Ts(out[None])[0]), lex_key(p),
                     msg=f"variant {variant}: mutate lex-worsened an individual")
 
     def test_mutate_variant_mismatch_asserts(self):
@@ -445,15 +446,15 @@ class TestEAEndToEnd(unittest.TestCase):
 
         pop = al.init_population()
         rand_ind = pop[np.random.randint(len(pop))]
-        base_obj = float(al.calc_obj(rand_ind[None])[0])
+        base_T = lex_key(al.calc_Ts(rand_ind[None])[0])
 
         T = al(n_epoch=10, variant='P')
         self.assertEqual(T.shape, (1, 3))
-        # Route both sides through calc_obj so the comparison is decoupled
-        # from calc_obj's internal weighting formula.
-        ea_obj = float(al.calc_obj(al._last_best_action[None])[0])
+        # Both sides are evaluator T-vectors; compare them the way the solver
+        # itself does — exact lex (tuple) order, lower is better.
+        ea_T = lex_key(al.calc_Ts(al._last_best_action[None])[0])
 
-        self.assertGreaterEqual(ea_obj, base_obj - 1e-6)
+        self.assertLessEqual(ea_T, base_T)
 
     def test_ea_result_feasible(self):
         np.random.seed(8)

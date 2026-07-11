@@ -11,12 +11,39 @@ from utils.local_search import ls
 from utils.ils_operators import perturbate, accept
 from copy import deepcopy
 
+
+def lex_sort(Ts):
+    """Stable lex-ascending row order of an (N, P) T-vector array (best first).
+
+    ``np.lexsort`` treats its LAST key as primary, so the priority levels are
+    passed in reverse order (T_P first, T_1 last) — the same convention as
+    rl.py's ``eps_lex_select``. Exact for any P and any magnitude: every level
+    is compared componentwise, never folded into a weighted scalar (whose
+    float64 dynamic range silently breaks the order as P grows).
+    """
+    Ts = np.asarray(Ts, dtype=np.float64)
+    return np.lexsort(Ts.T[::-1])
+
+
+def lex_argbest(Ts):
+    """Index of the lex-smallest T-vector row (first index wins exact ties,
+    like ``argmax`` on the scalar objective this replaces)."""
+    return int(lex_sort(Ts)[0])
+
+
+def lex_key(T):
+    """One T-vector as a plain tuple: Python tuple comparison short-circuits
+    on the first differing level with ordinary float ``<``, i.e. it IS the
+    exact lexicographic order (cf. the tuple compares in rl.py/oracle.py)."""
+    return tuple(np.asarray(T, dtype=np.float64).tolist())
+
+
 class BaseHCARP:
     def __init__(self):
         self.has_instance = False
         # Active problem variant ('P' precedence / 'U' upgrading). A sane
         # default; every algorithm's __call__ overwrites it from its `variant`
-        # parameter so calc_obj/get_Ts score solutions with the right decoder.
+        # parameter so calc_Ts/get_Ts score solutions with the right decoder.
         self.variant = 'P'
 
     def _load_data(self, dms, P, M, demands, clss, s, d, edge_indxs):
@@ -58,31 +85,25 @@ class BaseHCARP:
                 return False
         return True
     
-    # Lexicographic dominance base for calc_obj's Horner encoding
-    # obj = sum_p T_p * LEX_C**(P-1-p). Strict lex order (T1 > T2 > T3) is
-    # preserved as long as every T_p stays well below LEX_C: benchmark logs
-    # (logs/bm_*.out) show max T3 ~ 68, so LEX_C = 1e4 gives a ~150x safety
-    # margin — a T1 improvement of d dominates the lower levels whenever
-    # d > T_max/LEX_C ~ 0.007, far below any meaningful T1 difference, while
-    # keeping the total (~68e8 for P=3) small enough that float64 still
-    # resolves T3 differences down to ~1e-6. The old weights [1e3,1e1,1e-1]
-    # (100x per level) let a 0.01 T1 loss be outvoted by T2/T3 gains.
-    LEX_C = 1e4
+    def calc_Ts(self, actions):
+        """Hierarchical completion times, (N, P) — LOWER is lex-better.
 
-    def calc_obj(self, actions):
-        rewards = get_Ts(self.vars, actions=actions, variant=self.variant)  # (N, P), LOWER is better
-        P = rewards.shape[1]
-        w = self.LEX_C ** np.arange(P - 1, -1, -1, dtype=np.float64)
-        obj = rewards @ w
-        return -obj                                     # higher = better
-    
+        Solutions are ranked by exact componentwise lexicographic comparison
+        of these rows (``lex_sort``/``lex_argbest``/``lex_key``, cf.
+        solvers/rl.py), never by folding them into a single weighted scalar:
+        the old Horner encoding sum_p T_p * C**(P-1-p) needs C**(P-1) of
+        float64 dynamic range and silently misorders solutions once that
+        exceeds ~15-17 significant digits.
+        """
+        return get_Ts(self.vars, actions=actions, variant=self.variant)
+
     def calc_len(self, path):
         return -(self.s[path].sum() + self.dms[path[:-1], path[1:]].sum())
-    
+
     def get_best(self, samples):
-        obj = self.calc_obj(samples)
-        idx = obj.argmax()
-        return obj[idx], samples[idx]
+        Ts = self.calc_Ts(samples)
+        idx = lex_argbest(Ts)
+        return Ts[idx], samples[idx]
     
     def ls_lex_guarded(self, actions, max_len=None):
         """Lex-guarded local search (cf. solvers/rl.py's hybrid funnel).
@@ -94,8 +115,8 @@ class BaseHCARP:
         arcs deep into routes — trading T1 away for deadhead (measured on
         osm_test_small: T1 +40..80% right after the first ``ls`` pass).
 
-        Guard: run ``ls`` and keep each sample's result only if ``calc_obj``
-        (lex-weighted, higher = better) does not get worse than the pre-LS
+        Guard: run ``ls`` and keep each sample's result only if its
+        completion-time vector does not lex-worsen relative to the pre-LS
         input. Under 'U' a class-restricted 'P' ``ls`` arm is tried as well —
         every P-move is U-feasible, so variant U retains at least P's
         local-search power even when the unrestricted arm is rejected.
@@ -108,8 +129,9 @@ class BaseHCARP:
 
         Returns
         -------
-        (actions_list, obj_array) — per-sample lex-best over all arms; the
-        LS arms are preferred on exact ties so deadhead gains are kept.
+        (actions_list, Ts_array) — per-sample lex-best over all arms, with
+        the winners' (N, P) T-vectors; the LS arms are preferred on exact
+        ties so deadhead gains are kept.
         """
         if max_len is None:
             max_len = self.max_len
@@ -120,14 +142,15 @@ class BaseHCARP:
             tours = ls(self.vars, variant=var, actions=actions)
             arms.append([deserialize_tours(t, max_len) for t in tours])
         arms.append(actions)  # pre-LS fallback, last so LS arms win ties
-        objs = self._calc_obj_arms(arms)                       # (n_arms, N)
-        best = objs.argmax(axis=0)  # first max -> LS arm preferred on ties
+        Ts = self._calc_Ts_arms(arms)                       # (n_arms, N, P)
+        # first lex-min arm wins -> LS arm preferred on exact ties
+        best = [lex_argbest(Ts[:, i]) for i in range(len(actions))]
         idx = np.arange(len(actions))
-        return [arms[k][i] for i, k in enumerate(best)], objs[best, idx]
+        return [arms[k][i] for i, k in enumerate(best)], Ts[best, idx]
 
-    def _calc_obj_arms(self, arms):
-        """``calc_obj`` for several arms of the same sample batch, scoring each
-        distinct action once per sample.
+    def _calc_Ts_arms(self, arms):
+        """``calc_Ts`` for several arms of the same sample batch, scoring each
+        distinct action once per sample. Returns (n_arms, N, P).
 
         Exact: the evaluator's decode depends only on an action's nonzero arc
         order (every path in ``SolutionEvaluator`` starts from ``a[a != 0]``;
@@ -137,7 +160,7 @@ class BaseHCARP:
         input unchanged. Values are identical to scoring every arm in full.
         """
         n = len(arms[0])
-        objs = np.empty((len(arms), n), dtype=np.float64)
+        rows = [[None] * n for _ in range(len(arms))]
         memo = [{} for _ in range(n)]
         for k, arm in enumerate(arms):
             pending, pending_actions = [], []
@@ -145,16 +168,16 @@ class BaseHCARP:
                 a = np.asarray(act)
                 key = a[a != 0].astype(np.int64, copy=False).tobytes()
                 if key in memo[i]:
-                    objs[k, i] = memo[i][key]
+                    rows[k][i] = memo[i][key]
                 else:
                     pending.append((i, key))
                     pending_actions.append(act)
             if pending_actions:
-                vals = self.calc_obj(pending_actions)
+                vals = self.calc_Ts(pending_actions)
                 for (i, key), val in zip(pending, vals):
-                    objs[k, i] = val
+                    rows[k][i] = val
                     memo[i][key] = val
-        return objs
+        return np.asarray(rows, dtype=np.float64)
 
     def get_once(self, M, clss, attemp=10):
         # Bin-packing lower bound: if the eligible arcs' total demand exceeds
@@ -202,8 +225,8 @@ class InsertCheapestHCARP(BaseHCARP):
         # Lex-guarded local search (see BaseHCARP.ls_lex_guarded): the raw
         # deadhead-only ``ls`` must never lex-worsen (T1,T2,T3) — under
         # variant U it otherwise trades T1 away for deadhead.
-        acts, objs = self.ls_lex_guarded(actions)
-        best = acts[int(objs.argmax())]
+        acts, Ts = self.ls_lex_guarded(actions)
+        best = acts[lex_argbest(Ts)]
         return get_Ts(self.vars, actions=best[None], variant=self.variant)
     
 class ILSHCARP(BaseHCARP):
@@ -213,8 +236,8 @@ class ILSHCARP(BaseHCARP):
     refined by the inter/intra ``ls`` operators; the ILS loop then alternates a
     feasibility-preserving ``perturbate`` kick with a full local search and an
     acceptance test (``'best'`` improvement-only or ``'sa'`` simulated
-    annealing). The objective (``calc_obj``, higher = better) is the negated
-    lexicographically-weighted (T1, T2, T3).
+    annealing). Solutions are compared by their completion-time vectors
+    (T1, ..., TP) directly — exact lexicographic order, lower is better.
 
     Every ``ls`` application goes through ``ls_lex_guarded``: the deadhead-
     minimising local search is kept only when it does not lex-worsen the
@@ -228,6 +251,25 @@ class ILSHCARP(BaseHCARP):
         self.accept_mode = accept_mode
         self.T_init = T_init
         self.T_final = T_final
+
+    def _accept_lex(self, cur_T, cand_T, it, max_iter):
+        """Acceptance test on lex keys (``lex_key`` tuples, lower = better).
+
+        ``'best'``: accept iff the candidate is lex better-or-equal — the
+        same ties-accepted rule as ``ils_operators.accept``. ``'sa'``: a
+        lex-worsening candidate may still be accepted via ``accept``'s
+        annealing schedule, fed the (negated, higher = better) values at the
+        FIRST priority level where the vectors differ — the level that
+        decides the lex comparison — so no cross-level weighted scalar is
+        ever formed.
+        """
+        if cand_T <= cur_T:
+            return True
+        if self.accept_mode != 'sa':
+            return False
+        j = next(i for i, (a, b) in enumerate(zip(cur_T, cand_T)) if a != b)
+        return accept(-cur_T[j], -cand_T[j], it, max_iter, mode='sa',
+                      T_init=self.T_init, T_final=self.T_final)
 
     def __call__(self, max_iter=200, variant='P', num_init_sample=5,
                  seed=None, verbose=False):
@@ -245,13 +287,13 @@ class ILSHCARP(BaseHCARP):
         samples = [self.get_once(self.M, self.clss) for _ in range(num_init_sample)]
         samples = [s for s in samples if s is not None]
         assert samples, "construction failed to produce a feasible solution"
-        acts, objs = self.ls_lex_guarded(samples)
-        k = int(objs.argmax())
-        cur_obj, cur_action = float(objs[k]), acts[k]
+        acts, Ts = self.ls_lex_guarded(samples)
+        k = lex_argbest(Ts)
+        cur_T, cur_action = lex_key(Ts[k]), acts[k]
         cur_routes = gen_tours(cur_action)
 
         best_action = cur_action.copy()
-        best_obj = cur_obj
+        best_T = cur_T
         capacity = 1.0
         # Defensive: never re-serialise narrower than the current action (the
         # constructive path always yields exactly self.max_len, so this is a
@@ -263,22 +305,21 @@ class ILSHCARP(BaseHCARP):
             pert = perturbate(cur_routes, self.dms, self.demands, self.clss,
                               capacity, variant, rng, strength=self.strength)
             pert_action = deserialize_tours(pert, max_len)
-            cands, cobjs = self.ls_lex_guarded([pert_action], max_len=max_len)
+            cands, cTs = self.ls_lex_guarded([pert_action], max_len=max_len)
             cand_action = cands[0]
-            cand_obj = float(cobjs[0])
+            cand_T = lex_key(cTs[0])
 
-            if accept(cur_obj, cand_obj, it, max_iter, mode=self.accept_mode,
-                      T_init=self.T_init, T_final=self.T_final):
+            if self._accept_lex(cur_T, cand_T, it, max_iter):
                 cur_action = cand_action
-                cur_obj = cand_obj
+                cur_T = cand_T
                 cur_routes = gen_tours(cand_action)
 
-            if cand_obj > best_obj:
+            if cand_T < best_T:
                 best_action = cand_action.copy()
-                best_obj = cand_obj
+                best_T = cand_T
 
             if verbose and it % 20 == 0:
-                print(f"iter {it}: cur={cur_obj:.4f} best={best_obj:.4f}")
+                print(f"iter {it}: cur={cur_T} best={best_T}")
 
         # 3. report the hierarchical completion times of the best solution
         self._last_best_action = best_action
@@ -376,16 +417,17 @@ class EAHCARP(BaseHCARP):
 
         population = self.init_population()
         for epoch in range(n_epoch):
-            # selecting two of the best options we have (elitism)
-            obj = self.calc_obj(population)
-            idxs = np.argsort(obj)
-            new_population = [population[idxs[-1]], population[idxs[-2]]]
-            # Roulette-wheel selection: softmax over the exact-lex calc_obj would
-            # collapse to near-one-hot (LEX_C-scale dynamic range), killing the
-            # fitness-proportional diversity EA relies on. Rank instead: the
-            # centered hierarchical midrank is bounded in [-1, +1] regardless of
-            # the population's absolute T spread. gamma=0.5 matches GRPO's
-            # adv_gamma default — same multi-priority-combination philosophy.
+            # selecting two of the best options we have (elitism, exact lex)
+            idxs = lex_sort(self.calc_Ts(population))
+            new_population = [population[idxs[0]], population[idxs[1]]]
+            # Roulette-wheel selection needs actual probabilities, not just an
+            # ordering — and softmax over any lex-folded scalar objective would
+            # collapse to near-one-hot (its dynamic range spans priority
+            # levels), killing the fitness-proportional diversity EA relies
+            # on. Rank instead: the centered hierarchical midrank is bounded
+            # in [-1, +1] regardless of the population's absolute T spread.
+            # gamma=0.5 matches GRPO's adv_gamma default — same
+            # multi-priority-combination philosophy.
             T_population = get_Ts(self.vars, actions=population, variant=self.variant)
             prob = convert_prob(centered_lex_rank(T_population, gamma=0.5))
             nb = len(population) // 2 - 1
@@ -394,9 +436,9 @@ class EAHCARP(BaseHCARP):
             # ls_lex_guarded call instead of ~nb per-child calls. This is
             # byte-identical to the historical per-pair operate() loop:
             # make_pair draws the exact same np.random sequence (mutation
-            # never consumed randomness — ls and calc_obj are deterministic),
+            # never consumed randomness — ls and calc_Ts are deterministic),
             # children don't feed back into this epoch's selection, and
-            # ls_lex_guarded/_calc_obj_arms treat every sample independently.
+            # ls_lex_guarded/_calc_Ts_arms treat every sample independently.
             # Batching only amortises the per-call Python/evaluator overhead.
             pairs = run_parallel2(self.make_pair, [prob]*nb, population=population)
             children, mut_idx = [], []
@@ -412,11 +454,10 @@ class EAHCARP(BaseHCARP):
             population = new_population
             if verbose:
                 if epoch % 10 == 0:
-                    obj = self.calc_obj(population)
-                    idx = np.argsort(obj)[-1]
-                    print(f"epoch {epoch}:", obj[idx])
+                    Ts = self.calc_Ts(population)
+                    print(f"epoch {epoch}:", Ts[lex_argbest(Ts)])
 
-        routes = population[self.calc_obj(population).argmax()]
+        routes = population[lex_argbest(self.calc_Ts(population))]
         self._last_best_action = np.asarray(routes)
         return get_Ts(self.vars, actions=routes[None], variant=self.variant)
 
@@ -561,7 +602,7 @@ class ACOHCARP(BaseHCARP):
         ``get_best`` read it).
         """
         ants, pheromones = self.init_population(variant)
-        best_obj = -np.inf
+        best_T = None                      # lex incumbent (verbose reporting)
         elitist_epochs = []
         for epoch in range(n_epoch):
 
@@ -577,26 +618,27 @@ class ACOHCARP(BaseHCARP):
             # refine tours by lex-guarded local search (see
             # BaseHCARP.ls_lex_guarded): the raw deadhead-only ``ls`` must
             # never lex-worsen (T1,T2,T3) — under variant U it otherwise
-            # trades T1 away for deadhead. Reuse the guard's objectives for
+            # trades T1 away for deadhead. Reuse the guard's T-vectors for
             # the elite pick instead of re-scoring via get_best.
             if is_local_search:
-                elitist_ants, objs = self.ls_lex_guarded(elitist_ants)
-                k = int(objs.argmax())
-                ant_obj, best_ants = objs[k], elitist_ants[k]
+                elitist_ants, Ts = self.ls_lex_guarded(elitist_ants)
+                k = lex_argbest(Ts)
+                ant_T, best_ants = Ts[k], elitist_ants[k]
             else:
-                ant_obj, best_ants = self.get_best(elitist_ants)
+                ant_T, best_ants = self.get_best(elitist_ants)
             pheromones = self.update_pheromones(best_ants, pheromones)
 
-            best_obj = max(best_obj, ant_obj)
+            if best_T is None or lex_key(ant_T) < best_T:
+                best_T = lex_key(ant_T)
             elitist_epochs.append(best_ants)
             if verbose:
                 if epoch % 10 == 0:
-                    print(f"epoch {epoch}:", best_obj)
+                    print(f"epoch {epoch}:", best_T)
 
         # F3: guard the all-epochs-empty case before scoring the elite archive.
         assert elitist_epochs, "ACO failed to construct any feasible solution"
         # elitist_epochs is a list of (possibly ragged) 1-D flat actions; get_best
-        # -> calc_obj -> get_Ts iterates element-wise, so ragged lengths are fine.
+        # -> calc_Ts -> get_Ts iterates element-wise, so ragged lengths are fine.
         _, best_action = self.get_best(elitist_epochs)
         return np.asarray(best_action)
 

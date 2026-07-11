@@ -2,6 +2,7 @@
 
 Run: uv run python -m unittest tests.test_grpo -v
 """
+import os
 import unittest
 from unittest import mock
 
@@ -280,7 +281,8 @@ class TestGRPOStep(unittest.TestCase):
         self.assertTrue(pgrads and all(torch.isfinite(g).all() for g in pgrads))
 
     def test_eval_step_logs_lex_best(self):
-        """⭐ Val rollout logs val/lex_best (the lexicographic checkpoint monitor)."""
+        """⭐ Val rollout logs val/lex_best (diagnostic curve metric) and the
+        per-level val/T{p}_best means that LexBestCheckpoint selects on."""
         from lightning import Trainer
         env, policy, model = self._build(tag="grpo_val")
         dl = _synthetic_dl()
@@ -291,6 +293,8 @@ class TestGRPOStep(unittest.TestCase):
         with mock.patch.object(model.env, 'dataset', side_effect=lambda *a, **kw: dl):
             trainer.fit(model)
         self.assertIn("val/lex_best", trainer.callback_metrics)
+        for p in (1, 2, 3):
+            self.assertIn(f"val/T{p}_best", trainer.callback_metrics)
 
     def test_smoke_P_then_U(self):
         for variant in ("P", "U"):
@@ -640,6 +644,174 @@ class TestBac3DecoderUpgrade(unittest.TestCase):
             g = getattr(ctx, name).weight.grad
             self.assertIsNotNone(g, f"{name} got no gradient")
             self.assertTrue(torch.isfinite(g).all(), f"{name} grad not finite")
+
+
+class TestLexBestCheckpoint(unittest.TestCase):
+    """⭐ Exact lexicographic checkpoint selection (LexBestCheckpoint) — the
+    Horner val/lex_best scalar is diagnostic-only and must no longer decide
+    which epoch's weights survive (mirror of the solvers/meta.py lex fix)."""
+
+    @staticmethod
+    def _fake_trainer(epoch, T, prefix="val/T", suffix="_best"):
+        """Minimal fit-time trainer stub: epoch metrics for the P levels of T,
+        recording save_checkpoint / strategy.remove_checkpoint calls.
+        Metrics are float64 tensors: the callback's own path (float() + tuple
+        compare) must add ZERO rounding of its own, which these tests verify;
+        whatever dtype the logging pipeline delivers is compared exactly."""
+        from lightning.pytorch.trainer.states import TrainerFn
+        tr = mock.MagicMock()
+        tr.sanity_checking = False
+        tr.state.fn = TrainerFn.FITTING
+        tr.current_epoch = epoch
+        tr.callback_metrics = {
+            f"{prefix}{p + 1}{suffix}": torch.tensor(v, dtype=torch.float64)
+            for p, v in enumerate(T)}
+        return tr
+
+    def _run_epochs(self, cb, seq):
+        """Feed per-epoch (T_1..T_P) means through on_validation_end; return
+        the fake trainers (for save/remove call inspection)."""
+        trainers = []
+        for epoch, T in enumerate(seq):
+            tr = self._fake_trainer(epoch, T)
+            cb.on_validation_end(tr, None)
+            trainers.append(tr)
+        return trainers
+
+    def test_near_tie_immune_to_scalar_folding(self):
+        """⭐ MAIN REGRESSION: real near-tie pair from an EA run on
+        data/test_bm/small.npz[1] (variant P). A's T1 is strictly better by
+        ~6e-8, so the _LEX_C=1e4 Horner scalar (T1 weight 1e8) lets B's ~2 s
+        T2 advantage outvote it: ModelCheckpoint(monitor="val/lex_best",
+        mode="max") would have kept epoch 0 (B) and silently discarded the
+        truly-best epoch 1 (A). Exact tuple comparison keeps epoch 1."""
+        from trainers.grpo import LexBestCheckpoint, _LEX_C
+        A = (6.27379846572876, 16.42958915233612, 25.919182538986206)
+        B = (6.2737985253334045, 14.437795132398605, 21.55321180820465)
+
+        def horner(T):
+            lex = T[0]
+            for v in T[1:]:
+                lex = lex * _LEX_C + v
+            return -lex  # the logged val/lex_best (mode="max")
+
+        # Demonstrate the failure mode the fix removes: the scalar prefers B.
+        self.assertGreater(horner(B), horner(A))
+
+        cb = LexBestCheckpoint(dirpath="ckpt_dir", save_last=False)
+        trainers = self._run_epochs(cb, [B, A])
+        self.assertEqual(cb.best_T, A)
+        self.assertTrue(cb.best_model_path.endswith("epoch=001.ckpt"))
+        trainers[1].save_checkpoint.assert_called_once_with(cb.best_model_path)
+        # Epoch 0's file (the lex-worse one) was removed on improvement.
+        trainers[1].strategy.remove_checkpoint.assert_called_once()
+
+    def test_magnitude_robust_at_higher_P(self):
+        """For P=6 the Horner scalar needs C**5 = 1e20 of float64 dynamic
+        range: a last-level difference is not even representable, the scalars
+        collapse to equality and mode="max" keeps the earlier (worse) epoch.
+        Tuple comparison is exact for any P and any magnitude."""
+        from trainers.grpo import LexBestCheckpoint, _LEX_C
+        P = 6
+        A = tuple([1e2] * (P - 1) + [1.0])
+        B = tuple([1e2] * (P - 1) + [1.0 + 1e-9])
+        w = np.array([_LEX_C ** k for k in range(P - 1, -1, -1)])
+        self.assertEqual(float(np.dot(A, w)), float(np.dot(B, w)))  # collapses
+
+        cb = LexBestCheckpoint(dirpath="ckpt_dir", save_last=False)
+        self._run_epochs(cb, [B, A])
+        self.assertEqual(cb.best_T, A)
+        self.assertTrue(cb.best_model_path.endswith("epoch=001.ckpt"))
+
+    def test_ties_and_worse_epochs_keep_earlier_best(self):
+        """Strict '<': an exactly-tied or lex-worse later epoch never re-saves
+        (same tie behavior as the old mode="max" monitor); a T2 improvement
+        under equal T1 does win."""
+        from trainers.grpo import LexBestCheckpoint
+        good = (5.0, 9.0, 50.0)
+        cb = LexBestCheckpoint(dirpath="ckpt_dir", save_last=False)
+        trainers = self._run_epochs(
+            cb, [good, good, (5.0, 9.5, 1.0), (5.0, 8.0, 99.0)])
+        self.assertEqual(cb.best_T, (5.0, 8.0, 99.0))     # T1 tie -> T2 decides
+        self.assertTrue(cb.best_model_path.endswith("epoch=003.ckpt"))
+        trainers[1].save_checkpoint.assert_not_called()   # exact tie: no save
+        trainers[2].save_checkpoint.assert_not_called()   # lex-worse: no save
+
+    def test_guards_and_save_last(self):
+        """No saves during sanity check / outside fit / without val metrics;
+        save_last=True writes last.ckpt on every fit-time validation end."""
+        from lightning.pytorch.trainer.states import TrainerFn
+        from trainers.grpo import LexBestCheckpoint
+        cb = LexBestCheckpoint(dirpath="ckpt_dir", save_last=True)
+
+        sanity = self._fake_trainer(0, (1.0, 1.0, 1.0))
+        sanity.sanity_checking = True
+        cb.on_validation_end(sanity, None)
+        sanity.save_checkpoint.assert_not_called()
+
+        testing = self._fake_trainer(0, (1.0, 1.0, 1.0))
+        testing.state.fn = TrainerFn.TESTING
+        cb.on_validation_end(testing, None)
+        testing.save_checkpoint.assert_not_called()
+
+        no_metrics = self._fake_trainer(0, ())
+        cb.on_validation_end(no_metrics, None)  # only last.ckpt, no best
+        no_metrics.save_checkpoint.assert_called_once()
+        self.assertTrue(no_metrics.save_checkpoint.call_args[0][0]
+                        .endswith("last.ckpt"))
+        self.assertIsNone(cb.best_T)
+
+        real = self._fake_trainer(1, (2.0, 3.0, 4.0))
+        cb.on_validation_end(real, None)  # best + last
+        self.assertEqual(real.save_checkpoint.call_count, 2)
+        self.assertEqual(cb.best_T, (2.0, 3.0, 4.0))
+
+    def test_state_dict_roundtrip(self):
+        """best-so-far survives save/restore (full trainer-state resume)."""
+        from trainers.grpo import LexBestCheckpoint
+        cb = LexBestCheckpoint(dirpath="ckpt_dir", save_last=False)
+        self._run_epochs(cb, [(3.0, 2.0, 1.0)])
+        cb2 = LexBestCheckpoint(dirpath="ckpt_dir", save_last=False)
+        cb2.load_state_dict(cb.state_dict())
+        self.assertEqual(cb2.best_T, (3.0, 2.0, 1.0))
+        self.assertEqual(cb2.best_model_path, cb.best_model_path)
+        # A lex-worse epoch after resume does not steal the best slot.
+        tr = self._fake_trainer(9, (3.0, 2.0, 1.5))
+        cb2.on_validation_end(tr, None)
+        tr.save_checkpoint.assert_not_called()
+
+    def test_end_to_end_writes_best_and_last(self):
+        """⭐ Real CPU Trainer fit with LexBestCheckpoint: best epoch=EEE.ckpt
+        and last.ckpt land on disk, best_T is the (T1,T2,T3) tuple of the
+        logged val means."""
+        import tempfile
+        from lightning import Trainer
+        from trainers.grpo import LexBestCheckpoint
+        torch.manual_seed(0)
+        env = _make_env()
+        model = _make_model(GRPO, env, _make_policy(), tag="lexckpt",
+                            group_size=8)
+        dl = _synthetic_dl()
+        with tempfile.TemporaryDirectory() as tmp:
+            cb = LexBestCheckpoint(dirpath=tmp, save_last=True)
+            trainer = Trainer(accelerator="cpu", devices=1, max_epochs=1,
+                              limit_train_batches=1, limit_val_batches=1,
+                              num_sanity_val_steps=0,
+                              callbacks=[cb], logger=False,
+                              enable_progress_bar=False,
+                              enable_checkpointing=False)
+            with mock.patch.object(model.env, 'dataset',
+                                   side_effect=lambda *a, **kw: dl):
+                trainer.fit(model)
+            self.assertTrue(cb.best_model_path.endswith("epoch=000.ckpt"))
+            self.assertTrue(os.path.isfile(cb.best_model_path))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "last.ckpt")))
+            self.assertEqual(len(cb.best_T), 3)
+            for p in (1, 2, 3):
+                self.assertAlmostEqual(
+                    cb.best_T[p - 1],
+                    float(trainer.callback_metrics[f"val/T{p}_best"]),
+                    places=6)
 
 
 class TestEncoderShare(unittest.TestCase):

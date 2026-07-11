@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from utils.ils_operators import perturbate, accept, routes_to_action
 from utils.local_search import ls
 from utils.ops import gen_tours, deserialize_tours_batch
-from solvers.meta import BaseHCARP, ILSHCARP
+from solvers.evaluator import evaluate_batch
+from solvers.meta import BaseHCARP, ILSHCARP, lex_sort, lex_argbest, lex_key
 
 
 def make_symmetric_adj(n, seed=0):
@@ -193,44 +194,57 @@ class TestRoutesToAction(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 1d. calc_obj — exact lexicographic ordering (regression for the old
-#     weighted-sum [1e3, 1e1, 1e-1] which was NOT lex-order preserving)
+# 1d. lex_sort / lex_argbest / lex_key — exact lexicographic ordering.
+#     Regression guard: ranking must never go back through a folded weighted
+#     scalar (Horner encoding obj = sum_p T_p * C**(P-1-p)); the fixtures
+#     below include REAL T-vector pairs the old LEX_C=1e4 scalar misordered.
 # --------------------------------------------------------------------------- #
-class TestCalcObjLexOrder(unittest.TestCase):
-    def test_calc_obj_prefers_better_T1(self):
-        """A=(5.00,10,10) beats B=(5.01,5,5) on the primary objective; the old
-        weights ranked B higher (5060.5 < 5101), i.e. -obj_B > -obj_A."""
-        al = make_instance(nv=3, seed=5)
+class TestLexOrder(unittest.TestCase):
+    def test_prefers_better_T1(self):
+        """A=(5.00,10,10) beats B=(5.01,5,5) on the primary objective."""
         T = np.array([[5.00, 10.0, 10.0],
                       [5.01,  5.0,  5.0]], dtype=np.float64)
-        dummy_actions = np.zeros((2, 3), dtype=np.int32)
-        with mock.patch('solvers.meta.get_Ts', return_value=T):
-            obj = al.calc_obj(dummy_actions)
-        # sanity: the old formula really does misrank this pair
-        w_old = np.array([1e3, 1e1, 1e-1])
-        self.assertGreater((-T @ w_old)[1], (-T @ w_old)[0])
-        # the fixed calc_obj must rank A (better T1) strictly above B
-        self.assertGreater(obj[0], obj[1])
+        self.assertEqual(lex_argbest(T), 0)
+        self.assertLess(lex_key(T[0]), lex_key(T[1]))
 
-    def test_calc_obj_ties_break_on_lower_levels(self):
+    def test_ties_break_on_lower_levels(self):
         """Equal T1 -> T2 decides; equal T1,T2 -> T3 decides."""
-        al = make_instance(nv=3, seed=5)
         T = np.array([[5.0, 9.0, 50.0],
                       [5.0, 9.5,  1.0],
                       [5.0, 9.0, 49.0]], dtype=np.float64)
-        with mock.patch('solvers.meta.get_Ts', return_value=T):
-            obj = al.calc_obj(np.zeros((3, 3), dtype=np.int32))
-        self.assertGreater(obj[2], obj[0])   # same T1,T2 -> lower T3 wins
-        self.assertGreater(obj[0], obj[1])   # same T1 -> lower T2 wins
+        self.assertEqual(lex_sort(T).tolist(), [2, 0, 1])
 
-    def test_calc_obj_generalizes_over_P(self):
-        """Weight vector is built from rewards.shape[1], not hardcoded P=3."""
-        al = make_instance(nv=3, seed=5)
+    def test_generalizes_over_P(self):
+        """Comparison is componentwise over however many levels are present,
+        not hardcoded P=3."""
         T = np.array([[1.0, 2.0, 3.0, 10.0],
                       [1.0, 2.0, 3.0,  9.0]], dtype=np.float64)
-        with mock.patch('solvers.meta.get_Ts', return_value=T):
-            obj = al.calc_obj(np.zeros((2, 3), dtype=np.int32))
-        self.assertGreater(obj[1], obj[0])
+        self.assertEqual(lex_argbest(T), 1)
+
+    def test_near_tie_immune_to_scalar_folding(self):
+        """Real pair from an EA run on data/test_bm/small.npz[1] (variant P):
+        A's T1 is strictly better by ~6e-8, so the old LEX_C=1e4 Horner
+        scalar (T1 weight 1e8) let B's ~2 s T2 advantage outvote it — a
+        silent lex misordering. Exact comparison must pick A."""
+        A = np.array([6.27379846572876, 16.42958915233612, 25.919182538986206])
+        B = np.array([6.2737985253334045, 14.437795132398605, 21.55321180820465])
+        w = 1e4 ** np.arange(2, -1, -1, dtype=np.float64)
+        self.assertLess(B @ w, A @ w)                       # scalar misorders
+        self.assertEqual(lex_argbest(np.stack([A, B])), 0)  # exact lex does not
+        self.assertLess(lex_key(A), lex_key(B))
+
+    def test_magnitude_robust_at_higher_P(self):
+        """For P=6 the Horner scalar needs C**5 = 1e20 of float64 dynamic
+        range, so a last-level difference is not even representable — the
+        scalars collapse to exact equality. Componentwise comparison is exact
+        for any P and any magnitude."""
+        P = 6
+        A = np.array([1e2] * (P - 1) + [1.0])
+        B = np.array([1e2] * (P - 1) + [1.0 + 1e-9])
+        w = 1e4 ** np.arange(P - 1, -1, -1, dtype=np.float64)
+        self.assertEqual(A @ w, B @ w)                      # scalar collapses
+        self.assertEqual(lex_argbest(np.stack([A, B])), 0)
+        self.assertLess(lex_key(A), lex_key(B))
 
 
 # --------------------------------------------------------------------------- #
@@ -245,24 +259,24 @@ class TestILS(unittest.TestCase):
         # samples -> local search -> best. ILS's best-ever tracking starts from
         # exactly this solution, so its final answer must match or beat it.
         # (An *external* construction sample is NOT a valid baseline: ILS never
-        # sees it, and the exact-lex objective has no weighted-sum slack.)
+        # sees it, and exact lex comparison has no weighted-sum slack.)
         np.random.seed(123)
         samples = [al.get_once(al.M, al.clss) for _ in range(5)]
         samples = [s for s in samples if s is not None]
         self.assertTrue(samples)
         tours_batch = ls(al.vars, variant='P', actions=samples)
         action_batch = deserialize_tours_batch(tours_batch, al.nseq)
-        base_obj = float(al.get_best(action_batch)[0])
+        base_T = lex_key(al.get_best(action_batch)[0])
 
         T = al(max_iter=50, variant='P', num_init_sample=5, seed=123)
         # get_Ts returns shape (1, P)
         self.assertEqual(T.shape, (1, 3))
-        # Route both sides through calc_obj so the comparison is decoupled
-        # from calc_obj's internal weighting formula.
-        ils_obj = float(al.calc_obj(al._last_best_action[None])[0])
+        # Both sides are evaluator T-vectors; compare them the way the solver
+        # itself does — exact lex (tuple) order, lower is better.
+        ils_T = lex_key(al.calc_Ts(al._last_best_action[None])[0])
 
         # ILS result must be at least as good as its own initialization
-        self.assertGreaterEqual(ils_obj, base_obj - 1e-6)
+        self.assertLessEqual(ils_T, base_T)
 
     def test_ils_sa_mode_runs(self):
         al = make_instance(nv=3, seed=7)
@@ -292,8 +306,8 @@ def make_adversarial_instance():
     local search flips the class-1 pair. But the class-1 prefix gets slower:
     T1([a,b,·]) = 1+1+1+1 = 4 vs T1([b,a,·]) = 2+1+2+1 = 6. The flip is a
     WITHIN-class reorder, so both U decode arms (order-preserving segment and
-    class-sorted _build_P) inherit the damage: calc_obj strictly lex-worsens
-    under both variants' scoring. The P-restricted ls finds the same flip
+    class-sorted _build_P) inherit the damage: the T-vector strictly
+    lex-worsens under both variants' scoring. The P-restricted ls finds the same flip
     (same-class swaps are P-legal), so only the pre-LS fallback of
     ``ls_lex_guarded`` protects T1 here.
     """
@@ -332,30 +346,29 @@ def make_adversarial_instance():
 class TestLsLexGuarded(unittest.TestCase):
     def test_unguarded_u_ls_lex_worsens(self):
         """Document the failure mode: plain ls(variant='U') on the adversarial
-        instance strictly lex-worsens calc_obj (it only sees deadhead)."""
+        instance strictly lex-worsens the T-vector (it only sees deadhead)."""
         al = make_adversarial_instance()
         al.variant = 'U'
         pre = np.array([1, 2, 3], dtype=np.int32)
         tours = ls(al.vars, variant='U', actions=[pre])
         post = deserialize_tours_batch(tours, al.nseq)[0]
-        self.assertLess(float(al.calc_obj(post[None])[0]),
-                        float(al.calc_obj(pre[None])[0]))
+        self.assertGreater(lex_key(al.calc_Ts(post[None])[0]),
+                           lex_key(al.calc_Ts(pre[None])[0]))
 
     def test_guard_never_lex_worsens_adversarial(self):
         al = make_adversarial_instance()
         al.variant = 'U'
         pre = np.array([1, 2, 3], dtype=np.int32)
-        acts, objs = al.ls_lex_guarded([pre])
-        self.assertGreaterEqual(float(objs[0]),
-                                float(al.calc_obj(pre[None])[0]) - 1e-9)
+        acts, Ts = al.ls_lex_guarded([pre])
+        self.assertLessEqual(lex_key(Ts[0]),
+                             lex_key(al.calc_Ts(pre[None])[0]))
         # T1 must stay at its optimum (a then b: 1+1 + 1+1 = 4)
-        from solvers.evaluator import evaluate_batch
         T = evaluate_batch(al.vars, actions=[acts[0]], variant='U')[0]
         self.assertAlmostEqual(float(T[0]), 4.0, places=9)
 
     def test_guard_never_lex_worsens_random(self):
         """Property: for every sample and both variants, the guarded LS
-        objective is >= the pre-LS objective."""
+        T-vector is lex better-or-equal to the pre-LS T-vector."""
         for variant in ('P', 'U'):
             al = make_instance(nv=3, seed=11)
             al.variant = variant
@@ -363,10 +376,11 @@ class TestLsLexGuarded(unittest.TestCase):
             samples = [al.get_once(al.M, al.clss) for _ in range(8)]
             samples = [s for s in samples if s is not None]
             self.assertTrue(samples)
-            pre_obj = al.calc_obj(samples)
-            _, objs = al.ls_lex_guarded(samples)
-            self.assertTrue(np.all(objs >= pre_obj - 1e-9),
-                            msg=f"variant {variant}: {objs} < {pre_obj}")
+            pre_Ts = al.calc_Ts(samples)
+            _, Ts = al.ls_lex_guarded(samples)
+            for post, pre in zip(Ts, pre_Ts):
+                self.assertLessEqual(lex_key(post), lex_key(pre),
+                                     msg=f"variant {variant}: {post} > {pre}")
 
     def test_ils_u_end_to_end_keeps_t1(self):
         """Full ILS under U on the adversarial instance must report the

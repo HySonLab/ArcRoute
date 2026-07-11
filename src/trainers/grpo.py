@@ -20,14 +20,97 @@ The env must run in reward_mode='vector' so the rollout reward is the (B*K,3)
 T-vector that the rank consumes.
 """
 
+import os
+import re
+
 import torch
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.trainer.states import TrainerFn
 
 from utils.ops import batchify, unbatchify
 from .base import BaseRL
 
-# Lexicographic separation constant for the val/lex_best model-selection scalar
-# (T_1 weight = _LEX_C^2, T_2 = _LEX_C, T_3 = 1). Must dominate the T_2/T_3 range.
+# Lexicographic separation constant for the val/lex_best DIAGNOSTIC scalar
+# (T_1 weight = _LEX_C^2, T_2 = _LEX_C, T_3 = 1). Curve-watching only: the
+# Horner fold can silently misorder near-ties (a ~1e-8 T_1 improvement is
+# swamped by a ~1 s T_2/T_3 difference — same failure fixed in solvers/meta.py),
+# so checkpoint selection uses LexBestCheckpoint's exact tuple comparison instead.
 _LEX_C = 1.0e4
+
+# Epoch-mean per-level validation metrics logged by GRPO._eval_step; the
+# captured group is the 1-indexed priority level, so sorting on it rebuilds
+# the (T_1, ..., T_P) tuple for any P.
+_VAL_T_RE = re.compile(r"^val/T(\d+)_best$")
+
+
+class LexBestCheckpoint(Callback):
+    """Checkpoint selection by EXACT lexicographic comparison — replaces
+    `ModelCheckpoint(monitor="val/lex_best", mode="max")`.
+
+    Lightning's ModelCheckpoint can only argmax ONE logged float across epochs,
+    which forced the P-level objective through the Horner fold above — a scalar
+    that can misorder near-ties (and for large P cannot even represent a
+    last-level difference within float64). This callback instead reads the
+    per-level epoch means `val/T{p}_best` from `trainer.callback_metrics` at
+    the end of every fit-time validation epoch and compares the (T_1,...,T_P)
+    tuple (lower = better) against the best seen so far with Python tuple
+    comparison — exact for any P and any magnitude, mirroring the
+    lex_key/lexsort fix in solvers/meta.py.
+
+    Distributed safety: those metrics are logged with sync_dist=True, so after
+    reduction every rank holds identical values and takes the identical
+    save/skip decision; `trainer.save_checkpoint` is a collective that writes
+    on rank zero only. File layout matches the old callback: one best
+    `epoch=EEE.ckpt` (previous best removed on improvement) plus `last.ckpt`.
+    """
+
+    def __init__(self, dirpath: str, save_last: bool = True):
+        super().__init__()
+        self.dirpath = dirpath
+        self.save_last = save_last
+        self.best_T = None         # (T_1,...,T_P) epoch means of the best epoch
+        self.best_model_path = ""  # mirrors ModelCheckpoint's attribute name
+
+    @staticmethod
+    def _val_T_tuple(trainer):
+        """Rebuild (T_1, ..., T_P) from callback_metrics; None if absent
+        (e.g. limit_val_batches=0 runs)."""
+        found = [(int(m.group(1)), float(v))
+                 for k, v in trainer.callback_metrics.items()
+                 if (m := _VAL_T_RE.match(k))]
+        if not found:
+            return None
+        found.sort()
+        return tuple(v for _, v in found)
+
+    def on_validation_end(self, trainer, pl_module):
+        # Same guards as ModelCheckpoint: never save during the sanity check
+        # or outside trainer.fit (standalone trainer.validate/test calls).
+        if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
+            return
+        T = self._val_T_tuple(trainer)
+        # Exact componentwise lex comparison; strict '<' so ties keep the
+        # earlier epoch (same tie behavior as ModelCheckpoint mode="max").
+        if T is not None and (self.best_T is None or T < self.best_T):
+            prev = self.best_model_path
+            self.best_T = T
+            self.best_model_path = os.path.join(
+                self.dirpath, f"epoch={trainer.current_epoch:03d}.ckpt")
+            trainer.save_checkpoint(self.best_model_path)
+            if prev and prev != self.best_model_path:
+                trainer.strategy.remove_checkpoint(prev)  # rank-zero internally
+        if self.save_last:
+            trainer.save_checkpoint(os.path.join(self.dirpath, "last.ckpt"))
+
+    # Best-so-far survives a full trainer-state resume (Trainer(ckpt_path=...)),
+    # so a resumed run cannot overwrite the best file with a lex-worse epoch.
+    def state_dict(self):
+        return {"best_T": self.best_T, "best_model_path": self.best_model_path}
+
+    def load_state_dict(self, state_dict):
+        best = state_dict.get("best_T")
+        self.best_T = tuple(best) if best is not None else None
+        self.best_model_path = state_dict.get("best_model_path", "")
 
 
 def _centered_midrank(x):
@@ -342,7 +425,10 @@ class GRPO(BaseRL):
                 sync_dist=True,
                 batch_size=B,
             )
-        # Lex scalar on GPU via Horner: (T0*C+T1)*C+T2
+        # Lex scalar via Horner: (T0*C+T1)*C+T2 — DIAGNOSTIC ONLY (human curve
+        # metric). Checkpoint selection is LexBestCheckpoint's exact tuple
+        # comparison on the val/T{p}_best epoch means logged above; the folded
+        # scalar must never drive an automated argmax (it misorders near-ties).
         lex = reward[:, 0].clone()
         for j in range(1, P):
             lex = lex * _LEX_C + reward[:, j]

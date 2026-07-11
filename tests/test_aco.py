@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from utils.ops import gen_tours, deserialize_tours_batch
 from utils.local_search import ls
 from solvers.evaluator import evaluate_batch as get_Ts
-from solvers.meta import ACOHCARP
+from solvers.meta import ACOHCARP, lex_key
 
 
 def make_symmetric_adj(n, seed=0):
@@ -282,15 +282,15 @@ def make_adversarial_instance():
 class TestLocalSearchLexGuarded(unittest.TestCase):
     def test_unguarded_u_ls_lex_worsens(self):
         """Document the failure mode: plain ls(variant='U') on the adversarial
-        instance strictly lex-worsens calc_obj (it only sees deadhead) — this
-        is exactly what the old is_local_search branch did."""
+        instance strictly lex-worsens the T-vector (it only sees deadhead) —
+        this is exactly what the old is_local_search branch did."""
         al = make_adversarial_instance()
         al.variant = 'U'
         pre = np.array([1, 2, 3], dtype=np.int32)
         tours = ls(al.vars, variant='U', actions=[pre])
         post = deserialize_tours_batch(tours, al.nseq)[0]
-        self.assertLess(float(al.calc_obj(post[None])[0]),
-                        float(al.calc_obj(pre[None])[0]))
+        self.assertGreater(lex_key(al.calc_Ts(post[None])[0]),
+                           lex_key(al.calc_Ts(pre[None])[0]))
 
     def test_aco_u_local_search_keeps_t1(self):
         """End-to-end __call__ under U with is_local_search=True: force every
@@ -316,10 +316,11 @@ class TestLocalSearchLexGuarded(unittest.TestCase):
             elit = [al.construct_route(a, ph, variant=variant) for a in ants]
             elit = [e for e in elit if e is not None]
             self.assertTrue(elit)
-            pre = al.calc_obj(elit)
-            _, objs = al.ls_lex_guarded(elit)
-            self.assertTrue(np.all(objs >= pre - 1e-9),
-                            msg=f"variant {variant}: {objs} < {pre}")
+            pre = al.calc_Ts(elit)
+            _, Ts = al.ls_lex_guarded(elit)
+            for post, p in zip(Ts, pre):
+                self.assertLessEqual(lex_key(post), lex_key(p),
+                                     msg=f"variant {variant}: {post} > {p}")
 
 
 # --------------------------------------------------------------------------- #
