@@ -97,16 +97,31 @@ def build_graph(es):
     V_t = set().union(*V_t_k.values()) if V_t_k else set()
     V_t = V_t | {depot}  # depot is a service-relevant vertex too
 
-    # ----- all original arcs A ------------------------------------------- #
+    # ----- all original arcs A (parallel arcs collapsed) ----------------- #
+    # Parallel arcs sharing the same (tail, head) are merged into a single
+    # deadhead arc keeping the CHEAPEST traversal time. This is exact for
+    # deadheading (a walk never gains from a costlier parallel copy) and is
+    # REQUIRED for correctness: the deadhead variables y are indexed by the
+    # (tail, head) pair, so if A kept both copies the flow-balance (11) and
+    # deadhead-cost (3) sums -- which iterate A / A' -- would reference the
+    # SAME y variable twice. That double-charges the arc's cost AND injects a
+    # phantom second unit of flow through its endpoints, which the balance
+    # constraints then have to cancel with spurious extra deadheading. The
+    # net effect inflates t_{m,k}: SCIP proves an "optimum" strictly worse
+    # than a solution the true model admits (reproduced on small.npz
+    # instances 18/21/52/63, whose shortest depot->service deadheads run
+    # through such a duplicated arc). Deduplicating restores the intended
+    # deadhead network.
     cost = {}
-    A = []
     nodes = set()
     for tail, head, _d, _c, _s, traversal in np.vstack([req, nonreq]):
         a = (int(tail), int(head))
-        A.append(a)
-        cost[a] = float(traversal)
+        c = float(traversal)
+        if a not in cost or c < cost[a]:
+            cost[a] = c
         nodes.add(int(tail))
         nodes.add(int(head))
+    A = list(cost.keys())  # unique (tail, head) arcs, insertion order
 
     # ----- dummy node + transition arcs A_f / A_t ------------------------ #
     dummy = max(nodes) + 1
@@ -315,6 +330,155 @@ def _extract_T(model, T, P):
                     dtype=np.float64)
 
 
+def _heuristic_routes(es):
+    """Per-vehicle serviced-arc sequences from the InsertCheapest heuristic.
+
+    Returns a list of lists of (tail, head) arcs in service order (one list per
+    used vehicle, class-sorted), or None if the constructive heuristic fails.
+    Mirrors ``_heuristic_ub``'s call convention (fixed seed, RNG save/restore)
+    so the routing matches the schedule whose value ``_heuristic_ub`` reports.
+    """
+    try:
+        from solvers.meta import InsertCheapestHCARP, lex_argbest
+        from utils.ops import gen_tours
+        state = np.random.get_state()
+        try:
+            np.random.seed(0xA5C1)
+            h = InsertCheapestHCARP()
+            h.import_instance(es)
+            acts = [h.get_once(h.M, h.clss) for _ in range(20)]
+            acts = [a for a in acts if a is not None]
+            if not acts:
+                return None
+            arms, Ts = h.ls_lex_guarded(acts)
+            best = arms[lex_argbest(Ts)]
+        finally:
+            np.random.set_state(state)
+        # 1-based arc indices; gen_tours strips depot sentinels.
+        return [[int(a) for a in tour[1:-1]] for tour in gen_tours(best)]
+    except Exception:
+        return None
+
+
+def _warmstart_u(G, es, w, routes=None):
+    """Build a MILP-U-feasible starting incumbent + its objective.
+
+    Takes a P-feasible routing (class-sorted per vehicle) and translates it
+    into MILP-U variable values: class-k arcs are serviced at hierarchy
+    level = (rank of class k among the classes that vehicle actually serves),
+    i.e. the vehicle's occupied levels form a prefix (matching the
+    level-compaction symmetry break), and the inter-service deadheads are
+    realised as shortest paths over the deadhead network A, so the flow-balance
+    (28) / level-linking (25) / capacity (27) constraints all hold by
+    construction. A P-feasible schedule is always U-feasible, so this is both a
+    valid incumbent AND a valid objective cutoff.
+
+    ``routes`` is an optional per-vehicle list of 1-based required-arc-index
+    sequences in service order (depot sentinels are tolerated/stripped). When
+    supplied — e.g. the ACTUAL MILP-P optimal routing via
+    ``p_service_order_routes`` — the translated incumbent has the P optimum's
+    completion times, so MILP-U starts from (and, since SCIP only keeps
+    improving incumbents, never regresses below) T_1^P. When ``routes`` is None
+    the fast InsertCheapest constructive heuristic's routing is used instead
+    (the standalone default / fallback).
+
+    Returns (vals, obj) with ``vals`` = {'x','y','r','t','T'} keyed exactly as
+    ``solve_milp_u``'s variables, or (None, None) on any failure (the caller
+    then falls back to the plain heuristic bound with no warm start).
+    """
+    if routes is None:
+        routes = _heuristic_routes(es)
+    if routes is None:
+        return None, None
+    # Tolerate depot sentinels (0) so callers may pass reconstruct_routes_p's
+    # raw per-vehicle arrays ([0, a_i, ..., 0]) directly.
+    routes = [[int(a) for a in seq if int(a) != 0] for seq in routes]
+    P, Mn = G['P'], G['M']
+    M = list(range(Mn))
+    levels = list(range(1, P + 1))
+    classes = levels
+    depot, dummy = G['depot'], G['dummy']
+    req = G['req_arcs']
+
+    # deadhead network (deduplicated A with cheapest traversal costs)
+    DG = nx.DiGraph()
+    for a in G['A']:
+        DG.add_edge(a[0], a[1], weight=G['cost'][a])
+
+    def path_arcs(u, v):
+        if u == v:
+            return []
+        try:
+            seq = nx.shortest_path(DG, u, v, weight='weight')
+        except Exception:
+            return None
+        return [(seq[i], seq[i + 1]) for i in range(len(seq) - 1)]
+
+    xval = {(m, a, h): 0 for m in M for a in req for h in levels}
+    yval = {(m, a, h): 0 for m in M for a in G['A_prime'] for h in levels}
+    rval = {(m, k, h): 0 for m in M for k in classes for h in levels}
+    tval = {(m, 0): 0.0 for m in M}
+    Tval = {k: 0.0 for k in classes}
+
+    for m in M:
+        seq = routes[m] if m < len(routes) else []
+        arcs = [req[a - 1] for a in seq]  # heuristic order, class-sorted
+        by_class = {}
+        for a in arcs:
+            by_class.setdefault(G['cls'][a], []).append(a)
+        prev_exit = depot
+        h = 0
+        for k in sorted(by_class):        # occupied levels form a prefix
+            h += 1
+            cur = prev_exit
+            dh = sv = 0.0
+            for a in by_class[k]:
+                pa = path_arcs(cur, a[0])
+                if pa is None:
+                    return None, None
+                for e in pa:
+                    yval[(m, e, h)] += 1
+                    dh += G['cost'][e]
+                xval[(m, a, h)] = 1
+                sv += G['s'][a]
+                cur = a[1]
+            yval[(m, (dummy, prev_exit), h)] = 1   # A_f: enter level h
+            yval[(m, (cur, dummy), h)] = 1          # A_t: exit level h
+            rval[(m, k, h)] = 1
+            tval[(m, h)] = tval[(m, h - 1)] + sv + dh
+            Tval[k] = max(Tval[k], tval[(m, h)])
+            prev_exit = cur
+        for hh in range(h + 1, P + 1):    # trailing empty levels stay put
+            yval[(m, (dummy, prev_exit), hh)] = 1
+            yval[(m, (prev_exit, dummy), hh)] = 1
+            tval[(m, hh)] = tval[(m, hh - 1)]
+
+    obj = float(sum(w[k] * Tval[k] for k in classes))
+    return {'x': xval, 'y': yval, 'r': rval, 't': tval, 'T': Tval}, obj
+
+
+def _inject_u(model, vals, x, y, r, t, T):
+    """Register ``vals`` as a starting incumbent; return True if SCIP keeps it.
+
+    Built in the ORIGINAL problem space (createSol before optimize/transform);
+    addSol transfers it into the solution store, so SCIP starts branch-and-
+    bound from this incumbent instead of having to discover one.
+    """
+    sol = model.createSol()
+    for key, var in x.items():
+        model.setSolVal(sol, var, vals['x'][key])
+    for key, var in y.items():
+        model.setSolVal(sol, var, vals['y'][key])
+    for key, var in r.items():
+        model.setSolVal(sol, var, vals['r'][key])
+    for key, var in t.items():
+        if not isinstance(var, float):     # (m, 0) entries are plain floats
+            model.setSolVal(sol, var, vals['t'][key])
+    for key, var in T.items():
+        model.setSolVal(sol, var, vals['T'][key])
+    return model.addSol(sol)
+
+
 # --------------------------------------------------------------------------- #
 # MILP-P (Section 3.3)
 # --------------------------------------------------------------------------- #
@@ -472,7 +636,7 @@ def solve_milp_p(es, time_limit=3600, threads=8, verbose=False,
 # MILP-U (Section 3.4)
 # --------------------------------------------------------------------------- #
 def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
-                 return_model=False, heur_ub=True):
+                 return_model=False, heur_ub=True, p_solution=None):
     G = build_graph(es)
     P, Mn, Q = G['P'], G['M'], G['Q']
     M = list(range(Mn))
@@ -493,12 +657,41 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
     model = Model('HDCARP-U')
     _configure(model, time_limit, threads, verbose)
 
-    # Objective cutoff from a fast feasible heuristic (same rationale as
-    # MILP-P): any feasible schedule upper-bounds the optimum, so SCIP can
-    # prune against it from node 1. The bound is the value of a P-feasible
-    # schedule, which is also U-feasible (see _heuristic_ub), so exactness is
-    # preserved; if the cutoff ever proves too tight we re-solve without it.
-    ub_obj = _heuristic_ub(es, w, P, variant='U') if heur_ub else None
+    # Warm start (constructed below the variables) + objective cutoff. The
+    # MILP-U model is much larger than MILP-P (x and r carry an extra level
+    # index), and SCIP's default heuristics fail to find ANY incumbent within
+    # the time budget on several small-tier instances -- reported as
+    # "infeasible / no solution" even though every one is feasible (any
+    # P-feasible schedule is U-feasible). We therefore translate the
+    # InsertCheapest heuristic's P-feasible routing into a concrete U incumbent
+    # and inject it after the model is built (see _warmstart_u / _inject_u).
+    #
+    # The cutoff is taken from THAT SAME schedule's objective rather than from
+    # a separate _heuristic_ub() call: the two agree to float noise, but using
+    # the injected solution's own value guarantees the incumbent survives the
+    # objlimit (a value from an independent evaluator can round a hair below
+    # the reconstruction and reject the very solution we seed). If the warm
+    # start cannot be built we fall back to the plain heuristic bound.
+    #
+    # ``p_solution`` (optional): the ACTUAL MILP-P optimal routing for this
+    # instance (per-vehicle 1-based arc-index sequences in true service order,
+    # from ``p_service_order_routes``). Because HDCARP-U relaxes HDCARP-P's
+    # precedence constraint, every P-feasible schedule is U-feasible; seeding SCIP with
+    # the *proven-optimal* P routing (instead of the fast-but-suboptimal
+    # InsertCheapest heuristic) makes MILP-U's initial incumbent equal to the P
+    # optimum, so the reported T_1 starts at T_1^P and can only stay equal or
+    # improve — it can never regress above T_1^P. When p_solution is None the
+    # heuristic routing is used (standalone default / fallback for instances
+    # where MILP-P is not available or not proven).
+    warm_vals, ub_obj = (_warmstart_u(G, es, w, routes=p_solution)
+                         if heur_ub else (None, None))
+    if warm_vals is None and p_solution is not None and heur_ub:
+        # A supplied P routing failed to translate (e.g. an arc pair with no
+        # deadhead path in the deduplicated network) -- fall back to the
+        # constructive heuristic warm start so feasibility is still guaranteed.
+        warm_vals, ub_obj = _warmstart_u(G, es, w, routes=None)
+    if ub_obj is None and heur_ub:
+        ub_obj = _heuristic_ub(es, w, P, variant='U')
     if ub_obj is not None:
         model.setObjlimit(ub_obj + 1e-3)
 
@@ -646,6 +839,13 @@ def solve_milp_u(es, time_limit=3600, threads=8, verbose=False,
     # P x P matrix per vehicle whose values are mostly implied by x, so
     # forcing them to the top of the tree wastes the search.
 
+    # Inject the P-feasible warm start as the initial incumbent (see above).
+    # Guarantees NSols >= 1 whenever the instance is feasible, so SCIP reports
+    # a solution instead of a spurious "no solution", and gives the search a
+    # good primal bound to improve on rather than to rediscover.
+    if warm_vals is not None:
+        _inject_u(model, warm_vals, x, y, r, t, T)
+
     model.optimize()
     if (ub_obj is not None and model.getNSols() == 0
             and model.getStatus() in ('infeasible', 'inforunbd')):
@@ -701,6 +901,65 @@ def reconstruct_routes_p(model, x_vars, G, req_raw, adj):
                 route_arcs.extend(ordered)
                 prev = route_arcs[-1]
         routes.append(np.array([0] + route_arcs + [0], dtype=np.int32))
+    return routes
+
+
+def p_service_order_routes(model, x_vars, y_vars, G, req_raw):
+    """Per-vehicle serviced-arc sequences in the P solution's TRUE order.
+
+    Unlike ``reconstruct_routes_p`` (which re-orders each class's arcs by a
+    greedy nearest-neighbour heuristic — fine for a human-readable route log
+    but lossy w.r.t. the optimal deadhead structure), this follows the P
+    solution's own flow: for each (vehicle, class) it walks an Euler circuit
+    of the serviced (x) and deadhead (y) arcs the solver actually used,
+    starting/ending at the dummy node, and records the serviced arcs in the
+    order they are traversed. Feeding the result to ``_warmstart_u`` (which
+    realises inter-service deadheads as shortest paths) reproduces the P
+    optimum's completion times EXACTLY, because in the P optimum every
+    consecutive-service deadhead is already a shortest path.
+
+    Returns a list (one per vehicle) of 1-based required-arc-index sequences
+    concatenated across classes 1..P — the format ``_warmstart_u``/
+    ``solve_milp_u(p_solution=...)`` expect.
+    """
+    a2i = _arc_to_idx_map(req_raw)
+    dummy = G['dummy']
+    routes = []
+    for m in range(G['M']):
+        seq = []
+        for k in range(1, G['P'] + 1):
+            # Collect the arcs (tail, head, arc_index_or_None) this vehicle
+            # uses at class/level k: serviced required arcs and deadheads (with
+            # integer multiplicity), plus the dummy transition arcs A_f / A_t.
+            used = []
+            for a in G['req_by_class'][k]:
+                if model.getVal(x_vars[(m, a)]) > 0.5:
+                    used.append((a[0], a[1], a2i[a]))
+            for a in G['A_prime']:
+                cnt = int(round(model.getVal(y_vars[(m, a, k)])))
+                used.extend([(a[0], a[1], None)] * cnt)
+            if not used:
+                continue
+            # Hierholzer Euler circuit from the dummy node (the flow is
+            # balanced per node by constraint (11), so a circuit exists).
+            adj = {}
+            for eidx, (tail, _h, _ai) in enumerate(used):
+                adj.setdefault(tail, []).append(eidx)
+            circuit = []
+            stack = [(dummy, None)]
+            while stack:
+                v, ein = stack[-1]
+                bucket = adj.get(v)
+                if bucket:
+                    eidx = bucket.pop()
+                    stack.append((used[eidx][1], eidx))
+                else:
+                    _, e = stack.pop()
+                    if e is not None:
+                        circuit.append(e)
+            circuit.reverse()
+            seq.extend(used[e][2] for e in circuit if used[e][2] is not None)
+        routes.append(seq)
     return routes
 
 

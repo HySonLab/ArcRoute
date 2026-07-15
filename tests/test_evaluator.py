@@ -118,32 +118,23 @@ class TestUDecodeInterleaved(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(T)))
         self.assertTrue(np.all(T >= 0))
 
-    def test_no_phantom_vehicles_when_trips_exceed_M(self):
-        """Regression: demands force k_min=3 trips with M=1 -- the old code
-        gave every trip its own vehicle (len(vehicles) == #trips > M) and its
-        T1 assumed illegal parallelism."""
+    def test_over_capacity_single_vehicle_is_infeasible(self):
+        """Reload-bug fix (was test_no_phantom_vehicles_when_trips_exceed_M):
+        total demand 2.4 with ONE vehicle needs >1 trip. The old code served it
+        by chaining reload trips onto one vehicle's clock (finite T assuming an
+        illegal multi-trip). The fixed evaluator must score it INFEASIBLE
+        (+inf) — a single vehicle cannot serve more than its capacity Q."""
         n = 5
         adj = np.ones((n, n)) - np.eye(n)
         td = {
             "adj": adj,
             "service_times": np.array([0.0, 1.0, 1.0, 1.0, 1.0]),
             "clss": np.array([0, 1, 1, 1, 1], dtype=np.int64),
-            "demand": np.array([0.0, 0.6, 0.6, 0.6, 0.6]),  # total 2.4 -> 3 trips
+            "demand": np.array([0.0, 0.6, 0.6, 0.6, 0.6]),  # total 2.4 > Q
         }
-        vehicles, T_seq = SolutionEvaluator(variant="U")([1, 2, 3, 4], td, M=1)
-        self.assertEqual(len(vehicles), 1)
-        n_trips = len(vehicles[0])
-        self.assertGreaterEqual(n_trips, 3)
-        served = sorted(int(a) for trip in vehicles[0] for a in trip)
-        self.assertEqual(served, [1, 2, 3, 4])
-        # sequential trips on one vehicle: T1 must cover at least the sum of
-        # all-but-last trip durations plus the last arc, i.e. strictly more
-        # than any single trip's duration (the phantom-parallel lower bound).
-        ev = SolutionEvaluator(variant="U")
-        ev._cache_td(td)
-        longest_trip = max(float(ev._trip_profile(t, td)[2])
-                           for t in vehicles[0])
-        self.assertGreater(float(T_seq[0]), longest_trip)
+        _, T_seq = SolutionEvaluator(variant="U")([1, 2, 3, 4], td, M=1)
+        self.assertFalse(np.all(np.isfinite(T_seq)),
+                         "single vehicle serving >Q should be infeasible (reload)")
 
 
 # --------------------------------------------------------------------------- #
@@ -163,9 +154,12 @@ class TestEvaluateBatchVariant(unittest.TestCase):
     def test_variant_reaches_evaluator(self):
         """Regression: before the fix evaluate_batch silently defaulted to
         'P' for both variants, so U and P scored identically everywhere.
-        Uses an instance where the segment arm strictly lex-beats the P
-        decode (see TestUDualDecode.split_win_td) so the two variants MUST
-        produce different T-vectors."""
+        Uses an instance where the two variants MUST produce different
+        T-vectors. With the reload fix, the class-1 arc (demand 0.6) plus the
+        two class-2 arcs (0.3 each) sum to 1.2 > Q on the single unpartitioned
+        route [1,2,3], so the P decode (which honours the action's own —
+        here absent — vehicle boundaries: one route) is INFEASIBLE, while the
+        U segment arm splits it into two feasible single-trip vehicles."""
         td = split_win_td()
         vars = {
             "adj": td["adj"],
@@ -178,7 +172,7 @@ class TestEvaluateBatchVariant(unittest.TestCase):
         TU = evaluate_batch(vars, actions, variant="U")
         TP = evaluate_batch(vars, actions, variant="P")
         np.testing.assert_allclose(TU, [[2.0, 4.0, 0.0]])
-        np.testing.assert_allclose(TP, [[2.0, 12.0, 0.0]])
+        self.assertFalse(np.all(np.isfinite(TP)))          # single route > Q
         self.assertFalse(np.allclose(TU, TP))
 
     def test_default_is_P(self):
@@ -286,6 +280,60 @@ class TestULeqP(unittest.TestCase):
         # weighted-lexicographic objective (same spirit as the MILP test)
         w = np.array([1e6, 1e3, 1.0])
         self.assertLessEqual((TU @ w).min(), (TP @ w).min() + 1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# reload-bug fix: whole-route single budget, no reload trips
+# --------------------------------------------------------------------------- #
+class TestReloadScoring(unittest.TestCase):
+    def _td(self):
+        # depot + 2 class-1 arcs, demand 0.6 each. adj=1 off-diagonal.
+        n = 3
+        adj = np.ones((n, n)) - np.eye(n)
+        return {
+            "adj": adj,
+            "service_times": np.array([0.0, 1.0, 1.0]),
+            "clss": np.array([0, 1, 1], dtype=np.int64),
+            "demand": np.array([0.0, 0.6, 0.6]),
+        }
+
+    def test_old_build_P_reload_chunk_now_infeasible(self):
+        """0.6 + 0.6 = 1.2 > Q on ONE vehicle. The OLD _build_P fed the route
+        through _split_by_capacity, which inserted a depot reload and returned
+        a finite (illegally multi-trip) T. The fix scores it +inf."""
+        td = self._td()
+        _, T = SolutionEvaluator(variant="P")([1, 2], td, M=1)   # no separators
+        self.assertFalse(np.all(np.isfinite(T)))
+
+    def test_partition_respected_maps_trips_to_distinct_vehicles(self):
+        """Same two arcs, but the action's own 0-separator splits them across
+        two vehicles: feasible, single-trip each, scored as PARALLEL routes
+        (each arc completes at 0->arc = svc+adj = 2, not chained)."""
+        td = self._td()
+        vehicles, T = SolutionEvaluator(variant="P")([1, 0, 2], td, M=2)
+        # exactly one trip per used vehicle, both arcs served once
+        n_trips = sum(len(v) for v in vehicles)
+        self.assertEqual(n_trips, 2)
+        served = sorted(int(a) for v in vehicles for t in v for a in t)
+        self.assertEqual(served, [1, 2])
+        # parallel single trips: T1 = max over the two vehicles' class-1 arc
+        # completion = 0->arc->(depot) : svc(1)+adj(0,arc)=1+1 = 2 (NOT 4, which
+        # a reload/chained decode would give).
+        np.testing.assert_allclose(T, [2.0, 0.0, 0.0])
+
+    def test_more_trips_than_vehicles_infeasible(self):
+        """A 2-vehicle instance whose action needs 3 single-trip routes
+        (three 0-separated segments) can't be served by 2 vehicles -> +inf."""
+        n = 4
+        adj = np.ones((n, n)) - np.eye(n)
+        td = {
+            "adj": adj,
+            "service_times": np.array([0.0, 1.0, 1.0, 1.0]),
+            "clss": np.array([0, 1, 1, 1], dtype=np.int64),
+            "demand": np.array([0.0, 0.9, 0.9, 0.9]),  # each needs its own trip
+        }
+        _, T = SolutionEvaluator(variant="P")([1, 0, 2, 0, 3], td, M=2)
+        self.assertFalse(np.all(np.isfinite(T)))
 
 
 if __name__ == "__main__":

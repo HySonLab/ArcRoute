@@ -36,29 +36,28 @@ class SolutionEvaluator:
 
     # ------------------------------------------------------------------ public
     def routes_from_joint_actions(self, actions, M, N1):
-        """Decode flat Joint M×N action sequence → per-vehicle trips.
+        """Decode flat Joint M×N action sequence → per-vehicle routes.
 
         actions : 1D array, action = vehicle_m * N1 + arc_j (j==0 → depot).
         Returns : list (len M) of lists-of-trips (each trip = 1D arc-index array).
+
+        Reload-bug fix (see docs/root-cause-allow.md): each vehicle serves ONE
+        continuous route under a single capacity budget. A mid-route depot
+        visit (j==0) is legal transit but does NOT open a new trip / refresh
+        capacity, so every vehicle's arcs are collected into a SINGLE trip. If
+        that route's cumulative demand exceeds Q, ``_completion_times`` scores
+        the solution infeasible (a would-be reload) rather than silently
+        chaining a second trip onto the same vehicle.
         """
         M = max(int(M), 1)
-        vehicles = [[] for _ in range(M)]
-        cur_trip = [[] for _ in range(M)]
+        arcs = [[] for _ in range(M)]
         for a in np.asarray(actions).ravel().tolist():
             m = int(a) // N1
             j = int(a) % N1
-            if m >= M:
+            if m >= M or j == 0:
                 continue
-            if j == 0:
-                if cur_trip[m]:
-                    vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
-                    cur_trip[m] = []
-            else:
-                cur_trip[m].append(j)
-        for m in range(M):
-            if cur_trip[m]:
-                vehicles[m].append(np.array(cur_trip[m], dtype=np.int64))
-        return vehicles
+            arcs[m].append(j)
+        return [[np.array(a, dtype=np.int64)] if a else [] for a in arcs]
 
     def __call__(self, action, td, M=None, joint=False):
         """Evaluate one instance. Return (vehicles, T_vec).
@@ -77,11 +76,11 @@ class SolutionEvaluator:
         is_joint = joint or (a.size > 0 and int(a.max()) >= N1)
         if is_joint:
             vehicles = self.routes_from_joint_actions(a, M, N1)
-            return vehicles, self._completion_times(vehicles, td)
+            return vehicles, self._completion_times(vehicles, td, require_complete=True)
 
         if self.variant == "P":
             vehicles = self._build_P(action, td, M)
-            return vehicles, self._completion_times(vehicles, td)
+            return vehicles, self._completion_times(vehicles, td, require_complete=True)
 
         # Variant U. U's scheduling freedom is a strict superset of P's:
         # every class-sorted P schedule is U-feasible, so a correct U decoder
@@ -91,9 +90,9 @@ class SolutionEvaluator:
         # stack all class-1 arcs onto one vehicle where _build_P spreads
         # them) — decode both ways and return the lex-better schedule.
         vehicles_u = self._decode_U_segment(action, td, M)
-        T_u = self._completion_times(vehicles_u, td)
+        T_u = self._completion_times(vehicles_u, td, require_complete=True)
         vehicles_p = self._build_P(action, td, self._fleet_size(action, td, M))
-        T_p = self._completion_times(vehicles_p, td)
+        T_p = self._completion_times(vehicles_p, td, require_complete=True)
         if tuple(T_p.tolist()) < tuple(T_u.tolist()):
             return vehicles_p, T_p
         return vehicles_u, T_u
@@ -158,30 +157,47 @@ class SolutionEvaluator:
         return segs
 
     def _build_P(self, action, td, M):
-        """Build M vehicle routes for variant P (global precedence).
+        """Build vehicle routes for variant P (global precedence), honouring the
+        solver's OWN 0-separated vehicle partition.
 
-        Spreads each class-k block across M vehicles in demand-balanced chunks,
-        then splits by capacity. All routes are non-decreasing in class.
+        Reload-bug fix (see docs/root-cause-allow.md): the previous
+        implementation discarded the metaheuristic's 0-separators, re-spread
+        every arc across M demand-balanced vehicles, and then split each
+        vehicle's route into capacity-feasible *reload trips* via
+        ``_split_by_capacity`` — inserting exactly the multi-trip-per-vehicle
+        structure the problem forbids, and inflating (or falsely deflating) the
+        scored objective. It now maps each 0-separated segment to ONE
+        single-trip vehicle (class-sorted within the vehicle so precedence
+        holds) with no capacity re-splitting. If the partition uses more
+        segments than M, the surplus segments land on already-used vehicle
+        slots (via ``i % M``), so ``_completion_times`` sees >M trips and scores
+        the solution infeasible; likewise a segment whose demand exceeds Q is
+        rejected there. An action with no 0-separators is a single route on one
+        vehicle (feasible only if its whole demand ≤ Q).
         """
         a = np.asarray(action).astype(np.int64).ravel()
-        order = a[a != 0]
         M = max(int(M), 1)
         vehicles = [[] for _ in range(M)]
-        if len(order) == 0:
-            return vehicles
         clss = self._cls_np
-        demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
-        cap = self._capacity(td)
 
-        routes = [[] for _ in range(M)]
-        ocls = clss[order]
-        for ki, k in enumerate(np.unique(ocls)):
-            block = order[ocls == k]
-            for i, chunk in enumerate(self._balanced_chunks(block, demand, M)):
-                routes[(i + ki) % M].extend(chunk.tolist())
-        for m in range(M):
-            vehicles[m] = self._split_by_capacity(
-                np.array(routes[m], dtype=np.int64), demand, cap)
+        # Split into segments on 0-separators (each segment = one vehicle route).
+        segments, cur = [], []
+        for x in a.tolist():
+            if x == 0:
+                if cur:
+                    segments.append(cur)
+                    cur = []
+            else:
+                cur.append(int(x))
+        if cur:
+            segments.append(cur)
+
+        for i, seg in enumerate(segments):
+            seg = np.array(seg, dtype=np.int64)
+            # class-sort within the vehicle (stable) so class-1 precedes class-2
+            # precedes ... — precedence holds regardless of the raw arc order.
+            seg = seg[np.argsort(clss[seg], kind='stable')]
+            vehicles[i % M].append(seg)
         return vehicles
 
     @staticmethod
@@ -247,22 +263,60 @@ class SolutionEvaluator:
         n = len(trip)
         return self._cls_np[trip], cum[1:1 + n], cum[-1]
 
-    def _completion_times(self, vehicles, td):
-        """T_k = max absolute completion time over class-k arcs across all vehicles."""
+    def _completion_times(self, vehicles, td, require_complete=False):
+        """T_k = max absolute completion time over class-k arcs across all vehicles.
+
+        Reload-bug fix (see docs/root-cause-allow.md): one capacity budget per
+        vehicle, one single trip per vehicle, all vehicles running in PARALLEL
+        from time 0 (no offset-chaining of a second trip onto the same
+        vehicle's clock — that was the reload). The solution is INFEASIBLE
+        (T = +inf, so selection rejects it) when either
+          * the total number of trips exceeds the fleet size M (a would-be
+            reload / multi-trip: more single-trip routes than vehicles), or
+          * any trip's cumulative demand exceeds the vehicle capacity Q, or
+          * (require_complete) not every required arc is served — a
+            partial/dead-ended rollout. Under the fixed env a policy rollout
+            can strand arcs; scoring only the served arcs would make an
+            INCOMPLETE solution look artificially good (missing arcs lower
+            T_k), so full-solution callers pass require_complete=True. Per-
+            vehicle scorers (lex-safe LS, U-upgrade) pass False, since they
+            deliberately score one vehicle's arcs at a time.
+        A feasible single-trip-per-vehicle solution scores exactly as before
+        (each vehicle profiled independently, per-class max over all arcs).
+        """
+        M = len(vehicles)
+        inf = np.full(len(self.pos_val), np.inf, dtype=np.float64)
+
+        all_trips = [t for veh in vehicles for t in veh if len(t)]
+        if len(all_trips) > M:
+            return inf                                    # reload / multi-trip
+
+        if require_complete:
+            clss = self._cls_np if self._cls_np is not None \
+                else self._np(td["clss"]).reshape(-1)
+            n_required = int((clss[1:] != 0).sum())       # every non-depot arc
+            served = set()
+            for trip in all_trips:
+                served.update(int(a) for a in np.asarray(trip).ravel())
+            served.discard(0)
+            if len(served) < n_required:
+                return inf                                # incomplete / dead-end
+        # Whole-route capacity check requires demand info; callers that score
+        # only the schedule (e.g. lex-safe LS, which enforces capacity itself)
+        # may omit it — then the reload/multi-trip guard above still applies.
+        if "demand" in td:
+            cap = self._capacity(td)
+            demand = self._np(td["demand"]).astype(np.float64).reshape(-1)
+            for trip in all_trips:
+                if float(demand[np.asarray(trip, dtype=np.int64)].sum()) > cap + 1e-9:
+                    return inf                            # whole-route over Q
+
         per_class = {p: [0.0] for p in self.pos_val}
-        for veh_trips in vehicles:
-            # Profile each trip once, then order a vehicle's trips lower class
-            # first, then by duration (sorting the cached profiles avoids
-            # re-profiling every trip inside the sort key).
-            profiles = [self._trip_profile(t, td) for t in veh_trips]
-            if len(profiles) > 1:
-                profiles.sort(key=lambda pr: (int(pr[0].min()), float(pr[2])))
-            offset = 0.0
-            for arc_class, arc_comp, duration in profiles:
-                for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
-                    if c in per_class:
-                        per_class[c].append(offset + ac)
-                offset += float(duration)
+        for trip in all_trips:                            # each on its own vehicle
+            arc_class, arc_comp, _dur = self._trip_profile(trip, td)
+            for c, ac in zip(arc_class.tolist(), arc_comp.tolist()):
+                if c in per_class:
+                    per_class[c].append(ac)
         return np.array([max(per_class[p]) for p in self.pos_val], dtype=np.float64)
 
 

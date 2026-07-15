@@ -67,6 +67,11 @@ def final_band_pick(Ts, eps2, tie_tol=1e-6):
     Returns a row index into `Ts`.
     """
     ok = np.where(np.isfinite(Ts[:, 0]))[0]
+    if len(ok) == 0:
+        # Every candidate is infeasible (e.g. all rollouts dead-ended under the
+        # fixed env on a very hard instance). Fall back to the least-bad by raw
+        # lex order so the caller still gets a (non-crashing) answer.
+        return int(np.lexsort((Ts[:, 2], Ts[:, 1], Ts[:, 0]))[0])
     c = Ts[ok]
     m1 = c[:, 0].min()
     b1 = np.where(c[:, 0] <= m1 + tie_tol * max(m1, 1e-9))[0]
@@ -329,7 +334,8 @@ class RLHybHCARP(RLHCARP):
                 trip = route[1:-1]
                 if len(trip):
                     new_vehicles[m].append(trip)
-            return self.evaluator._completion_times(new_vehicles, td0), new_vehicles
+            return (self.evaluator._completion_times(
+                new_vehicles, td0, require_complete=True), new_vehicles)
 
         best_T, best_vehicles = _arm(self.variant)
         if self.variant == 'U':
@@ -387,7 +393,8 @@ class RLHybHCARP(RLHCARP):
             trip = route[1:-1]
             if len(trip):
                 new_vehicles[m].append(trip)
-        return self._u_evaluator._completion_times(new_vehicles, td0), new_vehicles
+        return (self._u_evaluator._completion_times(
+            new_vehicles, td0, require_complete=True), new_vehicles)
 
     def _oracle_forced_prefixes(self, td0, N1, adj, clss, demands, M):
         """Compute up to `oracle_k` forced class-1 opening-prefix flat-action
@@ -477,6 +484,22 @@ class RLHybHCARP(RLHCARP):
         actions = torch.stack(acts, 1).cpu().numpy().astype(np.int64)
         return reward, actions, (n_forced if forced_ok else 0)
 
+    def _greedy_anchor(self):
+        """The deterministic greedy rollout appended to every funnel pool as an
+        anchor (see `_run_funnel_once`). Factored out of `_run_funnel_once` so
+        the rollout source can be substituted without duplicating the funnel
+        body -- the learning-free-hybrid ablation (`solvers.rl_gch`) overrides
+        this to draw the anchor from GCH instead of the policy. Decoded AFTER
+        the sampling pool and via argmax (no RNG consumed), so the sampled
+        rows' RNG stream is untouched. Returns (g_reward (1,P) float64,
+        g_actions (1,S) int64)."""
+        with torch.inference_mode():
+            g_out = self.policy(batchify(self.td, 1), env=self.env,
+                                decode_type='greedy')
+        g_reward = g_out["reward"].cpu().numpy().astype(np.float64)
+        g_actions = g_out["actions"].cpu().numpy().astype(np.int64)
+        return g_reward, g_actions
+
     def _run_funnel_once(self, td0, M, N1, adj, clss, demands, classes,
                          forced, num_sample):
         """One prefix candidate's full funnel: decode pool -> greedy anchor
@@ -505,11 +528,7 @@ class RLHybHCARP(RLHCARP):
         # and via argmax (no RNG consumed), so the sampled rows' RNG stream --
         # and `_decode_pool`'s byte-identical-to-plain-policy guarantee -- are
         # untouched.
-        with torch.inference_mode():
-            g_out = self.policy(batchify(self.td, 1), env=self.env,
-                                decode_type='greedy')
-        g_reward = g_out["reward"].cpu().numpy().astype(np.float64)
-        g_actions = g_out["actions"].cpu().numpy().astype(np.int64)
+        g_reward, g_actions = self._greedy_anchor()
         S = max(actions.shape[1], g_actions.shape[1])
 
         def _pad(a):
@@ -563,7 +582,8 @@ class RLHybHCARP(RLHCARP):
         cands = []                                  # (T_vec, vehicles)
         for idx in keep:
             pre_vehicles = self.evaluator.routes_from_joint_actions(actions[idx], M, N1)
-            pre_T = self.evaluator._completion_times(pre_vehicles, td0)
+            pre_T = self.evaluator._completion_times(
+                pre_vehicles, td0, require_complete=True)
             ls_T, ls_vehicles = self._local_search_one(
                 pre_vehicles, td0, M, adj, clss, demands, classes)
             # local search optimizes total deadhead (a proxy for T_k), so only
@@ -601,6 +621,12 @@ class RLHybHCARP(RLHCARP):
                                          classes, forced, num_sample)
                    for forced in forced_list]
         best_T, best_vehicles = min(results, key=lambda r: tuple(r[0].tolist()))
+
+        # Read-only instrumentation (reload-bug diagnostics, Stage 0/4): stash
+        # the winning per-vehicle trip structure so a diagnostic harness can
+        # count reload events (a vehicle with >1 trip) and per-route cumulative
+        # demand without re-running the funnel. Never read by the solver itself.
+        self.last_best_vehicles = best_vehicles
 
         # ---- optional zero-training U upgrade (see __init__) ---------------
         # Runs AFTER the K-candidate funnel's overall winner is picked, on

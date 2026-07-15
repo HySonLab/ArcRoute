@@ -373,6 +373,27 @@ def t1_heuristic_argmin(adj, svc, clss, demands, M, cap=1.0,
     parts = [[int(c1[i]) for i in rt] for rt in best_routes]
     while len(parts) < Mi:
         parts.append([])
+
+    # Whole-route budget guard (reload-bug fix, see docs/root-cause-allow.md).
+    # The class-1 arcs are only the PREFIX of each vehicle's single trip;
+    # classes >=2 will later share the same capacity budget (one trip, no
+    # reload). A class-1 partition that fits on its own can still be impossible
+    # to complete without a reload -- e.g. it fills every vehicle so full that
+    # the largest higher-class arc no longer fits in ANY vehicle's residual.
+    # Reject such prefixes. Only NECESSARY conditions are checked (largest
+    # higher-class arc must fit the most-empty vehicle; total higher demand
+    # must fit the total residual), so no genuinely completable prefix is ever
+    # discarded.
+    higher = np.where(np.asarray(clss) >= 2)[0]
+    if len(higher):
+        loads = np.array([float(np.asarray(demands)[p].sum()) if p else 0.0
+                          for p in parts], dtype=np.float64)
+        residual = cap - loads
+        hd = np.asarray(demands)[higher].astype(np.float64)
+        if hd.sum() > residual.sum() + 1e-9 or hd.max() > residual.max() + 1e-9:
+            return dict(T1=INF, parts=None, secondary=INF, sec_plain=INF,
+                        tie_gain=0.0)
+
     return dict(T1=float(max(costs)), parts=parts, secondary=0.0,
                 sec_plain=0.0, tie_gain=0.0)
 

@@ -19,6 +19,13 @@ class CARPEnv:
         self.P = P
         self.reward_mode = reward_mode
         self.obj_weights = obj_weights if obj_weights is not None else [100.0 ** (-i) for i in range(self.P)]
+        # Penalty scale for a failed (dead-ended) rollout: applied per unit of
+        # UNSERVED demand (see get_reward). Large enough to dominate any
+        # feasible solution's T across all tiers, yet proportional so failures
+        # keep a gradient direction under Lex-GRPO's group-relative advantage
+        # (flat penalties collapse that signal -- see docs/root-cause-allow.md
+        # Risk 1). Rank-based training is insensitive to the exact magnitude.
+        self.deadend_penalty = 1e4
 
     def step(self, td: TensorDict):
         """Joint M×N step. `td["action"]` is a flat joint index in [0, M_max*(N+1)):
@@ -42,11 +49,14 @@ class CARPEnv:
         step_cost = td["adj"][ar, old_cn_m, j_star] + svc_j  # (B,)
 
         # Scatter-update only the selected vehicle slot — no full clone.
-        # capacity: add demand, reset to 0 on depot return
-        cap_delta = (td["used_capacity"][ar, m_star] + dem_j) * (~is_depot).float() \
-                    - td["used_capacity"][ar, m_star]
+        # capacity: CUMULATIVE over the whole route — add the served arc's
+        # demand to vehicle m_star. The depot has demand[0]==0, so a depot
+        # action adds nothing and, crucially, no longer RESETS the budget: this
+        # is the reload-bug fix. A mid-route depot visit is still a legal
+        # action (transit), it just never refreshes capacity, making reload
+        # structurally useless rather than merely masked.
         new_cap = td["used_capacity"] + torch.zeros_like(td["used_capacity"]).scatter_(
-            1, m_star[:, None], cap_delta[:, None])
+            1, m_star[:, None], dem_j[:, None])
 
         # completion: add step cost
         new_comp = td["completion"] + torch.zeros_like(td["completion"]).scatter_(
@@ -68,9 +78,8 @@ class CARPEnv:
         visited = td["visited"].scatter(-1, j_star[:, None, None], 1)
         visited = torch.where(is_depot.view(B, 1, 1), td["visited"], visited)
 
-        # done = all N non-depot arcs served.
+        # all N non-depot arcs served -> a successful terminal state.
         all_served = (visited[..., 0, 1:] != 0).all(dim=-1)   # (B,)
-        done = all_served.view(B, 1)
 
         td.update(
             {
@@ -79,10 +88,23 @@ class CARPEnv:
                 "completion": new_comp,
                 "completion_at_arc": new_comp_at_arc,
                 "visited": visited,
-                "done": done,
             }
         )
-        td.set("action_mask", self.get_action_mask(td))
+        mask = self.get_action_mask(td)                       # flat (B, M_max*N1)
+
+        # Dead-end detection: unserved arcs remain but NO vehicle has a feasible
+        # arc-serving action. Under cumulative capacity a greedy/early policy
+        # can strand demand (the old reload path silently rescued this). Such a
+        # state terminates the rollout as FAILED; the depot column stays
+        # feasible so the mask is never all-inf (a stranded vehicle can park),
+        # and get_reward charges a penalty proportional to the unserved demand.
+        mask3 = mask.reshape(B, -1, N1)                       # (B, M_max, N1)
+        has_arc = mask3[..., 1:].reshape(B, -1).any(dim=-1)   # (B,) any feasible arc
+        dead_end = (~all_served) & (~has_arc)                 # (B,)
+        done = (all_served | dead_end).view(B, 1)
+
+        td.set("done", done)
+        td.set("action_mask", mask)
         td.set("phase", self._phase(td))
         return td
 
@@ -136,20 +158,36 @@ class CARPEnv:
         # depot col: demand[0]=0 so never exceeds; zero it without clone via masking
         exceeds_cap = exceeds_cap & (torch.arange(N1, device=dev) > 0)[None, None, :]
 
-        # Depot idle-guard: a vehicle AT the depot with EMPTY load cannot pick depot
-        # again (prevents standing still). When the instance is done, never block
-        # depot so done rows always keep ≥1 feasible cell (a vehicle can park).
-        at_depot = (td["current_node"] == 0)                 # (B, M_max)
-        is_empty = (td["used_capacity"] == 0)                # (B, M_max)
-        block_depot = at_depot & is_empty & (~all_served[:, None])  # (B, M_max)
-        depot_mask = torch.zeros(B, M_max, N1, dtype=torch.bool, device=dev)
-        depot_mask[:, :, 0] = block_depot
-
         # Nonexistent-vehicle guard: vehicle m >= M_i does not exist -> fully masked.
         M_per_inst = td["num_vehicle"].reshape(B).to(dev)
         veh_range = torch.arange(M_max, device=dev).view(1, M_max)
         nonexistent = (veh_range >= M_per_inst.view(B, 1))    # (B, M_max)
         nonexistent_mask = nonexistent[:, :, None].expand(B, M_max, N1)
+
+        # Depot idle-guard (cumulative-capacity aware). Whenever progress is
+        # still possible anywhere in the instance (SOME vehicle can serve SOME
+        # arc), NO vehicle sitting at the depot may pick the depot again —
+        # otherwise, under cumulative capacity, the policy could idle at the
+        # depot forever (the old env broke such loops via the reload
+        # capacity-reset flipping a returned vehicle back to "empty" and then
+        # re-blocking it; that no longer happens). Crucially this must key off
+        # instance-wide progress, not a single vehicle's own remaining work: an
+        # EXHAUSTED vehicle parked at the depot would otherwise be an always-
+        # feasible no-op cell that a greedy policy fixates on while other
+        # vehicles could still make progress. Depot only re-opens when the
+        # instance is fully served or genuinely dead-ended (no vehicle can
+        # serve) — so the mask is never all-infeasible (a stranded vehicle can
+        # park), and the rollout terminates. This also subsumes the old
+        # `used_capacity==0` fresh-vehicle guard (a fresh vehicle can always
+        # serve, so it is still forced to depart).
+        arc_infeasible = (arc_mask | exceeds_cap | nonexistent_mask)  # (B,M,N1)
+        can_serve = (~arc_infeasible[:, :, 1:]).any(dim=-1)  # (B, M_max)
+        progress_possible = can_serve.any(dim=-1)            # (B,) any vehicle
+        at_depot = (td["current_node"] == 0)                 # (B, M_max)
+        block_depot = (at_depot & (~all_served[:, None])
+                       & progress_possible[:, None])         # (B, M_max)
+        depot_mask = torch.zeros(B, M_max, N1, dtype=torch.bool, device=dev)
+        depot_mask[:, :, 0] = block_depot
 
         full_mask = arc_mask | exceeds_cap | depot_mask | nonexistent_mask  # (B,M,N+1)
         flat_mask = full_mask.reshape(B, M_max * N1)
@@ -230,6 +268,20 @@ class CARPEnv:
         for ki, k in enumerate(self._pos_val()):
             mask_k = (clss == k).float()
             T[:, ki] = (comp * mask_k).max(dim=-1).values
+
+        # Dead-end (failed-rollout) penalty, proportional to UNSERVED demand.
+        # A stranded arc has completion_at_arc==0, so without a penalty a failed
+        # rollout would look artificially GOOD (missing arcs raise no T_k). The
+        # penalty makes every failure strictly worse than any feasible solution
+        # while staying proportional, so Lex-GRPO group advantages keep a
+        # gradient direction among failures (roadmap Risk 1). Fully-served
+        # rollouts have unserved_dem==0 -> penalty 0 -> reward unchanged.
+        served = td["visited"][..., 0, :] != 0                     # (B, N+1)
+        arc_col = (torch.arange(comp.shape[-1], device=dev) > 0)   # exclude depot
+        unserved = (~served) & arc_col[None, :]
+        unserved_dem = (td["demand"] * unserved.to(comp.dtype)).sum(-1)  # (B,)
+        T = T + (self.deadend_penalty * unserved_dem)[:, None]
+
         if self.reward_mode == 'vector':
             return T
         w = torch.tensor(self.obj_weights, dtype=T.dtype, device=dev)

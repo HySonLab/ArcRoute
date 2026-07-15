@@ -1,0 +1,39 @@
+=== small P (n=100 instances) ===
+A1_greedy            T1gap= 20.54% T2gap= 17.33% T3gap= 13.19% time=0.03s
+A1_bestofR           T1gap=  7.31% T2gap= 36.30% T3gap= 36.68% time=0.03s
+A2_no_candidates     T1gap=  2.34% T2gap= 14.17% T3gap=  8.62% time=0.25s
+A3_candidates_no_ls  T1gap=  0.00% T2gap=  5.85% T3gap= 18.68% time=0.18s
+A4_full              T1gap=  0.00% T2gap=  3.22% T3gap= 12.19% time=0.59s
+
+=== small U (n=100 instances) ===
+A1_greedy            T1gap=245.22% T2gap= 69.72% T3gap= 35.25% time=0.03s
+A1_bestofR           T1gap=167.45% T2gap=121.08% T3gap= 54.58% time=0.03s
+A2_no_candidates     T1gap= 44.60% T2gap= 41.47% T3gap= 12.82% time=0.46s
+A4_full              T1gap=  0.00% T2gap=  2.20% T3gap= 27.08% time=0.59s
+
+=== medium P (n=100 instances) ===
+A1_greedy            T1gap= 32.01% T2gap= 15.23% T3gap= 15.82% time=0.05s
+A1_bestofR           T1gap= 35.07% T2gap= 60.27% T3gap= 62.23% time=0.06s
+A2_no_candidates     T1gap=  6.26% T2gap= 14.72% T3gap=  6.40% time=0.59s
+A3_candidates_no_ls  T1gap=  0.00% T2gap=  5.87% T3gap= 11.49% time=0.71s
+A4_full              T1gap=  0.00% T2gap=  2.30% T3gap=  6.06% time=2.08s
+
+=== medium U (n=100 instances) ===
+A1_greedy            T1gap=345.39% T2gap=107.74% T3gap= 12.66% time=0.05s
+A1_bestofR           T1gap=359.80% T2gap=169.22% T3gap= 39.92% time=0.06s
+A2_no_candidates     T1gap= 87.42% T2gap= 45.85% T3gap= 41.66% time=1.90s
+A4_full              T1gap=  0.00% T2gap=  0.33% T3gap= 45.20% time=2.08s
+
+=== large P (n=100 instances) ===
+A1_greedy            T1gap= 54.18% T2gap= 24.64% T3gap= 27.44% time=0.09s
+A1_bestofR           T1gap= 89.60% T2gap= 83.16% T3gap= 95.49% time=0.11s
+A2_no_candidates     T1gap= 13.69% T2gap=  9.40% T3gap=  4.09% time=1.41s
+A3_candidates_no_ls  T1gap=  0.01% T2gap=  6.37% T3gap= 16.12% time=1.59s
+A4_full              T1gap=  0.00% T2gap=  3.10% T3gap= 10.88% time=5.78s
+
+=== large U (n=100 instances) ===
+A1_greedy            T1gap=448.57% T2gap=138.66% T3gap=  5.60% time=0.09s
+A1_bestofR           T1gap=570.37% T2gap=228.42% T3gap=113.36% time=0.11s
+A2_no_candidates     T1gap=136.88% T2gap= 37.28% T3gap= 19.29% time=4.46s
+A4_full              T1gap=  0.00% T2gap=  0.23% T3gap= 27.46% time=5.95s
+

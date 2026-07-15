@@ -152,12 +152,15 @@ class BaseHCARP:
         """``calc_Ts`` for several arms of the same sample batch, scoring each
         distinct action once per sample. Returns (n_arms, N, P).
 
-        Exact: the evaluator's decode depends only on an action's nonzero arc
-        order (every path in ``SolutionEvaluator`` starts from ``a[a != 0]``;
-        0-separators and padding are ignored), so two actions with the same
-        nonzero order provably receive the same T — e.g. when the U and P
-        local-search arms converge to the same tours, or an arm returns its
-        input unchanged. Values are identical to scoring every arm in full.
+        Exact: two actions receive the same T iff they decode identically.
+        Reload-bug fix: ``SolutionEvaluator`` now HONOURS an action's own
+        0-separators as vehicle boundaries (a single trip per vehicle, no
+        capacity re-split), so the decode depends on the full 0-separated
+        action, not just its nonzero arc order. The memo is therefore keyed by
+        the whole action's bytes (trailing padding included — harmless, it only
+        forgoes a cache hit): two arms that converge to the identical serialized
+        tours still dedup, but arms with the same arcs partitioned differently
+        no longer collide onto one (wrong) T.
         """
         n = len(arms[0])
         rows = [[None] * n for _ in range(len(arms))]
@@ -166,7 +169,7 @@ class BaseHCARP:
             pending, pending_actions = [], []
             for i, act in enumerate(arm):
                 a = np.asarray(act)
-                key = a[a != 0].astype(np.int64, copy=False).tobytes()
+                key = a.astype(np.int64, copy=False).tobytes()
                 if key in memo[i]:
                     rows[k][i] = memo[i][key]
                 else:

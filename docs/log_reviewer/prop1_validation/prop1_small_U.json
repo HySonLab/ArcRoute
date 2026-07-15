@@ -1,0 +1,10 @@
+{
+  "tier": "small",
+  "variant": "U",
+  "n_checked": 100,
+  "n_violations": 0,
+  "violations": [],
+  "median_margin": 5.3068124651908875,
+  "mean_margin": 5.697409099554643,
+  "pct_strict": 100.0
+}
